@@ -56,6 +56,10 @@ public interface PartAlignment extends PartSettingsHolder, Named, Solutions.Subj
      * @throws Exception if the alignment fails for any reason. The caller may retry.
      */
     PartAlignmentOffset findOffsets(Part part, BoardLocation boardLocation, Placement placement, Nozzle nozzle) throws Exception;
+
+    default PartAlignmentOffset findOffsets(Part part, BoardLocation boardLocation, Placement placement, Nozzle nozzle, boolean skipMovement) throws Exception {
+        return findOffsets(part, boardLocation, placement, nozzle);
+    }
     
     /**
      * Return the location where the alignment will take place.

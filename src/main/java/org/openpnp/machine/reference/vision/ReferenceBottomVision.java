@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.commons.io.IOUtils;
+import org.opencv.core.Mat;
 import org.opencv.core.Point;
 import org.opencv.core.RotatedRect;
 import org.opencv.core.Size;
@@ -14,6 +15,8 @@ import org.openpnp.gui.MainFrame;
 import org.openpnp.gui.support.DoubleConverter;
 import org.openpnp.gui.support.LengthConverter;
 import org.openpnp.gui.support.PropertySheetWizardAdapter;
+import org.openpnp.machine.reference.camera.ReferenceCamera;
+import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferenceNozzleTip;
 import org.openpnp.machine.reference.ReferenceNozzleTipCalibration;
 import org.openpnp.machine.reference.ReferenceNozzleTipCalibration.BackgroundCalibrationMethod;
@@ -34,11 +37,11 @@ import org.openpnp.model.Placement;
 import org.openpnp.model.VisionCompositing;
 import org.openpnp.model.VisionCompositing.Composite;
 import org.openpnp.model.VisionCompositing.Shot;
-import org.openpnp.spi.Camera;
-import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.NozzleTip;
+import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.PartAlignment;
 import org.openpnp.spi.PropertySheetHolder;
+import org.openpnp.spi.Camera;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
@@ -105,6 +108,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     @Override
     public PartAlignmentOffset findOffsets(Part part, BoardLocation boardLocation,
             Placement placement, Nozzle nozzle) throws Exception {
+        return findOffsets(part, boardLocation, placement, nozzle, false);
+    }
+
+    public PartAlignmentOffset findOffsets(Part part, BoardLocation boardLocation,
+            Placement placement, Nozzle nozzle, boolean skipMovement) throws Exception {
+        return findOffsets(part, boardLocation, placement, nozzle, skipMovement, null);
+    }
+
+    public PartAlignmentOffset findOffsets(Part part, BoardLocation boardLocation,
+            Placement placement, Nozzle nozzle, boolean skipMovement, 
+            org.openpnp.model.CapturedShot preCapturedShot) throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
 
         if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
@@ -118,14 +132,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             throw new Exception("Part mismatch with part on nozzle.");
         }
 
-        Camera camera = VisionUtils.getBottomVisionCamera();
+        Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
         PartAlignmentOffset offsets;
         if ((bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
                 || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn)) {
-            offsets = findOffsetsPreRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings);
+            offsets = findOffsetsPreRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings, skipMovement, preCapturedShot);
         }
         else {
-            offsets = findOffsetsPostRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings);
+            offsets = findOffsetsPostRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings, skipMovement, preCapturedShot);
         }
         if (nozzle.isAligningRotationMode()) {
             // Add the rotation offset to the rotation mode rather than adjusting for it in placement. This has the advantage of
@@ -147,7 +161,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             return null;
         }
 
-        Camera camera = VisionUtils.getBottomVisionCamera();
+        Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
         double wantedAngle = 0.0;
         if ((bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
                 || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn)) {
@@ -166,12 +180,19 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     }
     
     public Location getCameraLocationAtPartHeight(Part part, Camera camera, Nozzle nozzle, double angle) throws Exception {
+        return getCameraLocationAtPartHeight(part, camera, nozzle, angle, false);
+    }
+
+    public Location getCameraLocationAtPartHeight(Part part, Camera camera, Nozzle nozzle, double angle, boolean skipMovement) throws Exception {
         if (part == null) {
             // No part height accounted for.
             return camera.getLocation(nozzle)
                     .derive(null, null, null, angle);
         }
         if (part.isPartHeightUnknown()) {
+            if (skipMovement) {
+                throw new Exception("Part height unknown and skipMovement is enabled. Part height must be determined before parallel vision processing.");
+            }
             if (camera.getFocusProvider() != null
                     && nozzle.getNozzleTip() != null) {
                 NozzleTip nt = nozzle.getNozzleTip();
@@ -216,6 +237,12 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     private PartAlignmentOffset findOffsetsPreRotate(Part part, BoardLocation boardLocation,
             Placement placement, Nozzle nozzle, Camera camera, BottomVisionSettings bottomVisionSettings)
                     throws Exception {
+        return findOffsetsPreRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings, false, null);
+    }
+
+    private PartAlignmentOffset findOffsetsPreRotate(Part part, BoardLocation boardLocation,
+            Placement placement, Nozzle nozzle, Camera camera, BottomVisionSettings bottomVisionSettings,
+            boolean skipMovement, org.openpnp.model.CapturedShot preCapturedShot) throws Exception {
         double wantedAngle = placement.getLocation().getRotation();
         if (boardLocation != null) {
             wantedAngle = Utils2D.calculateBoardPlacementLocation(boardLocation, placement.getLocation())
@@ -223,12 +250,12 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
         wantedAngle = Utils2D.angleNorm(wantedAngle, 180.);
         // Wanted location.
-        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, wantedAngle);
+        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, wantedAngle, skipMovement);
 
         Location nozzleLocation = wantedLocation;
         final Location center = new Location(maxLinearOffset.getUnits());
 
-        try (CvPipeline pipeline = bottomVisionSettings.getPipeline()) {
+        try (CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings)) {
 
             // The running, iterative offset.
             Location offsets = new Location(nozzleLocation.getUnits());
@@ -236,8 +263,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Try getting a good fix on the part in multiple passes.
             for(int pass = 0;;) {
                 rect = processPipelineAndGetResult(pipeline, camera, part, nozzle,
-                        wantedLocation, nozzleLocation, bottomVisionSettings);
+                        wantedLocation, nozzleLocation, bottomVisionSettings, skipMovement, preCapturedShot);
 
+                // For parallel alignment with pre-captured shots, use displacement delta from the shot
+                if (preCapturedShot instanceof org.openpnp.model.PreCapturedPlacement) {
+                    Location displacement = ((org.openpnp.model.PreCapturedPlacement) preCapturedShot).getIntendedDisplacementDelta();
+                    if (displacement != null) {
+                        String cameraName = ((org.openpnp.model.PreCapturedPlacement) preCapturedShot).getCamera().getName();
+                        Logger.debug("{} displacement (parallel), using displacement delta {}", cameraName, displacement);
+                        nozzleLocation = nozzleLocation.subtract(displacement);
+                    }
+                }
                 Logger.debug("Bottom vision part {} result rect {}", part.getId(), rect);
 
                 // Create the offsets object. This is the physical distance from
@@ -315,12 +351,18 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     private PartAlignmentOffset findOffsetsPostRotate(Part part, BoardLocation boardLocation,
             Placement placement, Nozzle nozzle, Camera camera, BottomVisionSettings bottomVisionSettings)
                     throws Exception {
+        return findOffsetsPostRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings, false, null);
+    }
+
+    private PartAlignmentOffset findOffsetsPostRotate(Part part, BoardLocation boardLocation,
+            Placement placement, Nozzle nozzle, Camera camera, BottomVisionSettings bottomVisionSettings,
+            boolean skipMovement, org.openpnp.model.CapturedShot preCapturedShot) throws Exception {
         // Create a location that is the Camera's X, Y, it's Z + part height
         // and a rotation of 0, unless preRotate is enabled
-        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, 0.);
+        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, 0., skipMovement);
 
-        try (CvPipeline pipeline = bottomVisionSettings.getPipeline()) {
-            RotatedRect rect = processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, wantedLocation, bottomVisionSettings);
+        try (CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings)) {
+            RotatedRect rect = processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, wantedLocation, bottomVisionSettings, skipMovement, preCapturedShot);
 
             Logger.debug("Bottom vision part {} result rect {}", part.getId(), rect);
 
@@ -464,6 +506,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     public void preparePipeline(CvPipeline pipeline, Map<String, Object> pipelineParameterAssignments, 
             Camera camera, Package pkg, Nozzle nozzle, NozzleTip nozzleTip, Location wantedLocation, 
             Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings) throws Exception {
+        preparePipeline(pipeline, pipelineParameterAssignments, camera, pkg, nozzle, nozzleTip, 
+                wantedLocation, adjustedNozzleLocation, bottomVisionSettings, false);
+    }
+
+    protected void preparePipeline(CvPipeline pipeline, Map<String, Object> pipelineParameterAssignments, 
+            Camera camera, Package pkg, Nozzle nozzle, NozzleTip nozzleTip, Location wantedLocation, 
+            Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings, 
+            boolean skipMovement) throws Exception {
         VisionCompositing visionCompositing = pkg.getVisionCompositing();
         VisionCompositing.Composite composite = visionCompositing.new Composite(
                 pkg, bottomVisionSettings, nozzle, nozzleTip, camera, wantedLocation);
@@ -550,11 +600,26 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             pipeline.addProperties(pipelineParameterAssignments);
 
             // Get the shot location, but adjusted by the adjustedNozzleLocation.
-            Location shotLocation = composite.getShotLocation(shot)
-                    .addWithRotation(adjustedNozzleLocation.subtractWithRotation(wantedLocation)); 
+            Location shotLocationTemp = composite.getShotLocation(shot)
+                    .addWithRotation(adjustedNozzleLocation.subtractWithRotation(wantedLocation));
+            boolean displacementIsEnabled = Configuration.get().getMachine().isDisplacementEnabled();
+        if (displacementIsEnabled) {
+                  // Adjust 'shot Z' to nozzle balance level
+                if (nozzle != null) {
+                    double balance = Configuration.get().getMachine().getBalanceLevel().getValue();
+                    shotLocationTemp = shotLocationTemp.derive(null, null, balance, null);
+                }
+            }
+            final Location shotLocation = shotLocationTemp;
+            final boolean skipMove = skipMovement;
+
             pipeline.new PipelineShot() {
                 @Override
                 public void apply() throws Exception {
+                    if (skipMove) {
+                        super.apply();
+                        return;
+                    }
                     if (nozzle.getLocation().getLinearLengthTo(camera.getLocation(nozzle))
                             .compareTo(camera.getRoamingRadius()
                                     .add(nozzleTip.getMaxPickTolerance())) > 0) {
@@ -562,6 +627,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         MovableUtils.moveToLocationAtSafeZ(nozzle, shotLocation);
                     }
                     else {
+                        // When skipMove=false, we MUST move to exact shot location.
+                        // Displacement fallback is NOT allowed - it causes pipeline to expect
+                        // different position than actual capture position.
                         nozzle.moveTo(shotLocation);
                     }
                     super.apply();
@@ -581,10 +649,30 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
     }
 
+    public static CvPipeline getThreadLocalPipeline(BottomVisionSettings bottomVisionSettings) throws CloneNotSupportedException {
+        return bottomVisionSettings.getPipeline().clone();
+    }
+
     private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
             Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings) throws Exception {
+        return processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, adjustedNozzleLocation, bottomVisionSettings, false);
+    }
+
+    private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
+            Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings,
+            boolean skipMovement) throws Exception {
+        return processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, adjustedNozzleLocation, bottomVisionSettings, skipMovement, null);
+    }
+
+    private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
+            Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings,
+            boolean skipMovement, org.openpnp.model.CapturedShot preCapturedShot) throws Exception {
         preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), camera, part.getPackage(), 
-                nozzle, nozzle.getNozzleTip(), wantedLocation, adjustedNozzleLocation, bottomVisionSettings);
+                nozzle, nozzle.getNozzleTip(), wantedLocation, adjustedNozzleLocation, bottomVisionSettings, skipMovement);
+        // Set pre-captured shot AFTER preparePipeline (which calls resetReusedPipeline and clears pre-captured shots)
+        if (preCapturedShot != null) {
+            pipeline.setPreCapturedShot(0, preCapturedShot);
+        }
         for (PipelineShot pipelineShot : pipeline.getPipelineShots()) {
             pipelineShot.apply();
 
@@ -618,7 +706,27 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Display the shot result.   
             displayResult(OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()), part, null, camera, nozzle);
         }
-        return (RotatedRect) pipeline.getCurrentPipelineShot().processCompositeResult().getModel();
+        
+        RotatedRect resultRect = (RotatedRect) pipeline.getCurrentPipelineShot().processCompositeResult().getModel();
+        
+        // Validate displacement if we have a pre-captured placement with displacement data
+        if (preCapturedShot instanceof org.openpnp.model.PreCapturedPlacement) {
+            Location displacementDelta = ((org.openpnp.model.PreCapturedPlacement) preCapturedShot).getIntendedDisplacementDelta();
+            if (displacementDelta != null) {
+                double displacementDistance = displacementDelta.getLinearLengthTo(Location.origin).getValue();
+                double maxDistance = Configuration.get().getMachine().getDisplacementMaxDistance().getValue();
+                
+                if (displacementDistance > maxDistance) {
+                    Logger.warn("Displacement warning: displacement {} mm exceeds max {} mm for nozzle {} camera {}. " +
+                               "Check Advanced Camera Calibration and Nozzle Tip Runout Calibration.",
+                               displacementDistance, maxDistance, 
+                               ((org.openpnp.model.PreCapturedPlacement) preCapturedShot).getNozzle().getId(),
+                               ((org.openpnp.model.PreCapturedPlacement) preCapturedShot).getCamera().getName());
+                }
+            }
+        }
+        
+        return resultRect;
     }
 
     @Override
@@ -1043,6 +1151,328 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     }
                 }
             }
+        }
+    }
+    
+    /**
+     * Capture placement image in main thread (before background processing).
+     * All hardware interactions happen here - movement, settling, capture.
+     * This is the "Pre-capture Pattern" - images are captured in main thread,
+     * then background threads process pre-captured images only.
+     * 
+     * @param part The part being aligned
+     * @param camera The camera to use for capture
+     * @param nozzle The nozzle performing the capture
+     * @param wantedLocation The location where capture should occur
+     * @return CapturedShot containing the pre-captured image (no hardware references)
+     * @throws Exception If capture fails
+     */
+    public org.openpnp.model.CapturedShot capturePlacement(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation) throws Exception {
+        BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
+        
+        if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
+            throw new Exception("Bottom vision not enabled for part "+part.getId());
+        }
+        
+        // Clone pipeline for this capture
+        CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
+        try {
+            // Prepare the pipeline with camera and other settings
+            preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), 
+                    camera, part.getPackage(), nozzle, nozzle.getNozzleTip(), 
+                    wantedLocation, wantedLocation, bottomVisionSettings, false);
+            
+            // Get the first pipeline shot (typically only one for simple capture)
+            List<PipelineShot> shots = pipeline.getPipelineShots();
+            if (shots.isEmpty()) {
+                throw new Exception("No pipeline shots configured for part "+part.getId());
+            }
+            
+            PipelineShot pipelineShot = shots.get(0);
+            
+            // Apply the shot - this moves nozzle to position if not already there
+            pipelineShot.apply();
+            
+            // Process pipeline to get the result
+            pipeline.process();
+            
+            // Get the result
+            Result result = pipeline.getResult(VisionUtils.PIPELINE_RESULTS_NAME);
+            if (result == null) {
+                result = pipeline.getResult("result");
+            }
+            
+            if (result == null) {
+                throw new Exception("Pipeline processing failed for part "+part.getId());
+            }
+            
+            if (result.model == null) {
+                throw new Exception("No result found in pipeline for part "+part.getId());
+            }
+            
+            if (!(result.model instanceof RotatedRect)) {
+                throw new Exception("Incorrect pipeline result type for part "+part.getId());
+            }
+            
+            // Process the result (accumulate detection)
+            pipelineShot.processResult(result);
+            
+            // Get the final composite result
+            Result compositeResult = pipelineShot.processCompositeResult();
+            
+            if (compositeResult == null || compositeResult.model == null) {
+                throw new Exception("Composite result processing failed for part "+part.getId());
+            }
+            
+            RotatedRect rect = (RotatedRect) compositeResult.model;
+            
+            // Create a CapturedShot with the pre-captured image
+            // The image is in the pipeline's working image after process()
+            Mat preCapturedImage = pipeline.getWorkingImage().clone();
+            
+            // Use the wantedLocation parameter passed to this method
+            Location shotLocation = wantedLocation;
+            
+            // Return the pre-captured shot (no hardware references)
+            return new org.openpnp.model.CapturedShot(camera, nozzle, preCapturedImage, shotLocation);
+        }
+        finally {
+            // Always close the pipeline to release resources
+            pipeline.close();
+        }
+    }
+    
+    /**
+     * Capture image ONLY (no pipeline processing) in main thread for parallel alignment.
+     * This method captures the image without processing the pipeline, allowing true parallelism
+     * when combined with background thread processing.
+     * 
+     * The displacement is calculated as the actual offset from the current nozzle position
+     * to the target shot location. This includes both the camera's configured displacement
+     * AND the nozzle tip runout error.
+     * 
+     * @param part The part being aligned
+     * @param camera The camera to use for capture
+     * @param nozzle The nozzle performing the capture
+     * @param wantedLocation The location where capture should occur
+     * @return PreCapturedPlacement containing the captured image and displacement delta
+     * @throws Exception If capture fails
+     */
+    public org.openpnp.model.PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation) throws Exception {
+        return captureImageOnly(part, camera, nozzle, wantedLocation, false);
+    }
+
+    public org.openpnp.model.PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
+        BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
+        
+        if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
+            throw new Exception("Bottom vision not enabled for part "+part.getId());
+        }
+        
+        // Clone pipeline for this capture
+        CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
+        try {
+            // Prepare the pipeline with camera and other settings
+            // skipMovement=true to prevent any hardware movement during parallel capture
+            preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), 
+                    camera, part.getPackage(), nozzle, nozzle.getNozzleTip(), 
+                    wantedLocation, wantedLocation, bottomVisionSettings, true);
+            
+            // Get the first pipeline shot (typically only one for simple capture)
+            List<PipelineShot> shots = pipeline.getPipelineShots();
+            if (shots.isEmpty()) {
+                throw new Exception("No pipeline shots configured for part "+part.getId());
+            }
+            
+            PipelineShot pipelineShot = shots.get(0);
+            
+            // Apply the shot - with skipMovement=true, this sets properties but doesn't move hardware
+            pipelineShot.apply();
+            
+            // Light was already turned on in moveNozzlesToAlignmentPosition() before waitForCompletion()
+            // This ensures M810 is queued before M400, so light is guaranteed on when capture happens
+            
+            // Calculate the displacement delta: nozzle tip camera offset + nozzle runout compensation
+            // The camera offset comes from Nozzle Tip Runout Calibration (camera offset per nozzle tip)
+            // The nozzle runout compensation comes from Nozzle Tip Runout Calibration at the wanted rotation
+            ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
+            ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
+            
+            // Get the camera offset for this nozzle tip (this is the offset between nozzle tip and camera)
+            Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+                cameraOffset = calibrationNozzleTip.getCalibration().getCalibratedCameraOffset(refNozzle, camera);
+            }
+            
+            // Get nozzle runout compensation at the wanted rotation angle
+            Location runoutCompensation = new Location(cameraOffset.getUnits(), 0, 0, 0, 0);
+            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+                runoutCompensation = calibrationNozzleTip.getCalibration().getCalibratedOffset(refNozzle, wantedLocation.getRotation());
+            }
+            
+            // Combine: displacement delta = camera offset + runout compensation
+            // This should be small (< 2mm in each direction)
+            // For the first nozzle tip, displacement is zero since we're already at the correct position
+            Location displacementDelta;
+            if (isFirstNozzleTip) {
+                displacementDelta = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+            }
+            else {
+                displacementDelta = cameraOffset.add(runoutCompensation);
+            }
+            Logger.debug("captureImageOnly: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={}, displacementDelta={}", 
+                isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
+            
+            // Capture the image (no settling needed - head is already stationary)
+            BufferedImage capturedBufferedImage = camera.capture();
+            Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+            
+            // Turn off light or register with batch operation (if active)
+            try {
+                camera.actuateLightAfterCapture();
+            }
+            catch (Exception e) {
+                Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
+            }
+            
+            // Create a PreCapturedPlacement with the captured image and displacement delta
+            return new org.openpnp.model.PreCapturedPlacement(
+                    camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+        }
+        finally {
+            // Always close the pipeline to release resources
+            pipeline.close();
+        }
+    }
+
+    /**
+     * Capture an image with automatic settling for the first camera in parallel alignment.
+     * This method performs auto-settle (capturing multiple frames until stable) before 
+     * capturing the final image. This is used for the "settle camera" in parallel alignment
+     * to stabilize the mechanical system before capturing both cameras.
+     * 
+     * The method calculates the displacement delta to account for both camera displacement
+     * AND the nozzle tip runout error.
+     * 
+     * @param part The part being aligned
+     * @param camera The settling camera to use for capture (must support settling)
+     * @param nozzle The nozzle performing the capture
+     * @param wantedLocation The location where capture should occur
+     * @return PreCapturedPlacement containing the captured image and displacement delta
+     * @throws Exception If capture fails
+     */
+    public org.openpnp.model.PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation) throws Exception {
+        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, false);
+    }
+
+    public org.openpnp.model.PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
+        BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
+        
+        if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
+            throw new Exception("Bottom vision not enabled for part "+part.getId());
+        }
+        
+        // Clone pipeline for this capture
+        CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
+        try {
+            // Prepare the pipeline with camera and other settings
+            // skipMovement=true to prevent any hardware movement during parallel capture
+            preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), 
+                    camera, part.getPackage(), nozzle, nozzle.getNozzleTip(), 
+                    wantedLocation, wantedLocation, bottomVisionSettings, true);
+            
+            // Get the first pipeline shot (typically only one for simple capture)
+            List<PipelineShot> shots = pipeline.getPipelineShots();
+            if (shots.isEmpty()) {
+                throw new Exception("No pipeline shots configured for part "+part.getId());
+            }
+            
+            PipelineShot pipelineShot = shots.get(0);
+            
+            // Apply the shot - with skipMovement=true, this sets properties but doesn't move hardware
+            pipelineShot.apply();
+            
+            // Light was already turned on in moveNozzlesToAlignmentPosition() before waitForCompletion()
+            // This ensures M810 is queued before M400, so light is guaranteed on when capture happens
+            
+            // Calculate the displacement delta: nozzle tip camera offset + nozzle runout compensation
+            // The camera offset comes from Nozzle Tip Runout Calibration (camera offset per nozzle tip)
+            // The nozzle runout compensation comes from Nozzle Tip Runout Calibration at the wanted rotation
+            ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
+            ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
+            
+            // Get the camera offset for this nozzle tip (this is the offset between nozzle tip and camera)
+            Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+                cameraOffset = calibrationNozzleTip.getCalibration().getCalibratedCameraOffset(refNozzle, camera);
+            }
+            
+            // Get nozzle runout compensation at the wanted rotation angle
+            Location runoutCompensation = new Location(cameraOffset.getUnits(), 0, 0, 0, 0);
+            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+                runoutCompensation = calibrationNozzleTip.getCalibration().getCalibratedOffset(refNozzle, wantedLocation.getRotation());
+            }
+            
+            // Combine: displacement delta = camera offset + runout compensation
+            // This should be small (< 2mm in each direction)
+            // For the first nozzle tip, displacement is zero since we're already at the correct position
+            Location displacementDelta;
+            if (isFirstNozzleTip) {
+                displacementDelta = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+            }
+            else {
+                displacementDelta = cameraOffset.add(runoutCompensation);
+            }
+            Logger.debug("captureImageOnlyWithSettle: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={}, displacementDelta={}", 
+                isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
+            
+            // Perform auto-settle and capture - this captures multiple frames until stable
+            // The camera must support settling (extend AbstractSettlingCamera)
+            if (camera instanceof org.openpnp.machine.reference.camera.AbstractSettlingCamera) {
+                org.openpnp.machine.reference.camera.AbstractSettlingCamera settlingCamera = 
+                    (org.openpnp.machine.reference.camera.AbstractSettlingCamera) camera;
+                BufferedImage capturedBufferedImage = settlingCamera.settleAndCapture(
+                    org.openpnp.machine.reference.camera.AbstractSettlingCamera.SettleOption.Settle);
+                Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+                
+                // Turn off light or register with batch operation (if active)
+                try {
+                    camera.actuateLightAfterCapture();
+                }
+                catch (Exception e) {
+                    Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
+                }
+                
+                // Create a PreCapturedPlacement with the captured image and displacement delta
+                return new org.openpnp.model.PreCapturedPlacement(
+                        camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+            }
+            else {
+                // Camera doesn't support settling - fall back to regular capture
+                Logger.warn("Camera {} does not support settling, using regular capture", camera.getName());
+                BufferedImage capturedBufferedImage = camera.capture();
+                Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+                
+                // Turn off light or register with batch operation (if active)
+                try {
+                    camera.actuateLightAfterCapture();
+                }
+                catch (Exception e) {
+                    Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
+                }
+                
+                return new org.openpnp.model.PreCapturedPlacement(
+                        camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+            }
+        }
+        finally {
+            // Always close the pipeline to release resources
+            pipeline.close();
         }
     }
 

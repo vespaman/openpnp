@@ -287,5 +287,6 @@ public class VisionUtilsTest {
         public Length getRoamingRadius() {
             return new Length(10, LengthUnit.Millimeters);
         }
+
     }
 }

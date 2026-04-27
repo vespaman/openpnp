@@ -1452,6 +1452,10 @@ public class AdvancedCalibration extends LensCalibrationParams {
      * @param camera
      */
     public void applyCalibrationToMachine(ReferenceHead head, ReferenceCamera camera) {
+        if (getPrimaryLocation() != null) {
+            camera.setDefaultZ(getPrimaryLocation().getLengthZ());
+        }
+        
         Location calibratedOffsets = new Location(LengthUnit.Millimeters);
         if (head != null) {
             calibratedOffsets = calibratedOffsets

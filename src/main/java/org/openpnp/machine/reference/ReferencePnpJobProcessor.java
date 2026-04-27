@@ -27,6 +27,13 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.Map;
 
@@ -37,10 +44,13 @@ import org.openpnp.gui.JobPanel;
 import org.openpnp.gui.MainFrame;
 import org.openpnp.gui.support.Wizard;
 import org.openpnp.machine.reference.vision.AbstractPartAlignment;
+import org.openpnp.machine.reference.vision.ReferenceBottomVision;
 import org.openpnp.machine.reference.wizards.ReferencePnpJobProcessorConfigurationWizard;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.model.BoardLocation;
+import org.openpnp.model.CapturedShot;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.ImageBuffer;
 import org.openpnp.model.Job;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
@@ -61,6 +71,7 @@ import org.openpnp.spi.Machine;
 import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.NozzleTip;
 import org.openpnp.spi.PartAlignment;
+import org.openpnp.spi.PartAlignment.PartAlignmentOffset;
 import org.openpnp.spi.PnpJobPlanner;
 import org.openpnp.spi.PnpJobPlanner.PlannedPlacement;
 import org.openpnp.spi.PnpJobProcessor.JobPlacement.Status;
@@ -73,7 +84,11 @@ import org.openpnp.util.TravellingSalesman;
 import org.openpnp.util.UiUtils;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
+import org.openpnp.vision.pipeline.CvPipeline;
+import org.openpnp.model.VisionCompositing;
 import org.openpnp.util.FeederUtils;
+import org.openpnp.model.BottomVisionSettings;
+import org.openpnp.spi.Camera;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
@@ -161,6 +176,48 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     protected static Locator pickLocator;
     protected static Locator alignLocator;
     protected static Locator placeLocator;
+    
+    /**
+     * Separate executor for vision processing - NOT using machine.submit() to avoid command queue conflicts.
+     * This allows parallel vision processing across multiple cameras.
+     */
+    static volatile ExecutorService visionExecutor;
+    private static final Object executorLock = new Object();
+    
+    public static ExecutorService getVisionExecutor() {
+        if (visionExecutor == null || visionExecutor.isShutdown()) {
+            synchronized (executorLock) {
+                if (visionExecutor == null || visionExecutor.isShutdown()) {
+                    int poolSize = Math.max(2, 
+                        Runtime.getRuntime().availableProcessors() / 2);
+                    visionExecutor = new ThreadPoolExecutor(
+                        poolSize, poolSize,
+                        1, TimeUnit.MINUTES,
+                        new LinkedBlockingQueue<>(100),
+                        new java.util.concurrent.ThreadFactory() {
+                            private int counter = 0;
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                Thread t = new Thread(r);
+                                t.setName("vision-processor-" + counter++);
+                                t.setDaemon(true);
+                                return t;
+                            }
+                        });
+                }
+            }
+        }
+        return visionExecutor;
+    }
+    
+    public static void shutdownVisionExecutor() {
+        synchronized (executorLock) {
+            if (visionExecutor != null) {
+                visionExecutor.shutdownNow();
+                visionExecutor = null;
+            }
+        }
+    }
     
     protected List<JobPlacement> jobPlacements = new ArrayList<>();
 
@@ -1601,6 +1658,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      * Alignment step - align all parts on all nozzles
      */
     protected class Align extends PlannedPlacementStep {
+        private boolean parallelProcessed = false;
+        
         public Align(List<PlannedPlacement> plannedPlacements) {
             super(plannedPlacements);
         }
@@ -1610,7 +1669,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             if (plannedPlacement == null) {
                 return new EndCameraBatchOperation(plannedPlacements);
             }
-
+            
+            if (!parallelProcessed) {
+                parallelProcessed = true;
+                performParallelAlignment();
+                return this;
+            }
+            
             final Nozzle nozzle = plannedPlacement.nozzle;
             final JobPlacement jobPlacement = plannedPlacement.jobPlacement;
             final Placement placement = jobPlacement.getPlacement();
@@ -1631,6 +1696,42 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             return this;
         }
         
+        private void performParallelAlignment() throws JobProcessorException {
+            int cameraCount = 0;
+            try {
+                Map<Camera, List<PlannedPlacement>> placementsByCamera = new HashMap<>();
+                for (PlannedPlacement p : plannedPlacements) {
+                    Camera camera = VisionUtils.getBottomVisionCamera(p.nozzle);
+                    placementsByCamera.computeIfAbsent(camera, k -> new ArrayList<>()).add(p);
+                }
+                cameraCount = placementsByCamera.size();
+            }
+            catch (Exception e) {
+                Logger.warn("Could not determine camera count, using sequential alignment");
+            }
+            
+            if (cameraCount <= 1 || plannedPlacements.size() <= 1) {
+                Logger.debug("Using sequential alignment ({} cameras, {} placements)", cameraCount, plannedPlacements.size());
+                for (PlannedPlacement p : plannedPlacements) {
+                    PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart());
+                    if (partAlignment != null) {
+                        align(p, partAlignment);
+                    } else {
+                        p.alignmentOffsets = null;
+                        Logger.debug("Not aligning {} as no compatible enabled aligners defined", p.jobPlacement.getPlacement().getPart());
+                    }
+                    completed.add(p);
+                }
+            } else {
+                Logger.debug("Using parallel alignment ({} cameras, {} placements)", cameraCount, plannedPlacements.size());
+                ParallelAlign parallelAlign = new ParallelAlign(plannedPlacements);
+                parallelAlign.alignAllParallel();
+                for (PlannedPlacement p : plannedPlacements) {
+                    completed.add(p);
+                }
+            }
+        }
+        
         private void align(PlannedPlacement plannedPlacement, PartAlignment partAlignment) throws JobProcessorException {
             final Nozzle nozzle = plannedPlacement.nozzle;
             final JobPlacement jobPlacement = plannedPlacement.jobPlacement;
@@ -1646,7 +1747,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                             partAlignment,
                             part,
                             boardLocation,
-                            placement, nozzle);
+                            placement, nozzle, false);
                     Logger.debug("Align {} with {}, offsets {}", part, nozzle, plannedPlacement.alignmentOffsets);
                     return;
                 }
@@ -1671,6 +1772,593 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             }
             catch (Exception e) {
                 throw new JobProcessorException(nozzle, e);
+            }
+      }
+    }
+    
+   /**
+     * Parallel alignment step - align parts on multiple nozzles simultaneously.
+     * Leverages mechanical offset: when Nozzle 1 is over Camera 1, 
+     * Nozzle 2 is automatically over Camera 2.
+     */
+    protected class ParallelAlign extends Align {
+        public ParallelAlign(List<PlannedPlacement> plannedPlacements) {
+            super(plannedPlacements);
+        }
+        
+        /**
+         * Entry point for parallel alignment of all placements.
+         */
+        public void alignAllParallel() throws JobProcessorException {
+            if (plannedPlacements.size() <= 1) {
+                for (PlannedPlacement p : plannedPlacements) {
+                    super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
+                }
+                return;
+            }
+            
+            Map<Camera, List<PlannedPlacement>> placementsByCamera = new HashMap<>();
+            for (PlannedPlacement p : plannedPlacements) {
+                try {
+                    Camera camera = VisionUtils.getBottomVisionCamera(p.nozzle);
+                    placementsByCamera.computeIfAbsent(camera, k -> new ArrayList<>())
+                        .add(p);
+                }
+                catch (Exception e) {
+                    throw new JobProcessorException(
+                        p.jobPlacement.getPlacement(), p.nozzle, e);
+                }
+            }
+            
+            if (placementsByCamera.size() <= 1) {
+                for (PlannedPlacement p : plannedPlacements) {
+                    super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
+                }
+                return;
+            }
+            
+            ImageBuffer imageBuffer = null;
+            try {
+                // STEP 1: Pre-capture ALL images in main thread
+                imageBuffer = preCaptureAllImages(placementsByCamera);
+                
+                // STEP 2: Check if ALL placements have pre-captured shots
+                // If ANY placement has no shot (e.g., compositing), fall back to sequential for ALL
+                for (PlannedPlacement placement : plannedPlacements) {
+                    org.openpnp.model.CapturedShot shot = imageBuffer.getShot(placement.nozzle);
+                    if (shot == null) {
+                        Logger.info("No pre-captured shot for nozzle {}, falling back to sequential alignment for all", 
+                            placement.nozzle.getId());
+                        // Fall back to sequential for ALL placements
+                        for (PlannedPlacement p : plannedPlacements) {
+                            super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
+                        }
+                        return;
+                    }
+                }
+                
+                // STEP 3: All shots captured - submit ALL to background threads
+                List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
+                for (PlannedPlacement placement : plannedPlacements) {
+                    org.openpnp.model.CapturedShot shot = imageBuffer.getShot(placement.nozzle);
+                    futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
+                        try {
+                            processPreCapturedImage(placement, shot);
+                        }
+                        catch (JobProcessorException e) {
+                            throw new CompletionException(e);
+                        }
+                        catch (Exception e) {
+                            throw new CompletionException(
+                                new JobProcessorException(placement.nozzle, e));
+                        }
+                    }, getVisionExecutor()));
+                }
+                
+                // STEP 4: Wait for all background threads
+                try {
+                    java.util.concurrent.CompletableFuture.allOf(futures.toArray(
+                        new java.util.concurrent.CompletableFuture[0])).join();
+                }
+                catch (Exception e) {
+                    // One or more background threads failed - fall back to sequential for ALL
+                    Logger.info("Parallel alignment failed, falling back to sequential alignment for all");
+                    for (PlannedPlacement p : plannedPlacements) {
+                        super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
+                    }
+                    return;
+                }
+                
+                // STEP 5: All succeeded - nothing more to do
+            }
+            finally {
+                if (imageBuffer != null) {
+                    imageBuffer.release();
+                }
+            }
+        }
+        
+        private void moveNozzlesToAlignmentPosition(List<PlannedPlacement> placements) throws JobProcessorException {
+            if (placements.isEmpty()) {
+                return;
+            }
+            
+            try {
+                // Move the head to the alignment position for the first placement.
+                // Due to the mechanical design, when one nozzle is over its camera,
+                // the other nozzles are automatically over their respective cameras.
+                PlannedPlacement firstPlacement = placements.get(0);
+                final Nozzle nozzle = firstPlacement.nozzle;
+                final JobPlacement jobPlacement = firstPlacement.jobPlacement;
+                final Placement placement = jobPlacement.getPlacement();
+                final Part part = placement.getPart();
+                
+                PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                if (partAlignment == null || !(partAlignment instanceof ReferenceBottomVision)) {
+                    return;
+                }
+                
+                ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                if (!bottomVision.isEnabled()) {
+                    return;
+                }
+                
+                Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
+                Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(
+                    part, camera, nozzle, placement.getLocation().getRotation(), false);
+                
+                Logger.debug("Moving head to alignment position for parallel vision: {}", wantedLocation);
+                
+                // Move to safe Z first
+                nozzle.moveToSafeZ();
+                
+                // Move to the camera position (this moves the entire head)
+                MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
+                
+                // Turn on camera light BEFORE waiting for completion - this ensures M810 is queued
+                // before M400, so by the time waitForCompletion() returns, the light is already on
+                try {
+                    camera.actuateLightBeforeCapture(null);
+                }
+                catch (Exception e) {
+                    Logger.warn("Failed to turn on camera light before alignment: {}", e.getMessage());
+                }
+
+                // Wait for the head to physically arrive at the camera position before capturing images
+                nozzle.waitForCompletion(org.openpnp.spi.MotionPlanner.CompletionType.WaitForStillstand);
+                
+                Logger.debug("Head moved to alignment position for nozzle {}, camera {}", 
+                    nozzle.getId(), camera.getId());
+            }
+            catch (Exception e) {
+                throw new JobProcessorException(placements.get(0).jobPlacement.getPlacement(), 
+                    placements.get(0).nozzle, e);
+            }
+        }
+        
+        private void preDeterminePartHeights(Camera camera, List<PlannedPlacement> placements) 
+                throws JobProcessorException {
+            for (PlannedPlacement placement : placements) {
+                final Nozzle nozzle = placement.nozzle;
+                final JobPlacement jobPlacement = placement.jobPlacement;
+                final Placement actuation = jobPlacement.getPlacement();
+                final Part part = actuation.getPart();
+                
+                try {
+                    PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                    if (partAlignment != null && partAlignment instanceof ReferenceBottomVision) {
+                        ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                        if (bottomVision.isEnabled() && part != null && part.isPartHeightUnknown()) {
+                            Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(
+                                part, camera, nozzle, 0., false);
+                            Logger.debug("Pre-determined part {} height: {}", part.getId(), 
+                                part.getHeight());
+                        }
+                    }
+                }
+                catch (Exception e) {
+                    throw new JobProcessorException(part, nozzle, e);
+                }
+            }
+      }
+        
+        private ImageBuffer preCaptureAllImages(Map<Camera, List<PlannedPlacement>> placementsByCamera)
+                throws JobProcessorException {
+            // Flatten all placements into a single list
+            List<PlannedPlacement> allPlacements = new ArrayList<>();
+            for (List<PlannedPlacement> placements : placementsByCamera.values()) {
+                allPlacements.addAll(placements);
+            }
+            
+            if (allPlacements.isEmpty()) {
+                return new ImageBuffer();
+            }
+            
+            // Get the settle camera based on the first nozzle in the placement list.
+            // The job planner orders placements by nozzle, so the first nozzle will be
+            // the first to move into position and will have a part loaded (job planner
+            // doesn't schedule empty nozzles for alignment).
+            PlannedPlacement initialPlacement = allPlacements.get(0);
+            Nozzle initialNozzle = initialPlacement.nozzle;
+            Camera settleCamera;
+            try {
+                settleCamera = VisionUtils.getBottomVisionCamera(initialNozzle);
+            }
+            catch (Exception e) {
+                throw new JobProcessorException(initialPlacement.jobPlacement.getPlacement(), 
+                    initialNozzle, e);
+            }
+            List<PlannedPlacement> settleCameraPlacements = placementsByCamera.get(settleCamera);
+            
+            // The first nozzle tip (initialNozzle) should have zero displacement since the head
+            // moves to position this nozzle under the settle camera. All other nozzle tips
+            // need displacement compensation for camera-to-nozzle offset and runout.
+            Nozzle firstNozzleTip = initialNozzle;
+            
+            // Sort cameras for deterministic processing
+            List<Camera> cameras = new ArrayList<>(placementsByCamera.keySet());
+            cameras.sort((c1, c2) -> c1.getName().compareTo(c2.getName()));
+            
+            // Log all cameras participating in parallel alignment
+            StringBuilder cameraInfo = new StringBuilder();
+            cameraInfo.append("Parallel alignment: settling camera ").append(settleCamera.getName())
+                      .append(" (").append(settleCameraPlacements.size()).append(" placements)");
+            if (cameras.size() > 1) {
+                cameraInfo.append(", quick-capturing cameras ");
+                for (int i = 0; i < cameras.size(); i++) {
+                    if (!cameras.get(i).equals(settleCamera)) {
+                        if (cameraInfo.toString().contains("quick-capturing cameras") && 
+                            cameraInfo.toString().contains(")")) {
+                            cameraInfo.append(", ");
+                        }
+                        cameraInfo.append(cameras.get(i).getName())
+                                  .append(" (").append(placementsByCamera.get(cameras.get(i)).size()).append(" placements)");
+                    }
+                }
+            }
+            Logger.debug(cameraInfo.toString());
+            
+            // Pre-determine part heights for all placements
+            for (List<PlannedPlacement> placements : placementsByCamera.values()) {
+                try {
+                    preDeterminePartHeights(placements.get(0).jobPlacement.getPlacement().getPart() != null ?
+                        VisionUtils.getBottomVisionCamera(placements.get(0).nozzle) : null, placements);
+                }
+                catch (Exception e) {
+                    throw new JobProcessorException(placements.get(0).jobPlacement.getPlacement(), 
+                        placements.get(0).nozzle, e);
+                }
+            }
+            
+            // Start CameraBatchOperation to manage LED lifecycle across all captures
+            CameraBatchOperation cbo = machine.getCameraBatchOperation();
+            boolean batchStarted = false;
+            if (cbo != null) {
+                cbo.startBatchOperation("parallel-align-precapture");
+                batchStarted = true;
+                Logger.debug("Camera batch operation started for parallel alignment pre-capture");
+            }
+            
+            // Move to the first camera's position (compromise position for all cameras)
+            moveNozzlesToAlignmentPosition(settleCameraPlacements);
+            
+            ImageBuffer imageBuffer = new ImageBuffer();
+            // Track async capture futures for secondary cameras (single-shot parts only)
+            List<CompletableFuture<org.openpnp.model.PreCapturedPlacement>> asyncFutures = 
+                new ArrayList<>();
+            
+            try {
+                // ===================================================================
+                // PASS 1 (PARALLEL): Trigger async captures for single-shot parts
+                // This starts BEFORE the settle loop, allowing parallel capture
+                // during the 10-12ms settle time.
+                // ===================================================================
+                
+                // First, identify all secondary cameras and their single-shot placements
+                for (Camera captureCamera : cameras) {
+                    // Skip the settle camera - it handles its own captures
+                    if (captureCamera.equals(settleCamera)) {
+                        continue;
+                    }
+                    
+                    List<PlannedPlacement> captureCameraPlacements = placementsByCamera.get(captureCamera);
+                    if (captureCameraPlacements == null || captureCameraPlacements.isEmpty()) {
+                        continue;
+                    }
+                    
+                    // Submit async captures for single-shot parts only
+                    for (PlannedPlacement placement : captureCameraPlacements) {
+                        Nozzle nozzle = placement.nozzle;
+                        Part part = placement.jobPlacement.getPlacement().getPart();
+                        
+                        PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                        if (!(partAlignment instanceof ReferenceBottomVision)) {
+                            continue;
+                        }
+                        
+                        ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                        BottomVisionSettings bottomVisionSettings = 
+                            bottomVision.getInheritedVisionSettings(part);
+                        
+                        if (!bottomVisionSettings.isEnabled()) {
+                            continue;
+                        }
+                        
+                        // Skip multi-shot parts - they'll be handled in Pass 2
+                        if (needsMultipleShots(part)) {
+                            Logger.trace("Skipping async capture for multi-shot part {}, will handle sequentially", 
+                                part.getId());
+                            continue;
+                        }
+                        
+                        Location wantedLocation;
+                        try {
+                            wantedLocation = bottomVision.getCameraLocationAtPartHeight(
+                                part, captureCamera, nozzle, 0., false);
+                        }
+                        catch (Exception e) {
+                            throw new JobProcessorException(placement.nozzle, e);
+                        }
+                        
+                        boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
+                        
+                        // Capture references for closure
+                        final Camera cam = captureCamera;
+                        final Nozzle noz = nozzle;
+                        final Part prt = part;
+                        final boolean firstTip = isFirstNozzleTip;
+                        final Location loc = wantedLocation;
+                        final ReferenceBottomVision bv = bottomVision;
+                        
+                        // Submit async capture using default ForkJoinPool.commonPool()
+                        // This is I/O bound work, leaving visionExecutor free for OpenCV math
+                        CompletableFuture<org.openpnp.model.PreCapturedPlacement> future = 
+                            CompletableFuture.supplyAsync(() -> {
+                                try {
+                                    Logger.trace("Async capture started for camera {}, part {}", 
+                                        cam.getName(), prt.getId());
+                                    org.openpnp.model.PreCapturedPlacement shot = 
+                                        bv.captureImageOnly(prt, cam, noz, loc, firstTip);
+                                    Logger.trace("Async capture completed for camera {}, part {}", 
+                                        cam.getName(), prt.getId());
+                                    return shot;
+                                }
+                                catch (Exception e) {
+                                    throw new CompletionException(e);
+                                }
+                            });
+                        
+                        asyncFutures.add(future);
+                    }
+                }
+                
+                // ===================================================================
+                // PASS 1 CONTINUED: Settle on the first camera (blocks 10-12ms)
+                // During this time, secondary camera async captures run in parallel
+                // ===================================================================
+                
+                if (settleCameraPlacements != null && !settleCameraPlacements.isEmpty()) {
+                    PlannedPlacement firstPlacement = settleCameraPlacements.get(0);
+                    Camera camera = settleCamera;
+                    Nozzle nozzle = firstPlacement.nozzle;
+                    Part part = firstPlacement.jobPlacement.getPlacement().getPart();
+                    
+                    try {
+                        BottomVisionSettings bottomVisionSettings = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                            .getInheritedVisionSettings(part);
+                        if (bottomVisionSettings.isEnabled()) {
+                            Location wantedLocation = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                                .getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
+                            
+                            // Handle single-shot vs multi-shot for settle camera
+                            if (!needsMultipleShots(part)) {
+                                // Single-shot: use settle and capture
+                                boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
+                                org.openpnp.model.PreCapturedPlacement shot = 
+                                    ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                                    .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip);
+                                imageBuffer.addShot(nozzle, shot);
+                                
+                                // Capture remaining placements on the settle camera (single-shot only)
+                                for (int i = 1; i < settleCameraPlacements.size(); i++) {
+                                    PlannedPlacement placement = settleCameraPlacements.get(i);
+                                    nozzle = placement.nozzle;
+                                    part = placement.jobPlacement.getPlacement().getPart();
+                                    
+                                    bottomVisionSettings = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                                        .getInheritedVisionSettings(part);
+                                    if (bottomVisionSettings.isEnabled() && !needsMultipleShots(part)) {
+                                        wantedLocation = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                                            .getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
+                                        
+                                        boolean isFirstNozzleTip2 = nozzle.equals(firstNozzleTip);
+                                        org.openpnp.model.PreCapturedPlacement shot2 = 
+                                            ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
+                                            .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip2);
+                                        imageBuffer.addShot(nozzle, shot2);
+                                    }
+                                }
+                            }
+                            else {
+                                // Multi-shot part on settle camera - mark for Pass 2
+                                Logger.trace("Settle camera has multi-shot part {}, will handle in Pass 2", part.getId());
+                            }
+                        }
+                    }
+                    catch (Exception e) {
+                        throw new JobProcessorException(firstPlacement.nozzle, e);
+                    }
+                }
+                
+                // ===================================================================
+                // PASS 1 END: Wait for all async captures to complete
+                // This is very fast since captures already ran during settle
+                // ===================================================================
+                
+                if (!asyncFutures.isEmpty()) {
+                    Logger.trace("Waiting for {} async camera captures to complete", asyncFutures.size());
+                    CompletableFuture.allOf(asyncFutures.toArray(new CompletableFuture[0])).join();
+                    
+                    // Add completed captures to image buffer
+                    for (int i = 0; i < asyncFutures.size(); i++) {
+                        CompletableFuture<org.openpnp.model.PreCapturedPlacement> future = asyncFutures.get(i);
+                        try {
+                            org.openpnp.model.PreCapturedPlacement shot = future.get();
+                            imageBuffer.addShot(shot.getNozzle(), shot);
+                            Logger.trace("Async capture {} added to buffer (camera: {}, nozzle: {})", 
+                                i+1, shot.getCamera().getId(), shot.getNozzle().getId());
+                        }
+                        catch (Exception e) {
+                            Logger.error("Async camera capture failed: {}", e.getMessage());
+                            throw new JobProcessorException("Async camera capture failed", e);
+                        }
+                    }
+                    Logger.trace("All async captures complete, {} shots added", asyncFutures.size());
+                }
+                
+                // ===================================================================
+                // PASS 2 (SEQUENTIAL): Handle multi-shot parts
+                // After settle and async captures complete, process multi-shot parts
+                // that require head movement between shots.
+                // ===================================================================
+                
+                // Iterate through ALL cameras and placements
+                for (Camera captureCamera : cameras) {
+                    List<PlannedPlacement> captureCameraPlacements = placementsByCamera.get(captureCamera);
+                    if (captureCameraPlacements == null || captureCameraPlacements.isEmpty()) {
+                        continue;
+                    }
+                    
+                    for (PlannedPlacement placement : captureCameraPlacements) {
+                        Nozzle nozzle = placement.nozzle;
+                        Part part = placement.jobPlacement.getPlacement().getPart();
+                        
+                        PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                        if (!(partAlignment instanceof ReferenceBottomVision)) {
+                            continue;
+                        }
+                        
+                        ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                        BottomVisionSettings bottomVisionSettings = 
+                            bottomVision.getInheritedVisionSettings(part);
+                        
+                        if (!bottomVisionSettings.isEnabled()) {
+                            continue;
+                        }
+                        
+                        // Only process multi-shot parts here
+                        if (!needsMultipleShots(part)) {
+                            // Already handled in Pass 1 (async) or settle camera (sequential)
+                            continue;
+                        }
+                        
+                        // Multi-shot part: needs sequential processing with head movement
+                        Logger.trace("Processing multi-shot part {} sequentially on camera {}", 
+                            part.getId(), captureCamera.getName());
+                        
+                        try {
+                            Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(
+                                part, captureCamera, nozzle, 0., false);
+                            boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
+                            
+                            // For multi-shot, we need to use the settle capture method
+                            // which handles the movement between shots
+                            // This falls back to the original sequential behavior for these parts
+                            org.openpnp.model.PreCapturedPlacement shot = 
+                                bottomVision.captureImageOnlyWithSettle(part, captureCamera, nozzle, 
+                                    wantedLocation, isFirstNozzleTip);
+                            imageBuffer.addShot(nozzle, shot);
+                        }
+                        catch (Exception e) {
+                            throw new JobProcessorException(placement.nozzle, e);
+                        }
+                    }
+                }
+                
+            }
+            finally {
+                // End CameraBatchOperation - this will turn off all camera lights
+                if (batchStarted && cbo != null) {
+                    try {
+                        cbo.endBatchOperation("parallel-align-precapture");
+                        Logger.debug("Camera batch operation ended for parallel alignment pre-capture");
+                    }
+                    catch (Exception e) {
+                        Logger.warn("Failed to end camera batch operation: {}", e.getMessage());
+                    }
+                }
+            }
+            
+            return imageBuffer;
+        }
+        
+        private boolean needsMultipleShots(Part part) {
+            if (part.getPackage() == null) {
+                return false;
+            }
+            VisionCompositing visionCompositing = part.getPackage().getVisionCompositing();
+            if (visionCompositing == null) {
+                return false;
+            }
+            if (visionCompositing.getCompositingMethod() == VisionCompositing.CompositingMethod.None) {
+                return false;
+            }
+            // Check if compositing actually needs multiple shots
+            // "Restricted" mode with 0 extra shots should still work with parallel
+            BottomVisionSettings settings = null;
+            try {
+                PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                if (partAlignment instanceof ReferenceBottomVision) {
+                    settings = ((ReferenceBottomVision) partAlignment).getInheritedVisionSettings(part);
+                }
+            }
+            catch (Exception e) {
+                Logger.debug("Could not get vision settings for part {}", part.getId(), e);
+            }
+            if (settings == null) {
+                return false;
+            }
+            // Create a temporary composite to check shots travel
+            try {
+                Nozzle dummyNozzle = null;
+                Camera dummyCamera = null;
+                // We need actual nozzle/camera to create composite, but we can check the method
+                // For "Restricted" compositing, check if extra shots are configured
+                if (visionCompositing.getCompositingMethod() == VisionCompositing.CompositingMethod.Restricted) {
+                    // Restricted mode typically uses 1 shot unless extra pictures are needed
+                    // We'll allow parallel and fallback only if we detect multiple shots during actual processing
+                    return false;
+                }
+                // For other compositing methods, assume multiple shots needed
+                return true;
+            }
+            catch (Exception e) {
+                Logger.debug("Could not check shots travel for part {}", part.getId(), e);
+                return false;
+            }
+        }
+        
+        private void processPreCapturedImage(PlannedPlacement placement, CapturedShot shot) 
+                throws JobProcessorException {
+            final Nozzle nozzle = placement.nozzle;
+            final Part part = placement.jobPlacement.getPlacement().getPart();
+            final BoardLocation boardLocation = placement.jobPlacement.getBoardLocation();
+            
+            PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+            if (partAlignment == null) {
+                placement.alignmentOffsets = new PartAlignmentOffset(
+                    new Location(LengthUnit.Millimeters), false);
+                return;
+            }
+            
+            // No retries for parallel alignment - if fails, immediate fallback to sequential
+            try {
+                placement.alignmentOffsets = VisionUtils.findPartAlignmentOffsetsWithCapturedShot(
+                    partAlignment, part, boardLocation, 
+                    placement.jobPlacement.getPlacement(), nozzle, shot);
+            }
+            catch (Exception e) {
+                throw new JobProcessorException(part, nozzle, e);
             }
         }
     }
@@ -2513,7 +3201,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     
     protected abstract class PlannedPlacementStep implements Step {
         protected List<PlannedPlacement> plannedPlacements;
-        private Set<PlannedPlacement> completed = new HashSet<>();
+        protected Set<PlannedPlacement> completed = new HashSet<>();
         
         protected PlannedPlacementStep(List<PlannedPlacement> plannedPlacements) {
             this.plannedPlacements = plannedPlacements;

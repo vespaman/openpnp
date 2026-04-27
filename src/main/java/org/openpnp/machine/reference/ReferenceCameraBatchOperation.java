@@ -15,6 +15,7 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
     // null if there is no batch operation in progress
     private List<Camera> cameras;
     private int nestingLevel = 0;
+    private String currentBatchName = null;
 
     // Start a batch
     public void startBatchOperation(String name) {
@@ -22,26 +23,30 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
             cameras = new ArrayList<Camera>();
         }
         nestingLevel += 1;
-        Logger.trace("Start level {} {}",nestingLevel,name);
+        currentBatchName = name;
+        Logger.trace("Batch START level {} '{}' - cameras: {}",nestingLevel, name, cameras.size());
     }
 
     // End the batch operation, and get any cameras used in this operation to turn off their lights.
     public synchronized void endBatchOperation(String name) throws Exception {
-        Logger.trace("End level {} {}",nestingLevel,name);
+        Logger.trace("Batch END level {} '{}' - expected: {}",nestingLevel, name, currentBatchName);
 
         nestingLevel -= 1;
 
         if (nestingLevel==0) {
             List<Camera> camerasFormerlyInUse = cameras;
             cameras = null;
+            currentBatchName = null;
+            Logger.debug("Batch operation '{}' complete - turning off lights for {} cameras", 
+                name, camerasFormerlyInUse.size());
             for (Camera c: camerasFormerlyInUse) {
-                Logger.trace("Processing camera {}",c);
+                Logger.debug("  Camera '{}' - turning off light", c.getName());
                 c.actuateLightAfterCapture();
             }
         }
 
         if(nestingLevel<0) {
-            Logger.error("underflow");
+            Logger.error("Batch operation underflow - nesting level {}", nestingLevel);
             nestingLevel = 0;
         }
     }
@@ -49,12 +54,17 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
     public synchronized boolean registerWithBatchOperation(Camera c) {
         if (cameras==null) {
             // There is no batch in progress
+            Logger.trace("Camera '{}' registration attempted but no batch in progress", c.getName());
             return false;
         }
 
         if (!cameras.contains(c)) {
-            Logger.trace("Registering camera {}",c);
+            Logger.debug("Camera '{}' registered with batch '{}' (level {})", 
+                c.getName(), currentBatchName, nestingLevel);
             cameras.add(c);
+        } else {
+            Logger.trace("Camera '{}' already registered with batch '{}' (level {})", 
+                c.getName(), currentBatchName, nestingLevel);
         }
 
         return true;

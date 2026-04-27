@@ -699,7 +699,7 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
         // Make sure no rotation mode offset is currently applied.
         nozzle.setRotationModeOffset(null);
 
-        Camera camera = VisionUtils.getBottomVisionCamera();
+        Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
         ReferenceCamera referenceCamera = null;
         if (camera instanceof ReferenceCamera) {
             referenceCamera = (ReferenceCamera)camera;
@@ -921,7 +921,7 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
      */
     public Location getCalibratedCameraOffset(ReferenceNozzle nozzle, Camera camera) {
         try {
-            if (camera == VisionUtils.getBottomVisionCamera()) {
+            if (camera == VisionUtils.getBottomVisionCamera(nozzle)) {
                 if (isEnabled() && isCalibrated(nozzle)) {
                     return this.getRunoutCompensation(nozzle).getCameraOffset();
                 }
@@ -935,7 +935,7 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
     }
 
     private Location findCircle(ReferenceNozzle nozzle, Location measureLocation, boolean calibrateCamera) throws Exception {
-        Camera camera = VisionUtils.getBottomVisionCamera();
+        Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
         try (CvPipeline pipeline = getPreparedPipeline(camera, nozzle, measureLocation)) {
             
             pipeline.process();
