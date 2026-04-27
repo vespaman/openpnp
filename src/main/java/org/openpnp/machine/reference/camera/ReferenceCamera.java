@@ -194,7 +194,6 @@ public abstract class ReferenceCamera extends AbstractBroadcastingCamera impleme
         None,
         AutoFocus
     }
-
     public ReferenceCamera() {
         super();
         Configuration.get().addListener(new ConfigurationListener.Adapter() {

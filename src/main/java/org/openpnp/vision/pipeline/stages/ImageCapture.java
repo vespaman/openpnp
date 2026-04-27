@@ -16,6 +16,7 @@ import org.openpnp.vision.pipeline.Property;
 import org.openpnp.vision.pipeline.Stage;
 import org.openpnp.vision.pipeline.TerminalException;
 import org.openpnp.vision.pipeline.ui.PipelinePropertySheetTable;
+import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
 import org.simpleframework.xml.core.Commit;
@@ -95,11 +96,24 @@ public class ImageCapture extends CvStage {
         if (camera == null) {
             throw new Exception("No Camera set on pipeline.");
         }
+
+        // Check if we have a pre-captured shot for this pipeline shot index.
+        // This is used for parallel bottom vision where images are captured in the main thread
+        // before background processing begins, avoiding threading violations.
+        int shotIndex = pipeline.getCurrentShotIndex();
+        org.openpnp.model.CapturedShot preCapturedShot = pipeline.getPreCapturedShot(shotIndex);
+        if (preCapturedShot != null) {
+            // Use the pre-captured image instead of capturing a new one.
+            // This avoids hardware access in background threads.
+            Mat image = preCapturedShot.getImage().clone();
+            return new Result(image, ColorSpace.Bgr);
+        }
+
         try {
             // Light, settle and capture the image. Keep the lights on for possible averaging.
             camera.actuateLightBeforeCapture((defaultLight ? null : getLight()));
             try {
-                BufferedImage bufferedImage = camera.settleAndCapture(settleOption); 
+                BufferedImage bufferedImage = camera.settleAndCapture(this.settleOption);
                 // Remember the last captured image. This specifically records the native camera image, 
                 // i.e. it does not apply averaging (we want an unaltered raw image for analysis purposes).
                 pipeline.setLastCapturedImage(bufferedImage);

@@ -22,6 +22,7 @@ import org.openpnp.spi.CameraBatchOperation;
 import org.openpnp.spi.Head;
 import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.VisionProvider;
+import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
 
@@ -400,6 +401,8 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
         firePropertyChange("roamingRadius", oldValue, roamingRadius);
     }
 
+
+
     /**
      * Estimates the Z height of an object based upon the observed units per pixel for the
      * object. This is typically found by capturing images of a feature of the object from two
@@ -553,6 +556,7 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
 
     @Override
     public void actuateLightBeforeCapture(Object light) throws Exception {
+        Logger.trace("Camera '{}' actuateLightBeforeCapture called", this.getName());
         // Anti-glare: switch off opposite looking cameras.
         for (Camera camera : Configuration.get().getMachine().getAllCameras()) {
             if (camera != this
@@ -563,6 +567,8 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
                 if (lightActuator != null 
                         && (lightActuator.isActuated() == null || lightActuator.isActuated())) {
                     AbstractActuator.assertOnOffDefined(lightActuator);
+                    Logger.trace("Camera '{}' turning off anti-glare light for camera '{}'", 
+                        this.getName(), camera.getName());
                     actuateLight(lightActuator, lightActuator.getDefaultOffValue());
                 }
             }
@@ -572,6 +578,7 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
             Actuator lightActuator = getLightActuator();
             if (lightActuator != null) {
                 AbstractActuator.assertOnOffDefined(lightActuator);
+                Logger.trace("Camera '{}' turning ON light", this.getName());
                 actuateLight(lightActuator, 
                         (light != null ? light : lightActuator.getDefaultOnValue()));
             }
@@ -580,6 +587,8 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
 
     @Override
     public void actuateLightAfterCapture() throws Exception {
+        Logger.trace("Camera '{}' actuateLightAfterCapture called", this.getName());
+
         if (isAfterCaptureLightOff()) {
 
             Machine machine = Configuration.get().getMachine();
@@ -587,12 +596,15 @@ public abstract class AbstractCamera extends AbstractHeadMountable implements Ca
             if (cbo!=null && cbo.registerWithBatchOperation(this)) {
                 // We are in the middle of a batch operation taking many captures.
                 // This method will get called again when the batch is complete.
+                Logger.debug("Camera '{}' registered with batch operation - deferring light off", 
+                    this.getName());
                 return;
             }
 
             Actuator lightActuator = getLightActuator();
             if (lightActuator != null) {
                 AbstractActuator.assertOnOffDefined(lightActuator);
+                Logger.debug("Camera '{}' turning OFF light (no batch active)", this.getName());
                 actuateLight(lightActuator, lightActuator.getDefaultOffValue());
             }
         }

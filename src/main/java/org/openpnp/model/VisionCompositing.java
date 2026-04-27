@@ -20,7 +20,6 @@
  */
 
 package org.openpnp.model;
-import org.pmw.tinylog.Logger;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -29,9 +28,9 @@ import java.util.List;
 import java.util.Map.Entry;
 import java.util.TreeSet;
 
-import org.opencv.core.RotatedRect;
 import org.openpnp.gui.support.LengthConverter;
 import org.openpnp.model.Footprint.Pad;
+import org.openpnp.model.Point;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.NozzleTip;
@@ -39,6 +38,8 @@ import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.TravellingSalesman;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
+import org.opencv.core.RotatedRect;
+import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
 
@@ -174,7 +175,7 @@ public class VisionCompositing extends AbstractModelObject{
 
     public Camera getCamera() {
         try {
-            return VisionUtils.getBottomVisionCamera();
+            return VisionUtils.getBottomVisionCamera(null);
         }
         catch (Exception e) {
         }
@@ -797,6 +798,11 @@ public class VisionCompositing extends AbstractModelObject{
         public RotatedRect getDetectedRotatedRect() {
             return detectedRotatedRect;
         }
+        
+        void setDetectedRotatedRect(RotatedRect rect) {
+            this.detectedRotatedRect = rect;
+        }
+        
         private final double invHypot = 1/Math.hypot(1, 1); 
         private final double[] xOctogonalHullSign = new double[] { -invHypot,  0, +invHypot, -1, +1, -invHypot,  0, +invHypot };
         private final double[] yOctogonalHullSign = new double[] { -invHypot, -1, -invHypot,  0,  0, +invHypot, +1, +invHypot };

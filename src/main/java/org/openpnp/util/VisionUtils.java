@@ -3,12 +3,11 @@ package org.openpnp.util;
 import java.awt.Color;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
+import java.util.Comparator;
+import java.util.Collections;
 import org.apache.commons.io.IOUtils;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision;
 import org.openpnp.machine.reference.vision.ReferenceFiducialLocator;
@@ -38,6 +37,7 @@ import com.google.zxing.MultiFormatReader;
 import com.google.zxing.Result;
 import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 import com.google.zxing.common.HybridBinarizer;
+import org.pmw.tinylog.Logger;
 
 public class VisionUtils {
     final public static String PIPELINE_RESULTS_NAME = "results";
@@ -147,10 +147,53 @@ public class VisionUtils {
         });
         return locations;
     }
-    
-    public static Camera getBottomVisionCamera() throws Exception {
+
+    public static Integer findFirstNumber(String str) {
+        int number = 0;
+        boolean numberStart = false;
+
+        for (char character : str.toCharArray()) {
+            if (Character.isDigit(character)) {
+                number = number * 10 + Character.getNumericValue(character);
+                numberStart = true;
+            } else if (numberStart) {
+                break;
+            }
+        }
+        return numberStart ? number : -1;
+    }
+
+
+    public static Camera getBottomVisionCamera(Nozzle nozzle) throws Exception {
+        if (nozzle != null) {
+            Map<Nozzle, Camera> cache = Configuration.get().getNozzleToCameraCache();
+            Camera cached = cache.get(nozzle);
+            if (cached != null) {
+                //Logger.trace("Nozzle " + nozzle.getName() + ": returning cached camera " + cached.getName());
+                return cached;
+            }
+            
+            int nozzleNumber = findFirstNumber(nozzle.getName());
+            if (nozzleNumber != -1 ) {
+                for (Camera camera : Configuration.get().getMachine().getCameras()) {
+                    if ( camera.getLooking() == Camera.Looking.Up )
+                    {
+                        if ( nozzleNumber == findFirstNumber(camera.getName()))
+                        {
+                            Logger.trace("Nozzle " + nozzle.getName() + ": returning camera " + camera.getName());
+                            cache.put(nozzle, camera);
+                            return camera;
+                        }
+                    }
+                }
+
+                Logger.trace("Nozzle " + nozzle.getName() + ": did not find any associated camera");
+            }
+        }
+
         for (Camera camera : Configuration.get().getMachine().getCameras()) {
             if (camera.getLooking() == Camera.Looking.Up) {
+                Logger.trace("Returning default (first) camera " + camera.getName());
                 return camera;
             }
         }
@@ -266,6 +309,10 @@ public class VisionUtils {
     }
     
     public static PartAlignment.PartAlignmentOffset findPartAlignmentOffsets(PartAlignment p, Part part, BoardLocation boardLocation, Placement placement, Nozzle nozzle) throws Exception {
+        return findPartAlignmentOffsets(p, part, boardLocation, placement, nozzle, false);
+    }
+
+    public static PartAlignment.PartAlignmentOffset findPartAlignmentOffsets(PartAlignment p, Part part, BoardLocation boardLocation, Placement placement, Nozzle nozzle, boolean skipMovement) throws Exception {
         Map<String, Object> globals = new HashMap<>();
         globals.put("part", part);
         globals.put("nozzle", nozzle);
@@ -277,7 +324,7 @@ public class VisionUtils {
             cbo.startBatchOperation("visionutils");
         }
         try {
-            offsets = p.findOffsets(part, boardLocation, placement, nozzle);
+            offsets = p.findOffsets(part, boardLocation, placement, nozzle, skipMovement);
             return offsets;
         }
         finally {
@@ -287,6 +334,33 @@ public class VisionUtils {
             globals.put("offsets", offsets);
             Configuration.get().getScripting().on("Vision.PartAlignment.After", globals);
         }
+    }
+
+    public static PartAlignment.PartAlignmentOffset findPartAlignmentOffsetsWithCapturedShot(
+            PartAlignment p, Part part, BoardLocation boardLocation, Placement placement, 
+            Nozzle nozzle, org.openpnp.model.CapturedShot capturedShot) throws Exception {
+        Map<String, Object> globals = new HashMap<>();
+        globals.put("part", part);
+        globals.put("nozzle", nozzle);
+        Configuration.get().getScripting().on("Vision.PartAlignment.Before", globals);
+
+        PartAlignmentOffset offsets = null;
+        try {
+            if (p instanceof ReferenceBottomVision) {
+                ReferenceBottomVision bottomVision = (ReferenceBottomVision) p;
+                offsets = bottomVision.findOffsets(part, boardLocation, placement, nozzle, true, capturedShot);
+            }
+            else {
+                offsets = p.findOffsets(part, boardLocation, placement, nozzle, false);
+            }
+        }
+        finally {
+            globals.put("offsets", offsets);
+        }
+        
+        Configuration.get().getScripting().on("Vision.PartAlignment.After", globals);
+        
+        return offsets;
     }
 
     /**

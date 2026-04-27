@@ -254,4 +254,5 @@ public interface Camera extends HeadMountable, WizardConfigurable,
      * physical camera "pit" must allow for some extra wiggle space, on to of this nominal radius.   
      */
     public Length getRoamingRadius();
-}
+
+ }
