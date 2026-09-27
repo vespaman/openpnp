@@ -129,7 +129,6 @@ public class Configuration extends AbstractModelObject {
     private Scripting scripting;
     private EventBus bus = new EventBus();
     public TreeMap<String, String> scriptState = new TreeMap<>();
-    private Map<org.openpnp.spi.Nozzle, org.openpnp.spi.Camera> nozzleToCameraCache = new java.util.HashMap<>();
 
     public static boolean isInstanceInitialized() {
         return (instance != null);
@@ -750,10 +749,6 @@ public class Configuration extends AbstractModelObject {
 
     public Machine getMachine() {
         return machine;
-    }
-
-    public Map<org.openpnp.spi.Nozzle, org.openpnp.spi.Camera> getNozzleToCameraCache() {
-        return nozzleToCameraCache;
     }
 
     /**

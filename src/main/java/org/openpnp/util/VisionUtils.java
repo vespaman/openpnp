@@ -164,36 +164,35 @@ public class VisionUtils {
     }
 
 
+    /**
+     * Get the bottom vision camera to be used for the given nozzle. When several bottom vision
+     * cameras are fitted, the camera is paired with the nozzle by the first number occurring in
+     * their names, i.e. nozzle "N1" goes with camera "Up1". Without such a number in the name (or
+     * when there is no nozzle at all) the first up-looking camera is used, which is the historic
+     * single camera behaviour.
+     *
+     * @param nozzle the nozzle that wants to look at its part, may be null.
+     * @return the bottom vision camera to use.
+     * @throws Exception if the machine has no up-looking camera.
+     */
     public static Camera getBottomVisionCamera(Nozzle nozzle) throws Exception {
         if (nozzle != null) {
-            Map<Nozzle, Camera> cache = Configuration.get().getNozzleToCameraCache();
-            Camera cached = cache.get(nozzle);
-            if (cached != null) {
-                //Logger.trace("Nozzle " + nozzle.getName() + ": returning cached camera " + cached.getName());
-                return cached;
-            }
-            
             int nozzleNumber = findFirstNumber(nozzle.getName());
-            if (nozzleNumber != -1 ) {
+            if (nozzleNumber != -1) {
                 for (Camera camera : Configuration.get().getMachine().getCameras()) {
-                    if ( camera.getLooking() == Camera.Looking.Up )
-                    {
-                        if ( nozzleNumber == findFirstNumber(camera.getName()))
-                        {
-                            Logger.trace("Nozzle " + nozzle.getName() + ": returning camera " + camera.getName());
-                            cache.put(nozzle, camera);
-                            return camera;
-                        }
+                    if (camera.getLooking() == Camera.Looking.Up
+                            && nozzleNumber == findFirstNumber(camera.getName())) {
+                        Logger.trace("Nozzle {}: returning camera {}", nozzle.getName(), camera.getName());
+                        return camera;
                     }
                 }
-
-                Logger.trace("Nozzle " + nozzle.getName() + ": did not find any associated camera");
+                Logger.trace("Nozzle {}: no camera with a matching number", nozzle.getName());
             }
         }
 
         for (Camera camera : Configuration.get().getMachine().getCameras()) {
             if (camera.getLooking() == Camera.Looking.Up) {
-                Logger.trace("Returning default (first) camera " + camera.getName());
+                Logger.trace("Returning default (first) camera {}", camera.getName());
                 return camera;
             }
         }
