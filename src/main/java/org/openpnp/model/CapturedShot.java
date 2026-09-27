@@ -16,7 +16,7 @@ public class CapturedShot {
     private final Mat image;               // Pre-captured image (OpenCV native memory)
     private final Location shotLocation;   // Where image was captured
     private final long captureTimestamp;
-    private boolean released;
+    private volatile boolean released;
     
     public CapturedShot(Camera camera, Nozzle nozzle, Mat image, Location shotLocation) {
         this.camera = camera;

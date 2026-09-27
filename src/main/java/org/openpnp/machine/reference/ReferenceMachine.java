@@ -637,6 +637,9 @@ public class ReferenceMachine extends AbstractMachine {
 
     @Override
     public void close() throws IOException {
+        // The vision pipelines of the parallel bottom vision run on their own pool, it has no
+        // purpose once the machine is closed.
+        ReferencePnpJobProcessor.shutdownVisionExecutor();
         for (Driver driver : getDrivers()) {
             try {
                 driver.close();

@@ -32,12 +32,16 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.Map;
 
 import javax.swing.SwingUtilities;
+
+import org.opencv.core.Core;
 
 import org.openpnp.Translations;
 import org.openpnp.gui.JobPanel;
@@ -60,6 +64,7 @@ import org.openpnp.model.PanelLocation;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.model.PlacementsHolderLocation;
+import org.openpnp.model.PreCapturedPlacement;
 import org.openpnp.spi.CameraBatchOperation;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Feeder;
@@ -178,38 +183,53 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     protected static Locator placeLocator;
     
     /**
-     * Separate executor for vision processing - NOT using machine.submit() to avoid command queue conflicts.
-     * This allows parallel vision processing across multiple cameras.
+     * Separate executor for vision processing - NOT using machine.submit() to avoid command queue
+     * conflicts. This allows parallel vision processing across multiple cameras.
      */
     static volatile ExecutorService visionExecutor;
     private static final Object executorLock = new Object();
-    
+
+    /**
+     * @return the shared pool on which the vision pipelines of pre-captured images are processed.
+     *         Created on demand, its threads are daemons and it shrinks back to nothing when idle.
+     */
     public static ExecutorService getVisionExecutor() {
         if (visionExecutor == null || visionExecutor.isShutdown()) {
             synchronized (executorLock) {
                 if (visionExecutor == null || visionExecutor.isShutdown()) {
-                    int poolSize = Math.max(2, 
-                        Runtime.getRuntime().availableProcessors() / 2);
-                    visionExecutor = new ThreadPoolExecutor(
-                        poolSize, poolSize,
-                        1, TimeUnit.MINUTES,
-                        new LinkedBlockingQueue<>(100),
-                        new java.util.concurrent.ThreadFactory() {
-                            private int counter = 0;
-                            @Override
-                            public Thread newThread(Runnable r) {
-                                Thread t = new Thread(r);
-                                t.setName("vision-processor-" + counter++);
-                                t.setDaemon(true);
-                                return t;
-                            }
-                        });
+                    int poolSize = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+                    ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                            poolSize, poolSize,
+                            1, TimeUnit.MINUTES,
+                            // One task per nozzle in a parallel alignment, i.e. a handful at most,
+                            // so an unbounded queue cannot grow meaningfully and no task can be
+                            // rejected.
+                            new LinkedBlockingQueue<>(),
+                            new ThreadFactory() {
+                                private final AtomicInteger counter = new AtomicInteger();
+
+                                @Override
+                                public Thread newThread(Runnable r) {
+                                    Thread t = new Thread(r);
+                                    t.setName("vision-processor-" + counter.incrementAndGet());
+                                    t.setDaemon(true);
+                                    return t;
+                                }
+                            });
+                    // Let the pool really disappear when the job is done instead of keeping the
+                    // core threads alive for the rest of the session.
+                    executor.allowCoreThreadTimeOut(true);
+                    visionExecutor = executor;
                 }
             }
         }
         return visionExecutor;
     }
-    
+
+    /**
+     * Discard the vision processing pool, see {@link #getVisionExecutor()}. Threads are daemons so
+     * this is not needed to let the JVM exit, it only releases them earlier.
+     */
     public static void shutdownVisionExecutor() {
         synchronized (executorLock) {
             if (visionExecutor != null) {
@@ -1818,6 +1838,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             }
             
             ImageBuffer imageBuffer = null;
+            // The pipelines of the pre-captured images are processed on our own worker threads
+            // below. Left to itself, every one of those threads would spin up OpenCV's own thread
+            // pool and they would all compete for the same cores, so OpenCV is told to work
+            // single-threaded for the duration of the parallel alignment. This is a process-wide
+            // setting, hence it is only changed here and restored right afterwards.
+            int opencvThreads = Core.getNumThreads();
+            Core.setNumThreads(1);
             try {
                 // STEP 1: Pre-capture ALL images in main thread
                 imageBuffer = preCaptureAllImages(placementsByCamera);
@@ -1825,7 +1852,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 // STEP 2: Check if ALL placements have pre-captured shots
                 // If ANY placement has no shot (e.g., compositing), fall back to sequential for ALL
                 for (PlannedPlacement placement : plannedPlacements) {
-                    org.openpnp.model.CapturedShot shot = imageBuffer.getShot(placement.nozzle);
+                    CapturedShot shot = imageBuffer.getShot(placement.nozzle);
                     if (shot == null) {
                         Logger.info("No pre-captured shot for nozzle {}, falling back to sequential alignment for all", 
                             placement.nozzle.getId());
@@ -1838,10 +1865,10 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 }
                 
                 // STEP 3: All shots captured - submit ALL to background threads
-                List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
+                List<CompletableFuture<Void>> futures = new ArrayList<>();
                 for (PlannedPlacement placement : plannedPlacements) {
-                    org.openpnp.model.CapturedShot shot = imageBuffer.getShot(placement.nozzle);
-                    futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
+                    CapturedShot shot = imageBuffer.getShot(placement.nozzle);
+                    futures.add(CompletableFuture.runAsync(() -> {
                         try {
                             processPreCapturedImage(placement, shot);
                         }
@@ -1857,8 +1884,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 
                 // STEP 4: Wait for all background threads
                 try {
-                    java.util.concurrent.CompletableFuture.allOf(futures.toArray(
-                        new java.util.concurrent.CompletableFuture[0])).join();
+                    CompletableFuture.allOf(futures.toArray(
+                        new CompletableFuture[0])).join();
                 }
                 catch (Exception e) {
                     // One or more background threads failed - fall back to sequential for ALL
@@ -1872,6 +1899,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 // STEP 5: All succeeded - nothing more to do
             }
             finally {
+                Core.setNumThreads(opencvThreads);
                 if (imageBuffer != null) {
                     imageBuffer.release();
                 }
@@ -2044,7 +2072,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             
             ImageBuffer imageBuffer = new ImageBuffer();
             // Track async capture futures for secondary cameras (single-shot parts only)
-            List<CompletableFuture<org.openpnp.model.PreCapturedPlacement>> asyncFutures = 
+            List<CompletableFuture<PreCapturedPlacement>> asyncFutures = 
                 new ArrayList<>();
             
             try {
@@ -2112,12 +2140,12 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                         
                         // Submit async capture using default ForkJoinPool.commonPool()
                         // This is I/O bound work, leaving visionExecutor free for OpenCV math
-                        CompletableFuture<org.openpnp.model.PreCapturedPlacement> future = 
+                        CompletableFuture<PreCapturedPlacement> future = 
                             CompletableFuture.supplyAsync(() -> {
                                 try {
                                     Logger.trace("Async capture started for camera {}, part {}", 
                                         cam.getName(), prt.getId());
-                                    org.openpnp.model.PreCapturedPlacement shot = 
+                                    PreCapturedPlacement shot = 
                                         bv.captureImageOnly(prt, cam, noz, loc, firstTip);
                                     Logger.trace("Async capture completed for camera {}, part {}", 
                                         cam.getName(), prt.getId());
@@ -2154,7 +2182,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                             if (!needsMultipleShots(part)) {
                                 // Single-shot: use settle and capture
                                 boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
-                                org.openpnp.model.PreCapturedPlacement shot = 
+                                PreCapturedPlacement shot = 
                                     ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
                                     .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip);
                                 imageBuffer.addShot(nozzle, shot);
@@ -2172,7 +2200,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                             .getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
                                         
                                         boolean isFirstNozzleTip2 = nozzle.equals(firstNozzleTip);
-                                        org.openpnp.model.PreCapturedPlacement shot2 = 
+                                        PreCapturedPlacement shot2 = 
                                             ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
                                             .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip2);
                                         imageBuffer.addShot(nozzle, shot2);
@@ -2201,9 +2229,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     
                     // Add completed captures to image buffer
                     for (int i = 0; i < asyncFutures.size(); i++) {
-                        CompletableFuture<org.openpnp.model.PreCapturedPlacement> future = asyncFutures.get(i);
+                        CompletableFuture<PreCapturedPlacement> future = asyncFutures.get(i);
                         try {
-                            org.openpnp.model.PreCapturedPlacement shot = future.get();
+                            PreCapturedPlacement shot = future.get();
                             imageBuffer.addShot(shot.getNozzle(), shot);
                             Logger.trace("Async capture {} added to buffer (camera: {}, nozzle: {})", 
                                 i+1, shot.getCamera().getId(), shot.getNozzle().getId());
@@ -2264,7 +2292,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                             // For multi-shot, we need to use the settle capture method
                             // which handles the movement between shots
                             // This falls back to the original sequential behavior for these parts
-                            org.openpnp.model.PreCapturedPlacement shot = 
+                            PreCapturedPlacement shot = 
                                 bottomVision.captureImageOnlyWithSettle(part, captureCamera, nozzle, 
                                     wantedLocation, isFirstNozzleTip);
                             imageBuffer.addShot(nozzle, shot);
@@ -2275,6 +2303,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     }
                 }
                 
+            }
+            catch (Exception | Error e) {
+                // The caller never gets the buffer, so nothing would ever release the images that
+                // have already been captured. Do it here instead of leaving it to the garbage
+                // collector reclaiming native OpenCV memory at an unpredictable later time.
+                imageBuffer.release();
+                throw e;
             }
             finally {
                 // End CameraBatchOperation - this will turn off all camera lights
