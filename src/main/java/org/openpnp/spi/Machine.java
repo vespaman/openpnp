@@ -25,6 +25,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 
 import org.openpnp.model.Length;
+import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Solutions;
 
@@ -403,12 +404,65 @@ public interface Machine extends WizardConfigurable, PropertySheetHolder, Closea
      */
     public boolean isAutoLoadMostRecentJob();
 
-    public boolean isDisplacementEnabled();
-    public Length getBalanceLevel();
-    public void setBalanceLevel(Length level);
-    public Length getDisplacementMaxDistance();
-    public Length getDisplacementMaxZDiff();
-    public double getDisplacementMaxRotation();
+    /**
+     * @return True if a bottom vision image may be used even when the nozzle was not exactly on
+     *         the shot location, see {@link #getDisplacementMaxDistance()}.
+     */
+    public default boolean isDisplacementEnabled() {
+        return false;
+    }
+
+    public default void setDisplacementEnabled(boolean displacementEnabled) {
+    }
+
+    /**
+     * The common Z height at which the nozzles are held when bottom vision images are taken. This
+     * makes the working planes of several bottom vision cameras and the part height probing
+     * comparable.
+     *
+     * @return the balance level, 0 by default i.e. the shot location Z is used as it is.
+     */
+    public default Length getBalanceLevel() {
+        return new Length(0, LengthUnit.Millimeters);
+    }
+
+    public default void setBalanceLevel(Length balanceLevel) {
+    }
+
+    /**
+     * When a bottom vision image is taken without moving the nozzle exactly onto the shot
+     * location, the difference is compensated in the image analysis instead. This limits how far
+     * the nozzle may be away from the shot location for that to still be acceptable.
+     *
+     * @return the maximum tolerated X/Y displacement.
+     */
+    public default Length getDisplacementMaxDistance() {
+        return new Length(0, LengthUnit.Millimeters);
+    }
+
+    public default void setDisplacementMaxDistance(Length displacementMaxDistance) {
+    }
+
+    /**
+     * @return the maximum tolerated Z difference, see {@link #getDisplacementMaxDistance()}.
+     */
+    public default Length getDisplacementMaxZDiff() {
+        return new Length(0, LengthUnit.Millimeters);
+    }
+
+    public default void setDisplacementMaxZDiff(Length displacementMaxZDiff) {
+    }
+
+    /**
+     * @return the maximum tolerated rotation difference in degrees, see
+     *         {@link #getDisplacementMaxDistance()}.
+     */
+    public default double getDisplacementMaxRotation() {
+        return 0.;
+    }
+
+    public default void setDisplacementMaxRotation(double displacementMaxRotation) {
+    }
 
     public CameraBatchOperation getCameraBatchOperation();
 

@@ -161,21 +161,41 @@ public class ReferenceMachine extends AbstractMachine {
     @Element(required = false)
     private boolean autoLoadMostRecentJob = false;
 
+    /**
+     * When several bottom vision cameras are used, a nozzle is usually not exactly under its own
+     * camera. If the remaining offset is small, the image can still be taken and the offset can be
+     * compensated in the image analysis instead of moving the nozzle. This avoids the settling and
+     * the vibration of a tiny move. See ReferenceBottomVision.
+     */
     @Element(required = false)
     private boolean displacementEnabled = false;
 
+    /**
+     * Common Z height at which the nozzles are balanced when bottom vision images are taken.
+     */
     @Element(required = false)
-    private Length balanceLevel = new Length( 0.0, LengthUnit.Millimeters);
+    private Length balanceLevel = new Length(0.0, LengthUnit.Millimeters);
 
+    /**
+     * Maximum X/Y distance from the shot location for which the image is still taken without
+     * moving the nozzle, see displacementEnabled.
+     */
     @Element(required = false)
-    private Length displacementMaxDistance = new Length( 0.5, LengthUnit.Millimeters);
+    private Length displacementMaxDistance = new Length(0.5, LengthUnit.Millimeters);
 
+    /**
+     * Maximum Z difference from the shot location for which the image is still taken without
+     * moving the nozzle, see displacementEnabled.
+     */
     @Element(required = false)
-    private Length displacementMaxZDiff = new Length( 0.1, LengthUnit.Millimeters);
+    private Length displacementMaxZDiff = new Length(0.1, LengthUnit.Millimeters);
 
+    /**
+     * Maximum rotation difference in degrees for which the image is still taken without moving the
+     * nozzle, see displacementEnabled.
+     */
     @Element(required = false)
     private double displacementMaxRotation = 0.01;
-
 
     @Element(required = false)
     private Solutions solutions = new Solutions();
@@ -374,6 +394,7 @@ public class ReferenceMachine extends AbstractMachine {
         this.autoLoadMostRecentJob = autoLoadMostRecentJob;
     }
 
+    @Override
     public boolean isDisplacementEnabled() {
         return displacementEnabled;
     }
@@ -382,24 +403,44 @@ public class ReferenceMachine extends AbstractMachine {
         this.displacementEnabled = displacementEnabled;
     }
 
-    /** Sets and gets the balance level for the nozzles.
-     * Balance level is used as a unified target Z for bottom vision focusing and part height probing
-     * when multi bottom vision cameras are used on a head.
+    /**
+     * @return the common Z height at which the nozzles are balanced when bottom vision images are
+     *         taken.
      */
+    @Override
     public Length getBalanceLevel() {
-        return this.balanceLevel;
+        return balanceLevel;
     }
-    public void setBalanceLevel(Length level) {
-        this.balanceLevel = level;
+
+    public void setBalanceLevel(Length balanceLevel) {
+        this.balanceLevel = balanceLevel;
     }
+
+    @Override
     public Length getDisplacementMaxDistance() {
-        return this.displacementMaxDistance;
+        return displacementMaxDistance;
     }
+
+    public void setDisplacementMaxDistance(Length displacementMaxDistance) {
+        this.displacementMaxDistance = displacementMaxDistance;
+    }
+
+    @Override
     public Length getDisplacementMaxZDiff() {
-        return this.displacementMaxZDiff;
+        return displacementMaxZDiff;
     }
+
+    public void setDisplacementMaxZDiff(Length displacementMaxZDiff) {
+        this.displacementMaxZDiff = displacementMaxZDiff;
+    }
+
+    @Override
     public double getDisplacementMaxRotation() {
-        return this.displacementMaxRotation;
+        return displacementMaxRotation;
+    }
+
+    public void setDisplacementMaxRotation(double displacementMaxRotation) {
+        this.displacementMaxRotation = displacementMaxRotation;
     }
 
 
