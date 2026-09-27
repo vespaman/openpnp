@@ -113,3 +113,50 @@ Decisions taken:
 
 Machine configuration and captured images, `openpnp.sh`, any modification of the agent1 repository,
 closing PR #1916, and pushing to `origin`.
+
+## 6. Outcome (2026-09-27)
+
+Branch `parallel-bottom-vision`, based on `upstream/test` `16d29e7b33`:
+
+| Commit | Content |
+|--------|---------|
+| `1f64cfbb35` | the salvaged work, ported as one commit (parallel capture + displacement, MBV squashed in) |
+| `cf456ad267` | design history documents imported into `docs/design/parallel-bottom-vision/` |
+| `dac7e90083` | MBV quality fix: displacement settings on `Machine` become `default` methods |
+| `f92ab69073` | MBV quality fix: unit-safe displacement handling of pre-captured shots |
+| `8190ae9c2a` | hardening R1 |
+| `dec31fedef` | hardening R2, R3 |
+| `68848cfd5d` | hardening R4 (part), R5, R2 scope |
+| `92c971eb18` | hardening R6 (part) |
+| `a66d0dad5d`, `8f9fb00a98` | this plan and `PRE-ALIGNMENT-CHECK.md` |
+
+Disposition of the risk register. The full test suite (277 tests) passed both before and after the
+hardening commits; none of the items below marked *fixed* changes what the machine does, they only
+remove the ways it could go wrong.
+
+| # | Disposition |
+|---|-------------|
+| R1 | **fixed** `8190ae9c2a`: the cache is gone, the camera is looked up on every call. The lookup is a loop over a handful of cameras; there is nothing worth caching in it. |
+| R2 | **fixed** `dec31fedef` + `68848cfd5d`: no longer touched by the pipeline constructor; `alignAllParallel()` saves the value, sets one thread for its own duration and restores it in a `finally`. |
+| R3 | **fixed** `dec31fedef`: skipped stage resets are logged, and the `clone()` shortcut that avoided the reset is gone. |
+| R4 | **partly fixed** `68848cfd5d`: a pre-capture that throws now releases the images it had already taken, and the released flag of a shot is visible to the other threads. Not done: an audit of who owns the `Mat` in `processPreCapturedImage()` and `clearPreCapturedShots()`, and whether overwriting a buffered shot releases the old image. Needs a native-memory measurement on the machine, not a code reading. |
+| R5 | **fixed** `68848cfd5d`: unbounded queue (at most one task per nozzle exists anyway), atomic thread numbering, pool allowed to shrink to zero, `shutdownVisionExecutor()` called from `ReferenceMachine.close()`. |
+| R6 | **partly fixed** `92c971eb18`: the align step again verifies the part is still on the nozzle afterwards, which is what the parallel path had silently dropped, and the flag is documented. Not done: the flag is still a one-shot on a step object; what happens to it on a job retry or an aborted-then-resumed job is untested. |
+| R7 | **partly fixed** `f92ab69073`: displacement limits are enforced in real units, a displaced shot is only used in the single-pass case, and using one after a rotation now logs a warning instead of pretending. Not done: the post-rotate path still does not compensate the displacement, and the correctness of the per-shot delta needs a real machine with displacement enabled. |
+| R8 | **not done, on purpose**: `ReferenceBottomVision` remains a 4000 line class with three `findOffsets` and two of most other things. Untangling it is a behaviour-preserving refactor of the code that decides where a part is, and it should be done with the machine available to verify it, not as drive-by cleanup. |
+| R9 | **fixed** `dac7e90083` for the `Machine` methods; the ported `PartAlignment.findOffsets(..., boolean skipMovement)` was already a `default` method. The other methods named in the register (`Camera.set/getCapturedImage`, `CameraBatchOperation.getCurrentBatchName`, an `AdvancedCalibration` overload) turned out not to exist in the tree; the register was over-inclusive. |
+| R10 | **not measured**: the trace logging in the light path is still there. Whether it costs anything is a measurement on the machine, and it is cheap to remove if it does. |
+| R11 | **mostly not a defect**: `System.out.println` in tests is the convention of this repository (30 test files use it), so the new tests were left alone. The hardcoded `/home/micke/...` paths and the repository-root fixtures belong to the pre-check snapshot on `parallel-bottom-vision-wip`, not to this branch, and that branch is not meant to be merged. |
+| R12 | documented in `PRE-ALIGNMENT-CHECK.md`, not implemented. |
+
+Still open, in the order they should be taken:
+
+1. Machine validation with displacement enabled: a job with parts on several nozzles, checking the
+   alignment results against the same job with `displacement-enabled` off, and watching the native
+   memory over a long run.
+2. R7 post-rotate compensation, once (1) says where the remaining error is.
+3. R4 ownership audit.
+4. R8 class untangling, with the machine available.
+
+The branch has not been built on real hardware from this repository; the "verified on real hardware"
+status belongs to the author's checkout at `6343c999e9`.
