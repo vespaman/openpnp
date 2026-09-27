@@ -1696,7 +1696,10 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 return new EndCameraBatchOperation(plannedPlacements);
             }
             
-            if (!parallelProcessed) {
+            // The whole batch is aligned in one go, once. A machine that does not want that
+            // (Machine.isParallelAlignmentEnabled()) falls through to the placement by placement
+            // handling below, as it did before the parallel path existed.
+            if (!parallelProcessed && machine.isParallelAlignmentEnabled()) {
                 parallelProcessed = true;
                 performParallelAlignment();
                 return this;

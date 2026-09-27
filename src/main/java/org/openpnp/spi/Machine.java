@@ -464,6 +464,20 @@ public interface Machine extends WizardConfigurable, PropertySheetHolder, Closea
     public default void setDisplacementMaxRotation(double displacementMaxRotation) {
     }
 
+    /**
+     * @return True if the parts of a placement batch may be aligned in one pass, i.e. all the
+     *         bottom vision images of the batch are captured and processed together instead of one
+     *         nozzle at a time. Only ever relevant on a machine with more than one bottom vision
+     *         camera; with a single one the alignment is sequential either way. Turn it off to get
+     *         the classic, one-nozzle-at-a-time behaviour.
+     */
+    public default boolean isParallelAlignmentEnabled() {
+        return true;
+    }
+
+    public default void setParallelAlignmentEnabled(boolean parallelAlignmentEnabled) {
+    }
+
     public CameraBatchOperation getCameraBatchOperation();
 
 }

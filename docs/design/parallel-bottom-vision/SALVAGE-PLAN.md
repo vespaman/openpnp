@@ -108,6 +108,7 @@ Decisions taken:
 | R10 | `Logger.trace` added to the per-capture light path; overhead must be measured | `AbstractCamera` |
 | R11 | Test hygiene: 149 added `System.out` lines, hardcoded `/home/micke/dev_random/openpnp/precheck_img/precheck` paths, fixtures at the repository root instead of `src/test/resources` | new `Parallel*Test`, `PreCheck*Test` |
 | R12 | The pre-check WIP is mid-debug and over budget: 50-70 ms measured against a ~30 ms settle window | `.opencode/plans/diagnose-precheck-timing.md` |
+| R13 | No way back: the parallel path has no setting of its own, it is taken whenever a batch has more than one bottom vision camera and more than one placement. Found while writing the outcome, it is not in the register above. | `ReferencePnpJobProcessor.Align.stepImpl()` and `performParallelAlignment()` |
 
 ## 5. Out of scope
 
@@ -148,12 +149,15 @@ remove the ways it could go wrong.
 | R10 | **not measured**: the trace logging in the light path is still there. Whether it costs anything is a measurement on the machine, and it is cheap to remove if it does. |
 | R11 | **mostly not a defect**: `System.out.println` in tests is the convention of this repository (30 test files use it), so the new tests were left alone. The hardcoded `/home/micke/...` paths and the repository-root fixtures belong to the pre-check snapshot on `parallel-bottom-vision-wip`, not to this branch, and that branch is not meant to be merged. |
 | R12 | documented in `PRE-ALIGNMENT-CHECK.md`, not implemented. |
+| R13 | **fixed** after the first test run of this outcome: `parallel-alignment-enabled` on `ReferenceMachine`, exposed as a `default` method on the `Machine` SPI, gating `Align.stepImpl()`. Defaults to `true`, i.e. the behaviour of the checkout this came from; set it to `false` to get the classic one-nozzle-at-a-time alignment without rebuilding. No GUI, like the displacement settings. |
 
 Still open, in the order they should be taken:
 
-1. Machine validation with displacement enabled: a job with parts on several nozzles, checking the
-   alignment results against the same job with `displacement-enabled` off, and watching the native
-   memory over a long run.
+1. Machine validation with displacement enabled: the same job three times, with
+   `parallel-alignment-enabled` off, on with `displacement-enabled` off, and on with
+   `displacement-enabled` on. Comparing the placement offsets of the three runs says both whether
+   the parallel path agrees with the classic one and what displacement costs in accuracy. Watch the
+   native memory over a long run.
 2. R7 post-rotate compensation, once (1) says where the remaining error is.
 3. R4 ownership audit.
 4. R8 class untangling, with the machine available.

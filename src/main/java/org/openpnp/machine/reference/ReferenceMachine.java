@@ -197,6 +197,16 @@ public class ReferenceMachine extends AbstractMachine {
     @Element(required = false)
     private double displacementMaxRotation = 0.01;
 
+    /**
+     * The parts of a placement batch are aligned in one pass instead of one nozzle at a time: all
+     * the bottom vision images of the batch are captured, one camera settling while the others
+     * photograph their nozzles, and the images are then analysed in parallel. Only relevant when
+     * the machine has more than one bottom vision camera. Switch it off for the classic
+     * one-nozzle-at-a-time alignment. See ReferencePnpJobProcessor.
+     */
+    @Element(required = false)
+    private boolean parallelAlignmentEnabled = true;
+
     @Element(required = false)
     private Solutions solutions = new Solutions();
 
@@ -443,7 +453,15 @@ public class ReferenceMachine extends AbstractMachine {
         this.displacementMaxRotation = displacementMaxRotation;
     }
 
+    @Override
+    public boolean isParallelAlignmentEnabled() {
+        return parallelAlignmentEnabled;
+    }
 
+    @Override
+    public void setParallelAlignmentEnabled(boolean parallelAlignmentEnabled) {
+        this.parallelAlignmentEnabled = parallelAlignmentEnabled;
+    }
 
     @Override
     public Wizard getConfigurationWizard() {
