@@ -1678,6 +1678,12 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      * Alignment step - align all parts on all nozzles
      */
     protected class Align extends PlannedPlacementStep {
+        /**
+         * True once this whole batch of placements has been aligned in one go by
+         * {@link #performParallelAlignment()}. Only the placements that could not be handled then
+         * (none in the normal case, a failed batch in the error case) still go through the
+         * placement-by-placement code below.
+         */
         private boolean parallelProcessed = false;
         
         public Align(List<PlannedPlacement> plannedPlacements) {
@@ -1736,6 +1742,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart());
                     if (partAlignment != null) {
                         align(p, partAlignment);
+                        checkPartOn(p.nozzle);
                     } else {
                         p.alignmentOffsets = null;
                         Logger.debug("Not aligning {} as no compatible enabled aligners defined", p.jobPlacement.getPlacement().getPart());
@@ -1747,6 +1754,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 ParallelAlign parallelAlign = new ParallelAlign(plannedPlacements);
                 parallelAlign.alignAllParallel();
                 for (PlannedPlacement p : plannedPlacements) {
+                    checkPartOn(p.nozzle);
                     completed.add(p);
                 }
             }
