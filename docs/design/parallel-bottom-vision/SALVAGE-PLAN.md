@@ -131,6 +131,10 @@ Branch `parallel-bottom-vision`, based on `upstream/test` `16d29e7b33`:
 | `68848cfd5d` | hardening R4 (part), R5, R2 scope |
 | `92c971eb18` | hardening R6 (part) |
 | `a66d0dad5d`, `8f9fb00a98` | this plan and `PRE-ALIGNMENT-CHECK.md` |
+| `a939b4e3df` | R13: the `parallel-alignment-enabled` setting |
+| `74cb7cc892` | R14: the sequential small-move saving of MBV, per shot instead of per camera |
+
+The documentation commits in between are left out of the table, `git log --oneline` has them all.
 
 Disposition of the risk register. The full test suite (277 tests) passed both before and after the
 hardening commits; none of the items below marked *fixed* changes what the machine does, they only
@@ -151,20 +155,19 @@ remove the ways it could go wrong.
 | R11 | **mostly not a defect**: `System.out.println` in tests is the convention of this repository (30 test files use it), so the new tests were left alone. The hardcoded `/home/micke/...` paths and the repository-root fixtures belong to the pre-check snapshot on `parallel-bottom-vision-wip`, not to this branch, and that branch is not meant to be merged. |
 | R12 | documented in `PRE-ALIGNMENT-CHECK.md`, not implemented. |
 | R13 | **fixed** after the first test run of this outcome: `parallel-alignment-enabled` on `ReferenceMachine`, exposed as a `default` method on the `Machine` SPI, gating `Align.stepImpl()`. Defaults to `true`, i.e. the behaviour of the checkout this came from; set it to `false` to get the classic one-nozzle-at-a-time alignment without rebuilding. No GUI, like the displacement settings. |
-| R14 | **documented, not restored**. The data itself was never lost and does not need a new field: `getCalibratedCameraOffset()` returns the `center-x`/`center-y` of the runout compensation of the fitted nozzle tip, which in the real configuration is 0.1-0.25 mm per nozzle - the "slight delta" of the machine concept. The MBV sequential no-move path is a separate feature and it is a behaviour change on a branch that is about to be machine tested, so it waits until the test has a baseline; if it is brought back it must carry the displacement per shot (pipeline property), not as mutable state on the `Camera`, which is exactly the sharing that R1 and R4 were about. |
+| R14 | **fixed** `74cb7cc892`, per-shot rather than per-camera: `CvPipeline.setShotDisplacement(shotIndex, ...)` records that the picture is taken without moving, `ImageCapture` skips the settling for that shot, and `findOffsetsPreRotate()` subtracts what is left. Narrower than MBV on purpose, because MBV kept the value on the `Camera` and never cleared it on the branch that did move, so a stale displacement could be applied to a later pass or to the other nozzle: it is only done for a single-shot part (a composited part is assembled from its shots in machine coordinates), only in pre-rotate (the post-rotate path returns offsets relative to the camera centre and has no nozzle location to correct), and the value is cleared on every `resetReusedPipeline()`. `ShotDisplacementTest` covers the bookkeeping; whether the compensation is right is run D of `MACHINE-TEST.md`. |
 
 Still open, in the order they should be taken:
 
-1. `MACHINE-TEST.md`: the same job run three times, with `parallel-alignment-enabled` off, on with
-   `displacement-enabled` off, and on with `displacement-enabled` on, plus the abort, missing-part,
-   single-camera and long-run checks. Placement accuracy is deliberately not measured - on this
-   machine it is dominated by mechanics and by the last calibration, so a change of this kind
-   cannot be seen in it; behaviour, rejections, cycle time and memory can.
+1. `MACHINE-TEST.md`: the same job run four times, with `parallel-alignment-enabled` off, on with
+   `displacement-enabled` off, on with `displacement-enabled` on, and off with
+   `displacement-enabled` on, plus the abort, missing-part, single-camera and long-run checks.
+   Placement accuracy is deliberately not measured - on this machine it is dominated by mechanics and
+   by the last calibration, so a change of this kind cannot be seen in it; behaviour, rejections,
+   cycle time and memory can.
 2. R7 post-rotate compensation, once (1) says where the remaining error is.
-3. R14: if the run with `parallel-alignment-enabled` off is measurably slower than MBV was, bring
-   back the sequential no-move displacement, per shot rather than per camera.
-4. R4 ownership audit.
-5. R8 class untangling, with the machine available.
+3. R4 ownership audit.
+4. R8 class untangling, with the machine available.
 
 The branch has not been built on real hardware from this repository; the "verified on real hardware"
 status belongs to the author's checkout at `6343c999e9`.

@@ -42,11 +42,12 @@ sorts them below the documents written in this fork.
   already measured by the nozzle tip calibration
   (`ReferenceNozzleTipCalibration.getCalibratedCameraOffset()`, the `center-x`/`center-y` of the
   runout compensation, looked up per nozzle) plus the runout at the wanted rotation angle, carried
-  per shot in `PreCapturedPlacement`. That is what `displacement-enabled` buys in this branch.
-  Not carried over from `multi-bottom-vision`: its sequential trick of not moving a nozzle that is
-  already close to the shot location and compensating the difference in the analysis. With
-  `parallel-alignment-enabled` off, displacement only sets the Z of the shot to the balance level.
-  See R14 in `SALVAGE-PLAN.md`.
+   per shot in `PreCapturedPlacement`. The balance level Z of the shot also comes from it.
+  The sequential trick of `multi-bottom-vision` - a nozzle already close to its shot location is not
+  moved at all, the picture is taken without settling and the difference is compensated in the
+  analysis - was dropped by the parallel rework and restored in this fork, but kept per shot on the
+  pipeline instead of mutable state on the `Camera`, and only for pre-rotate and single-shot parts.
+  See R14 in `SALVAGE-PLAN.md` and run D in `MACHINE-TEST.md`.
 - Pre-alignment check: **not merged**. A mid-debug snapshot is preserved on branch
   `parallel-bottom-vision-wip`; see `PRE-ALIGNMENT-CHECK.md` for the write-up.
 

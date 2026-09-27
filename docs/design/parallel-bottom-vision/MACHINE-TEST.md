@@ -50,16 +50,27 @@ the cameras is close to, but not equal to, the distance between the nozzles - th
    |---|---|---|
    | A | `false` | `false` |
    | B | `true` | `false` |
-    | C | `true` | `true` |
+   | C | `true` | `true` |
+   | D | `false` | `true` |
 
-   What the runs are, as of this branch (see R14 in `SALVAGE-PLAN.md`): A is the classic upstream
-   behaviour, one nozzle walked to its shot location at a time. B is the parallel path with every
-   nozzle still driven to its exact shot location. C is the parallel path where the head parks once
-   and the nozzles other than the settle nozzle are photographed where they happen to be, their
-   calibrated camera offset plus runout being compensated in the analysis. `displacement-enabled` in
-   run A does almost nothing here - in this branch the sequential path only takes the balance level Z
-   from it, it does not yet have the `multi-bottom-vision` trick of skipping a move that is small
-   enough. So compare run A with upstream, not with the old `multi-bottom-vision` timings.
+   What the runs are, as of this branch (see R14 in `SALVAGE-PLAN.md`):
+
+   - **A** is the classic upstream behaviour: one nozzle walked to its exact shot location at a
+     time, settling every time. Compare A with upstream, not with the old `multi-bottom-vision`
+     timings.
+   - **B** is the parallel path with every nozzle still driven to its exact shot location.
+   - **C** is the parallel path where the head parks once and the nozzles other than the settle
+     nozzle are photographed where they happen to be, their calibrated camera offset plus runout
+     being compensated in the analysis.
+   - **D** is the sequential path with the small-move saving of `multi-bottom-vision` restored: a
+     nozzle already within `displacement-max-distance` (and the rotation and Z limits) of its shot
+     location is not moved at all, the picture is taken without settling and the difference is
+     compensated in the analysis. Only for pre-rotate and only for single-shot parts, so a
+     composited part still moves. Look for `compensating` in the log; if a run of D shows as many
+     moves as A, the limits are too tight or the nozzle really is far from the shot location.
+
+   Run D is the one to watch for accuracy: it is the only one where the machine deliberately
+   measures a part from a place that is not the shot location, on its own.
 
 
 The test job: more than one bottom vision camera in use, more than one nozzle per camera, at least
@@ -71,8 +82,11 @@ compositing (multi-shot). A production job of yours is ideal - do not build a sy
 For each run, in `OpenPnP.log`:
 
 ```
-grep -c "Using parallel alignment" OpenPnP.log     # expect: run A 0, runs B and C >= 1
-grep -c "Using sequential alignment" OpenPnP.log   # run A >= 1
+grep -c "Using parallel alignment" OpenPnP.log          # expect: run A and D 0, runs B and C >= 1
+grep -c "Using sequential alignment" OpenPnP.log        # run A and D >= 1
+grep -c "nozzle not moved to the shot location" OpenPnP.log   # run D >= 1, run A 0
+grep -c "displacement (sequential)" OpenPnP.log         # run D >= 1, run A 0
+grep -c "displacement (parallel)" OpenPnP.log           # run C >= 1, run B 0
 ```
 
 If run B or C shows sequential on a multi-camera machine, stop: the setting is not being read, or
@@ -102,7 +116,7 @@ Pass:
   normal run. If it appears, the interesting part of the log is the 50 lines before it.
 
 The one numeric comparison worth doing, because it is easy and it is self-consistent rather than
-absolute: for a few placements that appear in all three runs, look at the `Offsets accepted {...}`
+absolute: for a few placements that appear in all the runs, look at the `Offsets accepted {...}`
 lines. They should be of the same order (say within 0.05 mm / 0.5° of each other). If they agree,
 the paths agree. If one of them is out by a millimetre, something in the displacement or camera
 pairing is wrong. Do not push it finer than that - you cannot measure it finer anyway.
