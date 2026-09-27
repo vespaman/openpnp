@@ -1,5 +1,8 @@
 # Parallel Camera Capture - Implementation Guide
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 This document provides the exact code changes needed to implement parallel camera capture during the settle test.
 
 ## Summary of Changes

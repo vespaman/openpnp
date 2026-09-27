@@ -1,5 +1,8 @@
 # Parallel Camera Capture - Revised Implementation (v2)
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Key Corrections from v1
 
 1. **Thread Pool**: Use `CompletableFuture.supplyAsync()` without executor (defaults to ForkJoinPool.commonPool())

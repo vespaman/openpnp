@@ -1,5 +1,8 @@
 # Pre-Alignment Check Implementation Plan
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Overview
 
 Add a quick "part-on + size check" that runs in parallel with camera settling for ALL cameras (settle + non-settle), using the first available image from each camera. Results are logged when complete, with the intent to use the results in a future optimization phase.

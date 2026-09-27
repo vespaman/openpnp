@@ -1,5 +1,8 @@
 # Parallel Camera Capture - Revised Plan Summary (v2)
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Executive Summary
 
 Implement parallel image capture during settle test using ForkJoinPool.commonPool() for I/O bound camera captures, preserving visionExecutor for OpenCV processing. Two-pass system handles multi-shot parts sequentially.

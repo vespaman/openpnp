@@ -1,6 +1,6 @@
 # Parallel Bottom Vision Salvage Plan
 
-Status: IN PROGRESS
+Status: ported and hardened, machine test pending (`MACHINE-TEST.md`)
 Started: 2026-09-27
 Source of the work being salvaged: `/mnt/agent1/dev_random/openpnp` (read-only mount, repo owned by
 another user; never written to).
@@ -109,6 +109,7 @@ Decisions taken:
 | R11 | Test hygiene: 149 added `System.out` lines, hardcoded `/home/micke/dev_random/openpnp/precheck_img/precheck` paths, fixtures at the repository root instead of `src/test/resources` | new `Parallel*Test`, `PreCheck*Test` |
 | R12 | The pre-check WIP is mid-debug and over budget: 50-70 ms measured against a ~30 ms settle window | `.opencode/plans/diagnose-precheck-timing.md` |
 | R13 | No way back: the parallel path has no setting of its own, it is taken whenever a batch has more than one bottom vision camera and more than one placement. Found while writing the outcome, it is not in the register above. | `ReferencePnpJobProcessor.Align.stepImpl()` and `performParallelAlignment()` |
+| R14 | What displacement actually is was unclear enough to be reported as missing. The MBV sequential trick (nozzle already within `displacement-max-distance` of the shot location, so do not move it, store the difference on the camera, let `ImageCapture` skip settling, compensate in `findOffsets`) is gone from the parallel rework: the non-pre-captured path always moves to the exact shot location. Displacement in this branch is only the per-shot delta of the pre-captured path plus the balance-level Z. | MBV `ReferenceBottomVision` (`camera.setDisplacements(...)`, `isDisplacementActive()`) and `ImageCapture` (`SettleOption.Skip`) against this branch, where `ImageCapture` has no displacement logic and `PipelineShot.apply()` says "Displacement fallback is NOT allowed" |
 
 ## 5. Out of scope
 
@@ -150,6 +151,7 @@ remove the ways it could go wrong.
 | R11 | **mostly not a defect**: `System.out.println` in tests is the convention of this repository (30 test files use it), so the new tests were left alone. The hardcoded `/home/micke/...` paths and the repository-root fixtures belong to the pre-check snapshot on `parallel-bottom-vision-wip`, not to this branch, and that branch is not meant to be merged. |
 | R12 | documented in `PRE-ALIGNMENT-CHECK.md`, not implemented. |
 | R13 | **fixed** after the first test run of this outcome: `parallel-alignment-enabled` on `ReferenceMachine`, exposed as a `default` method on the `Machine` SPI, gating `Align.stepImpl()`. Defaults to `true`, i.e. the behaviour of the checkout this came from; set it to `false` to get the classic one-nozzle-at-a-time alignment without rebuilding. No GUI, like the displacement settings. |
+| R14 | **documented, not restored**. The data itself was never lost and does not need a new field: `getCalibratedCameraOffset()` returns the `center-x`/`center-y` of the runout compensation of the fitted nozzle tip, which in the real configuration is 0.1-0.25 mm per nozzle - the "slight delta" of the machine concept. The MBV sequential no-move path is a separate feature and it is a behaviour change on a branch that is about to be machine tested, so it waits until the test has a baseline; if it is brought back it must carry the displacement per shot (pipeline property), not as mutable state on the `Camera`, which is exactly the sharing that R1 and R4 were about. |
 
 Still open, in the order they should be taken:
 
@@ -159,8 +161,10 @@ Still open, in the order they should be taken:
    machine it is dominated by mechanics and by the last calibration, so a change of this kind
    cannot be seen in it; behaviour, rejections, cycle time and memory can.
 2. R7 post-rotate compensation, once (1) says where the remaining error is.
-3. R4 ownership audit.
-4. R8 class untangling, with the machine available.
+3. R14: if the run with `parallel-alignment-enabled` off is measurably slower than MBV was, bring
+   back the sequential no-move displacement, per shot rather than per camera.
+4. R4 ownership audit.
+5. R8 class untangling, with the machine available.
 
 The branch has not been built on real hardware from this repository; the "verified on real hardware"
 status belongs to the author's checkout at `6343c999e9`.

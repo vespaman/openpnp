@@ -1,5 +1,8 @@
 # Camera Displacement Correction Plan
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Problem
 
 Parallel bottom vision alignment displacement values were returning wrong values (~1.5mm camera position instead of < 0.1mm calibration error). The displacement should represent the camera-to-nozzle alignment error + nozzle tip runout.

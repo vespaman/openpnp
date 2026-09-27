@@ -1,5 +1,8 @@
 # Diagnose Pre-Check Timing Issues - Systematic Approach
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Problem Statement
 
 **Known Facts:**

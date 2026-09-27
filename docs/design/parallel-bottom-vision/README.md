@@ -7,6 +7,10 @@ so they overlap and some of them describe designs that were later abandoned.
 
 They are kept as engineering background, not as specification. Where a document disagrees with the
 code, the code wins. See `SALVAGE-PLAN.md` for the risk register of the resulting implementation.
+Each of them carries a one line notice under its title saying the same thing.
+
+The imported files keep the modification date they had in the development checkout, so `ls -lt`
+sorts them below the documents written in this fork.
 
 ## Chronology
 
@@ -32,8 +36,17 @@ code, the code wins. See `SALVAGE-PLAN.md` for the risk register of the resultin
 - Parallel capture and parallel pipeline processing: **implemented**, committed as
   `Implement parallel image capture and bottom vision improvements`, experimental. It ran on real
   hardware in the checkout it came from, not from this repository; see `MACHINE-TEST.md`.
-- Camera displacement / multi bottom vision cameras: **implemented**, inherited from
-  `multi-bottom-vision` and squashed into the same commit.
+- Camera displacement: **implemented, but in a different place than the design documents describe**.
+  The per-camera `displacement` X/Y fields of `multi-bottom-vision` were runtime state and never
+  survived a restart; they are gone. What the parallel path uses instead is the camera offset
+  already measured by the nozzle tip calibration
+  (`ReferenceNozzleTipCalibration.getCalibratedCameraOffset()`, the `center-x`/`center-y` of the
+  runout compensation, looked up per nozzle) plus the runout at the wanted rotation angle, carried
+  per shot in `PreCapturedPlacement`. That is what `displacement-enabled` buys in this branch.
+  Not carried over from `multi-bottom-vision`: its sequential trick of not moving a nozzle that is
+  already close to the shot location and compensating the difference in the analysis. With
+  `parallel-alignment-enabled` off, displacement only sets the Z of the shot to the balance level.
+  See R14 in `SALVAGE-PLAN.md`.
 - Pre-alignment check: **not merged**. A mid-debug snapshot is preserved on branch
   `parallel-bottom-vision-wip`; see `PRE-ALIGNMENT-CHECK.md` for the write-up.
 

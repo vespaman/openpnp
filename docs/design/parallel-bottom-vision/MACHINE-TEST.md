@@ -50,7 +50,17 @@ the cameras is close to, but not equal to, the distance between the nozzles - th
    |---|---|---|
    | A | `false` | `false` |
    | B | `true` | `false` |
-   | C | `true` | `true` |
+    | C | `true` | `true` |
+
+   What the runs are, as of this branch (see R14 in `SALVAGE-PLAN.md`): A is the classic upstream
+   behaviour, one nozzle walked to its shot location at a time. B is the parallel path with every
+   nozzle still driven to its exact shot location. C is the parallel path where the head parks once
+   and the nozzles other than the settle nozzle are photographed where they happen to be, their
+   calibrated camera offset plus runout being compensated in the analysis. `displacement-enabled` in
+   run A does almost nothing here - in this branch the sequential path only takes the balance level Z
+   from it, it does not yet have the `multi-bottom-vision` trick of skipping a move that is small
+   enough. So compare run A with upstream, not with the old `multi-bottom-vision` timings.
+
 
 The test job: more than one bottom vision camera in use, more than one nozzle per camera, at least
 ~100 placements, more than one part type, and at least one part whose package uses vision

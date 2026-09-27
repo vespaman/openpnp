@@ -1,5 +1,8 @@
 # Parallel Bottom Vision Test Plan - Revised
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Executive Summary
 
 This test plan validates the parallel bottom vision implementation based on **real-world alignment scenarios**, not artificial benchmarks. The key insight is:

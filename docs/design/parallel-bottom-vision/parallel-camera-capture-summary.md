@@ -1,5 +1,8 @@
 # Parallel Camera Capture - Implementation Plan Summary
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Overview
 
 Implement parallel image capture for multi-bottom-vision-camera setup in OpenPnP. Trigger secondary camera captures asynchronously during the primary camera's settle test, eliminating 10-12ms latency.

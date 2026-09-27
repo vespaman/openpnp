@@ -1,5 +1,8 @@
 # Parallel Bottom Vision Implementation Plan - Corrected
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Executive Summary
 
 This plan implements true parallel bottom vision processing for machines with multiple cameras, leveraging the mechanical offset where Nozzle 1 over Camera 1 means Nozzle 2 is automatically over Camera 2.

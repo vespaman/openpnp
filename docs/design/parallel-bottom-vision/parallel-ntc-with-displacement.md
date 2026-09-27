@@ -1,5 +1,8 @@
 # Parallel Nozzle Tip Calibration (NTC) with Camera Displacement
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Overview
 
 Implement parallel NTC calibration for multiple nozzles that share the same nozzle tip type, while simultaneously calculating and updating camera displacement values for accurate parallel bottom vision.

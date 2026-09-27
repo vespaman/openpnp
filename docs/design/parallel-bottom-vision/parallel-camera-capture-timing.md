@@ -1,5 +1,8 @@
 # Parallel Camera Capture - Timing Diagram
 
+> Historical design note from the development checkout, imported 2026-09-27. It describes what was
+> intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+
 ## Before (Sequential Capture)
 
 ```
