@@ -109,11 +109,17 @@ public class ImageCapture extends CvStage {
             return new Result(image, ColorSpace.Bgr);
         }
 
+        // When the nozzle was not moved onto the shot location, there is nothing to settle, so
+        // capture at once and let the analysis compensate the difference.
+        SettleOption settleOption = (pipeline.getShotDisplacement(shotIndex) == null 
+                ? this.settleOption 
+                : SettleOption.Skip);
+
         try {
             // Light, settle and capture the image. Keep the lights on for possible averaging.
             camera.actuateLightBeforeCapture((defaultLight ? null : getLight()));
             try {
-                BufferedImage bufferedImage = camera.settleAndCapture(this.settleOption);
+                BufferedImage bufferedImage = camera.settleAndCapture(settleOption);
                 // Remember the last captured image. This specifically records the native camera image, 
                 // i.e. it does not apply averaging (we want an unaltered raw image for analysis purposes).
                 pipeline.setLastCapturedImage(bufferedImage);

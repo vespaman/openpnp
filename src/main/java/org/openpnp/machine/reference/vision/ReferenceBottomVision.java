@@ -277,6 +277,16 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         nozzleLocation = nozzleLocation.subtract(displacement);
                     }
                 }
+                else {
+                    // The image may have been taken without the nozzle being exactly on the shot
+                    // location, see preparePipeline(). Compensate what is left over.
+                    Location displacement = pipeline.getShotDisplacement(pipeline.getCurrentShotIndex());
+                    if (displacement != null) {
+                        nozzleLocation = nozzleLocation.subtract(displacement);
+                        Logger.debug("Bottom vision part {} displacement (sequential) {} compensated, "
+                                + "nozzle location becomes {}", part.getId(), displacement, nozzleLocation);
+                    }
+                }
                 Logger.debug("Bottom vision part {} result rect {}", part.getId(), rect);
 
                 // Create the offsets object. This is the physical distance from
@@ -536,6 +546,18 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     + "For more diagnostic information go to the Vision Compositing tab on package "+pkg.getId()+". ");
         }
         pipeline.resetReusedPipeline();
+        // Taking the picture from where the nozzle already is, instead of moving it onto the shot
+        // location, saves the settling of a tiny move. Only possible when displacement is enabled
+        // and when the part is photographed in a single shot: a composited part is assembled from
+        // its shots in machine coordinates, so shots taken from different places than the ones the
+        // compositing computed do not add up. Only in pre-rotate: the post-rotate path returns the
+        // offsets relative to the camera centre and never sees a nozzle location to apply the
+        // difference to, see displacementCheck().
+        final boolean displacementPossible = !skipMovement
+                && nozzle != null
+                && isPreRotate()
+                && composite.getShotsTravel().size() == 1
+                && Configuration.get().getMachine().isDisplacementEnabled();
         for (Shot shot : composite.getShotsTravel()) {
             Location upp = camera.getUnitsPerPixelAtZ();
             pipeline.setProperty("camera", camera);
@@ -631,6 +653,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         super.apply();
                         return;
                     }
+                    Location displacement = null;
                     if (nozzle.getLocation().getLinearLengthTo(camera.getLocation(nozzle))
                             .compareTo(camera.getRoamingRadius()
                                     .add(nozzleTip.getMaxPickTolerance())) > 0) {
@@ -638,12 +661,41 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         MovableUtils.moveToLocationAtSafeZ(nozzle, shotLocation);
                     }
                     else {
-                        // When skipMove=false, we MUST move to exact shot location.
-                        // Displacement fallback is NOT allowed - it causes pipeline to expect
-                        // different position than actual capture position.
-                        nozzle.moveTo(shotLocation);
+                        Machine machine = Configuration.get().getMachine();
+                        Location currentLocation = nozzle.getLocation();
+                        Length distance = currentLocation.getLinearLengthTo(shotLocation);
+                        Length zDifference = currentLocation.getLengthZ()
+                                .subtract(shotLocation.getLengthZ()).abs();
+                        double rotationDifference = Math.abs(Math.IEEEremainder(
+                                currentLocation.getRotation() - shotLocation.getRotation(), 360.));
+                        if (displacementPossible
+                                && distance.compareTo(machine.getDisplacementMaxDistance()) < 0
+                                && zDifference.compareTo(machine.getDisplacementMaxZDiff()) < 0
+                                && rotationDifference < machine.getDisplacementMaxRotation()) {
+                            // The nozzle is so close to the shot location that the picture can be
+                            // taken from where it is. Remember the difference, the image capture
+                            // stage skips the settling of a move that is not made and the analysis
+                            // compensates what is left.
+                            displacement = shotLocation.deriveLengths(
+                                    shotLocation.getLengthX().subtract(currentLocation.getLengthX()),
+                                    shotLocation.getLengthY().subtract(currentLocation.getLengthY()),
+                                    null, null);
+                            Logger.debug("Bottom vision on nozzle {} camera {}: nozzle not moved to "
+                                            + "the shot location {}, it is only {} away (Z {}, "
+                                            + "rotated {} degrees), compensating {} in the analysis.",
+                                    nozzle.getId(), camera.getName(), shotLocation, distance,
+                                    zDifference, rotationDifference, displacement);
+                        }
+                        else {
+                            // When skipMove=false and the difference is too big to be compensated
+                            // by vision, the nozzle must be moved to the exact shot location.
+                            nozzle.moveTo(shotLocation);
+                        }
                     }
                     super.apply();
+                    // Only now, because the shot index of this shot is not known before it has been
+                    // applied.
+                    pipeline.setShotDisplacement(pipeline.getCurrentShotIndex(), displacement);
                 }
 
                 @Override 

@@ -17,6 +17,7 @@ import org.opencv.core.Point;
 import org.opencv.core.Scalar;
 import org.opencv.imgproc.Imgproc;
 import org.openpnp.model.CapturedShot;
+import org.openpnp.model.Location;
 import org.openpnp.vision.FluentCv.ColorSpace;
 import org.openpnp.vision.pipeline.CvStage.Result;
 import org.pmw.tinylog.Logger;
@@ -75,6 +76,8 @@ public class CvPipeline implements AutoCloseable {
     private int currentShot;
     
     private Map<Integer, CapturedShot> preCapturedShots = new HashMap<>();
+
+    private Map<Integer, Location> shotDisplacements = new HashMap<>();
 
     public CvPipeline() {
     }
@@ -472,6 +475,7 @@ public class CvPipeline implements AutoCloseable {
         properties = new HashMap<>();
         compositeShots = new ArrayList<>();
         clearPreCapturedShots();
+        clearShotDisplacements();
     }
 
     private static Serializer createSerializer() {
@@ -526,6 +530,41 @@ public class CvPipeline implements AutoCloseable {
             shot.release();
         }
         preCapturedShots.clear();
+    }
+
+    /**
+     * Record that the image of a pipeline shot is to be taken without moving the nozzle onto the
+     * shot location, together with the difference between the intended shot location and the place
+     * the nozzle actually is. The image capture stage uses it to skip the settling of a move that
+     * is never made, the vision analysis uses it to compensate the remaining offset.
+     *
+     * It is kept per shot and per pipeline on purpose. The camera would be the obvious place, but
+     * several nozzles are processed in parallel through their own cameras, and a displacement left
+     * behind on a camera by one of them would be applied to the next one.
+     *
+     * @param shotIndex The index of the pipeline shot (0-based)
+     * @param displacement the offset to compensate, or null to clear the shot again.
+     */
+    public void setShotDisplacement(int shotIndex, Location displacement) {
+        if (displacement == null) {
+            shotDisplacements.remove(shotIndex);
+        }
+        else {
+            shotDisplacements.put(shotIndex, displacement);
+        }
+    }
+
+    /**
+     * @param shotIndex The index of the pipeline shot (0-based)
+     * @return the displacement the image of this shot was taken with, or null if the nozzle was
+     *         moved to the shot location.
+     */
+    public Location getShotDisplacement(int shotIndex) {
+        return shotDisplacements.get(shotIndex);
+    }
+
+    public void clearShotDisplacements() {
+        shotDisplacements.clear();
     }
 
     public abstract class PipelineShot {
