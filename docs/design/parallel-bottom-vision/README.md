@@ -30,9 +30,18 @@ code, the code wins. See `SALVAGE-PLAN.md` for the risk register of the resultin
 ## Status of each idea
 
 - Parallel capture and parallel pipeline processing: **implemented**, committed as
-  `Implement parallel image capture and bottom vision improvements`, experimental but verified on
-  real hardware.
+  `Implement parallel image capture and bottom vision improvements`, experimental. It ran on real
+  hardware in the checkout it came from, not from this repository; see `MACHINE-TEST.md`.
 - Camera displacement / multi bottom vision cameras: **implemented**, inherited from
   `multi-bottom-vision` and squashed into the same commit.
 - Pre-alignment check: **not merged**. A mid-debug snapshot is preserved on branch
   `parallel-bottom-vision-wip`; see `PRE-ALIGNMENT-CHECK.md` for the write-up.
+
+## Written in this fork, not imported
+
+| Document | Content |
+|----------|---------|
+| `SALVAGE-PLAN.md` | how the work was rescued from the development checkout, the risk register, and what the hardening did about it |
+| `MACHINE-TEST.md` | what to run on the real machine before this branch is trusted, and what deliberately is not measured |
+| `PRE-ALIGNMENT-CHECK.md` | the unimplemented pre-alignment check, as a requirement note |
+| `DISPLACEMENT-VERIFICATION.md` | assessment of letting the machine measure its own displacement data instead of re-calibrating by hand |
