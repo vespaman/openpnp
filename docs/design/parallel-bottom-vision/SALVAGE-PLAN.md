@@ -153,11 +153,11 @@ remove the ways it could go wrong.
 
 Still open, in the order they should be taken:
 
-1. Machine validation with displacement enabled: the same job three times, with
-   `parallel-alignment-enabled` off, on with `displacement-enabled` off, and on with
-   `displacement-enabled` on. Comparing the placement offsets of the three runs says both whether
-   the parallel path agrees with the classic one and what displacement costs in accuracy. Watch the
-   native memory over a long run.
+1. `MACHINE-TEST.md`: the same job run three times, with `parallel-alignment-enabled` off, on with
+   `displacement-enabled` off, and on with `displacement-enabled` on, plus the abort, missing-part,
+   single-camera and long-run checks. Placement accuracy is deliberately not measured - on this
+   machine it is dominated by mechanics and by the last calibration, so a change of this kind
+   cannot be seen in it; behaviour, rejections, cycle time and memory can.
 2. R7 post-rotate compensation, once (1) says where the remaining error is.
 3. R4 ownership audit.
 4. R8 class untangling, with the machine available.
