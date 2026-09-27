@@ -16,6 +16,7 @@ import org.opencv.core.Mat;
 import org.opencv.core.Point;
 import org.opencv.core.Scalar;
 import org.opencv.imgproc.Imgproc;
+import org.openpnp.model.CapturedShot;
 import org.openpnp.vision.FluentCv.ColorSpace;
 import org.openpnp.vision.pipeline.CvStage.Result;
 import org.pmw.tinylog.Logger;
@@ -73,12 +74,9 @@ public class CvPipeline implements AutoCloseable {
 
     private int currentShot;
     
-    private Map<Integer, org.openpnp.model.CapturedShot> preCapturedShots = new HashMap<>();
+    private Map<Integer, CapturedShot> preCapturedShots = new HashMap<>();
 
     public CvPipeline() {
-        // Limit OpenCV to 1 thread per pipeline to prevent oversubscription
-        // when multiple pipelines run in parallel (e.g., parallel alignment)
-        org.opencv.core.Core.setNumThreads(1);
     }
 
     public CvPipeline(String xmlPipeline) {
@@ -339,21 +337,24 @@ public class CvPipeline implements AutoCloseable {
         }
     }
 
-  /**
-      * Reset all the modified parameters to default values
-      * (we do not want the parameters to permanently modify the pipeline). 
-      */
-     public void resetToDefaults() {
-         for (CvAbstractParameterStage stage : getParameterStages()) {
-             try {
-                 stage.resetParameterValue(this);
-             }
-             catch (Exception e) {
-                 // Ignore exceptions during reset, especially when camera property is not set.
-                 // This can happen during pipeline cloning when camera is not yet available.
-             }
-         }
-     }
+    /**
+     * Reset all the modified parameters to default values
+     * (we do not want the parameters to permanently modify the pipeline). 
+     */
+    public void resetToDefaults() {
+        for (CvAbstractParameterStage stage : getParameterStages()) {
+            try {
+                stage.resetParameterValue(this);
+            }
+            catch (Exception e) {
+                // A stage cannot be reset when the context it needs is not set yet, e.g. the
+                // camera property is missing while a pipeline is being cloned. Keep the stage as
+                // it is, but make it visible in the log.
+                Logger.debug("Cannot reset the parameters of pipeline stage {} : {}", 
+                        stage.getName(), e.getMessage());
+            }
+        }
+    }
 
     /**
      * Release any temporary resources associated with the processing of the pipeline. Should be
@@ -446,12 +447,7 @@ public class CvPipeline implements AutoCloseable {
     @Override
     public CvPipeline clone() throws CloneNotSupportedException {
         try {
-            // Don't call resetToDefaults() as it may fail if properties like camera are not set.
-            // Properties are not serialized anyway, so there's no need to reset them.
-            Serializer ser = createSerializer();
-            StringWriter sw = new StringWriter();
-            ser.write(this, sw);
-            return new CvPipeline(sw.toString());
+            return new CvPipeline(toXmlString());
         }
         catch (Exception e) {
             throw new CloneNotSupportedException(e.getMessage());
@@ -494,7 +490,10 @@ public class CvPipeline implements AutoCloseable {
         this.lastCapturedImage = lastCapturedImage;
     }
 
-    public Map<Integer, org.openpnp.model.CapturedShot> getPreCapturedShots() {
+    /**
+     * @return the pre-captured shots by pipeline shot index, never null.
+     */
+    public Map<Integer, CapturedShot> getPreCapturedShots() {
         return preCapturedShots;
     }
     
@@ -505,7 +504,7 @@ public class CvPipeline implements AutoCloseable {
      * @param shotIndex The index of the pipeline shot (0-based)
      * @param shot The pre-captured shot data
      */
-    public void setPreCapturedShot(int shotIndex, org.openpnp.model.CapturedShot shot) {
+    public void setPreCapturedShot(int shotIndex, CapturedShot shot) {
         preCapturedShots.put(shotIndex, shot);
     }
     
@@ -515,7 +514,7 @@ public class CvPipeline implements AutoCloseable {
      * @param shotIndex The index of the pipeline shot (0-based)
      * @return The pre-captured shot, or null if not set
      */
-    public org.openpnp.model.CapturedShot getPreCapturedShot(int shotIndex) {
+    public CapturedShot getPreCapturedShot(int shotIndex) {
         return preCapturedShots.get(shotIndex);
     }
     
@@ -523,7 +522,7 @@ public class CvPipeline implements AutoCloseable {
      * Clear all pre-captured shots and release their OpenCV native memory.
      */
     public void clearPreCapturedShots() {
-        for (org.openpnp.model.CapturedShot shot : preCapturedShots.values()) {
+        for (CapturedShot shot : preCapturedShots.values()) {
             shot.release();
         }
         preCapturedShots.clear();
