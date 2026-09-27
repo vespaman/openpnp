@@ -1,134 +1,177 @@
 # Automatic displacement verification - assessment
 
-Status: **assessment only**, nothing here is designed in detail or implemented. Written
-2026-09-27 from the question: *can the machine measure its own displacement data, so that checking
-it does not mean re-running the camera tilt calibration, the nozzle calibration and the nozzle tip
-runout calibration by hand - and ideally while the cameras are still being adjusted?*
+Status: **assessment**, nothing implemented. Written 2026-09-27, rewritten the same day after the
+machine concept in `machine.md` was taken into account. Question: can the machine determine and
+re-verify its own displacement data, so that checking it does not mean re-doing the camera
+alignment (tilt), the nozzle and the nozzle tip runout calibration by hand - and ideally while the
+camera is still being moved?
 
-Short answer: yes, mostly, and the part of it that pays for itself needs no precision artifact and
-no change to the bottom vision code. The measurements are differential: the same thing is measured
-two different ways and has to agree, and *how* it disagrees names the cause.
+Short answer: yes. The head is the artifact. One head, nozzles at fixed positions, sharing X/Y;
+their relative position is known from the earlier setup. That is a rigid, machine-mounted
+measurement standard, and bottom vision can see two of its nozzles at the same time. Everything
+below follows from that.
 
-## 1. What "the displacement" is
+## 1. Where the displacement actually lives in the code
 
-For every (nozzle, up-looking bottom camera) pair the machine needs to know where the camera's
-image is, in machine coordinates, at part height, and how it is rotated. The MBV/PBV shortcut
-trusts that: it photographs a part that is not exactly under the camera and computes the nozzle
-position from where the part appears in the image.
+The shot location for a nozzle under an up-looking camera is built up like this:
 
-Error sources, and what the current compensation models:
+```
+camera.getLocation(nozzle)                      AbstractCamera:178
+  = camera's own machine location
+    - nozzle.getCameraToolCalibratedOffset(camera)
+        = runout compensation camera offset     ReferenceNozzleTipCalibration:922
+          (only for the camera paired to this nozzle, zero otherwise)
+  + part height ...                             ReferenceBottomVision.getCameraLocationAtPartHeight()
+```
 
-| # | Source | Compensated today? |
-|---|--------|--------------------|
-| 1 | camera XY mounting error (where it is vs where the calibration says) | yes, by camera calibration |
-| 2 | camera tilt: optical axis not perpendicular to the axis of Z travel | only at the calibrated Z; grows with Z error and with distance from image centre |
-| 3 | pixel size (units/pixel) error | only at the calibrated Z; scales with distance from centre |
-| 4 | camera roll about its optical axis | yes, by the camera rotation calibration |
-| 5 | nozzle tip / part runout, C-axis wobble | yes, by nozzle tip runout calibration |
-| 6 | nozzle tilt (tip axis not parallel to Z) | no model at all |
-| 7 | part height / balance level error | feeds 2 and 3 |
-| 8 | machine squareness, backlash, belt stretch over the distance between shot position and placement position | no |
+and then, during analysis, the parallel path subtracts the per-shot
+`PreCapturedPlacement.intendedDisplacementDelta` (`ReferenceBottomVision.java:271-278`) - the
+distance the head happened to be off the ideal shot location, runout included.
 
-The compensation itself is a translation plus a rotation between camera location and nozzle
-location. That is exactly right for 1 and 4 and a decent approximation for 5, and it is structurally
-unable to model 2, 3, 6 - which is why checking it is worth something.
+Two consequences:
 
-## 2. Method: differential, so no reference artifact
+- There is **no stored per-camera displacement X/Y** in this branch. What `machine.md` describes
+  (the small difference between camera spacing and nozzle spacing, kept per camera, reference camera
+  zero) is spread over the camera's machine-coordinate calibration, the runout compensation offset,
+  and the per-shot runtime delta. `multi-bottom-vision` had a runtime `Camera.setDisplacements(x, y)`;
+  the parallel implementation replaced it with the per-shot value. So "write the measured displacement
+  back" has no field to write to today - see §5.
+- Everything pixel-to-machine goes through the **advanced camera calibration**
+  (`reference/camera/calibration/AdvancedCalibration`), which keeps a virtual camera matrix, a
+  rectification matrix, a physical camera position in the machine frame
+  (`vectorFromMachToPhyCamInMachRefFrame`), the **optical axis direction in the machine frame**
+  (`unitVectorPhyCamZInMachRefFrame` - the tilt, already measured and stored), and a principal point
+  offset. That is the correction the user has in mind, and it is why turning a camera screw by hand
+  is so awkward: it changes the physical camera position, while the calibration still applies the
+  tilt/rectification of the previous position, and the apparent XY of anything not at the calibrated
+  Z shifts as a result.
 
-The machine does not need to know absolute truth. It needs to find out whether measuring the same
-thing along two different paths gives the same answer. Every experiment below is one nozzle, one
-part, and a comparison.
+## 2. The reference is the head
 
-| Exp | What | What a non-zero result means |
-|-----|------|------------------------------|
-| E1 pair offset | Known part on the nozzle, photographed at its nominal shot location (zero displacement). Residual between measured and expected. | 1, 4 - the pair calibration is off |
-| E2 displacement sweep | E1 repeated with the nozzle held displaced by 0, ±0.2, ±0.4, ±0.6 mm in X and Y. | residual constant → the displacement compensation is right; residual linear in displacement → 3 (or a wrong camera-to-nozzle distance); asymmetric/quadratic → 2 |
-| E3 Z sweep | E1 at balance level and at ±0.5, ±1 mm. | drift with Z is 2 combined with 3. The slope d(residual)/dZ is essentially tan(tilt angle): it says how much the camera is tilted, and in which direction, i.e. what to shim |
-| E4 C sweep | Same part, C at 12 angles over 360°, part centre recorded. Fit a circle. | runout amplitude and phase (5); compare with the stored runout calibration. A component that rotates with the part instead of the tip → 6, needs a part tall enough to see it (a 0603 will not show it, a SOIC will) |
-| E5 camera to camera | A fixed target on the bed, photographed by every bottom camera in turn while the head moves. | camera-to-camera registration and 8, with no nozzle involved |
-| E6 roll | A target with a known straight edge, seen by each camera. | 4 |
+Two 0402s (or any part that picks and outlines reliably), one on each nozzle, head at a position
+where both are inside their cameras' fields of view, both cameras shooting - which is exactly what
+the parallel capture already does. Both part centres measured, each converted to machine coordinates
+by its own camera calibration:
 
-E1+E2+E4 answer the question "is the displacement I am about to trust right now, right". E3 is the
-one that helps while a camera is still loose in its mount. All of them are loops over existing
-primitives; none of them needs a new kind of motion.
+- the vector between them must equal the known inter-nozzle vector;
+- the **residual per camera is that camera's displacement error**, directly.
 
-## 3. What already exists and should be reused
+Nothing else is needed for the basic check, and it is a strong measurement:
 
-Nothing fundamental has to be written; the pieces are:
+- Both shots are of the same rigid head, at the same instant. Axis repeatability, backlash,
+  squareness and belt stretch do not enter at all - the inter-nozzle distance is fixed by mechanics,
+  not by the axes.
+- Both nozzles are at the same Z (balance level), so a Z error affects both the same way and largely
+  cancels in the vector.
+- A 0402 is fine as a target: the vector is between two part centres, so the part's own size error
+  mostly cancels, and its outline is what bottom vision is already good at. The bare nozzle tip
+  works too but gives no rotation, so a part is better.
 
-- `ReferenceBottomVision.findOffsets(part, ..., boolean skipMovement)` measures a part without
-  moving the nozzle, and the parallel work added `captureImageOnly` /
-  `captureImageOnlyWithSettle`, which return an image on demand. The measurement half exists.
-- `VisionUtils.getBottomVisionCamera(nozzle)` gives the pairs; `PreCapturedPlacement` already carries
-  the per-shot displacement delta that E2 wants to vary.
-- `ReferenceNozzleTipCalibration` already does an E4-like sweep against a bottom camera and fits
-  runout; E4 is largely that machinery pointed at a report instead of at a calibration write.
-- `org.openpnp.machine.reference.camera.calibration.AdvancedCalibration` already runs a test-pattern
-  calibration with `Calib3d.calibrateCamera`, i.e. tilt/perspective and intrinsics are already
-  modelled for cameras that are calibrated that way. E2/E3 should read what that produced and report
-  residuals, not invent a second bit of maths next to it.
-- The Issues & Solutions panel (`Solutions.Subject`, `Solutions.Issue`, and `ActionProperty` for a
-  button) is the existing place for "this is off, click to check/fix", including showing a check as
-  stale since the last run.
-- The scripting panel sees the whole SPI, so the first version needs no compiled code at all.
+One measurement gives the displacement. Repeating it while moving the head gives the decomposition
+that makes the result actionable:
 
-## 4. Shape of the module, additive by construction
+| Vary | Keep | A residual that... | is caused by | what to do |
+|------|------|--------------------|--------------|------------|
+| nothing (one position) | - | is constant | camera mounting / displacement | move the camera, or store the offset |
+| head X/Y over the field, e.g. 5x5 steps of 1 mm | Z | changes with position | pixel size or perspective error in the advanced calibration | re-run advanced calibration, do not bend the mechanical alignment to fix it |
+| head Z, ±0.5 / ±1 mm | X/Y | changes with Z | camera tilt: the optical axis direction (`unitVectorPhyCamZInMachRefFrame`) is wrong | shim/tilt the camera; the slope d(residual)/dZ is essentially tan(tilt), so it also says by how much and in which direction |
+| C angle, 12 steps | X/Y, Z | periodic with C | runout (already calibrated) - compare with the stored runout compensation; a component that follows the part rather than the tip is nozzle tilt | re-run runout calibration / check the tip |
+| which part is on which nozzle (swap) | - | flips sign | the parts, not the machine | use one pair and average both ways |
 
-**v0 - a script, zero core changes.** Loop nozzles × cameras, run E1, E4 and a short E2, print a
-table, write a CSV next to the configuration. One file, no new UI, no calibration touched. Wrong in
-details until it has been run once, but it settles the design questions with real numbers.
+The mean over positions is the displacement; the spread is the calibration error. That separation is
+the useful output, because they are fixed by completely different actions, and today they are
+conflated in one manual alignment.
 
-**v1 - a report-only module.** New class, e.g.
-`org.openpnp.machine.reference.vision.DisplacementCheck`, plus one action reachable from Issues &
-Solutions. Runs as a machine action, so it is cancelable and refused while a job runs. Per pair it
-reports: dx, dy, dz, dθ, runout amplitude/phase, residual-vs-displacement slope, d(residual)/dZ, and
-a verdict against `displacement-max-distance`, `-z-diff`, `-rotation`. CSV and log. It writes no
-calibration value. This is the "verify it every now and then" deliverable.
+The same data also gives a **scale check in machine units**: the inter-nozzle spacing is a known
+length, so the measured distance between the two part centres is a direct measurement of the
+effective units-per-pixel at that Z and in that part of the field. That is what a printed
+checkerboard is normally bought for - here it is bolted to the head.
 
-**v2 - adjust assist.** For one camera at a time, static target, no head movement, looped at camera
-frame rate: measured centre vs expected centre, in mm, with direction, plus the tilt figure from the
-Z slope. That is the "help me while I move the camera" tool. It is a small non-modal window; it can
-start life as the ordinary camera view plus a script printing to the console, which is nearly free
-and already usable.
+## 3. Reuse, do not re-implement
 
-**v3, only after v1 has proved itself.** Offer to write the measured values back, and treat a drift
-since the last check as an issue in the panel. Until then, a human decides.
+- `ReferenceBottomVision.findOffsets(part, ..., skipMovement)` measures a part without moving;
+  `captureImageOnly` / `captureImageOnlyWithSettle` hand back an image on demand.
+- The parallel pre-capture already photographs all nozzles at once and knows the per-shot
+  displacement delta - the verification measurement is close to a call of that same code with a
+  known part forced on each nozzle.
+- `ReferenceNozzleTipCalibration` already sweeps C against a bottom camera and fits runout, and
+  already produces `getCalibratedCameraOffset(nozzle, camera)`, which is the number to compare with.
+- `AdvancedCalibration` already knows the camera position and tilt and already has the test pattern
+  machinery; the check should read what it stored and report residuals against it, not build a second
+  model beside it.
+- Issues & Solutions (`Solutions.Subject`, `Issue`, `ActionProperty` for a button) is the existing
+  home for "this drifted, run the check", including keeping the result stale until it is re-run.
+- The scripting panel sees the whole SPI, so the first version needs no compiled code.
 
-Effort, honestly: v0 can be written here in one sitting but is worthless until it runs once on the
-machine. v1 is about a day of coding plus a couple of hours at the machine to make the numbers
-sane. v2 is a further day with iteration. The maths is not the cost; the cost is settling what the
-target is and what to do about vibration, lighting and part-to-part variation.
+## 4. Shape of the module
 
-## 5. What has to be decided first
+**v0 - script, zero core changes.** Force/assume a part on each nozzle, one head position, shoot both
+cameras, print the per-camera residual and the inter-nozzle vector error; then loop over a small
+X/Y grid and over three Z heights and print the decomposed table; CSV into the config directory. This
+is a day of writing at most, and it will already be better than the current manual check.
 
-1. **The target.** What can sit repeatably on the bed, or be picked reliably? In increasing
-   usefulness: the bare nozzle tip (centre only, no rotation); a part with a trustworthy package
-   size; a printed checkerboard/ChArUco (needed for a real tilt/intrinsic answer); a machined pin or
-   gauge block if one exists. E1/E2/E4 work with the first two. E3 wants a part of some height or a
-   board. E5/E6 want something fixed.
-2. **Machine facts.** How many nozzles and bottom cameras and which pairs; how repeatable the axes
-   are over a 50 mm move; whether it is homed and left homed. Every measurement below is limited by
-   that number, so it has to be known, not assumed.
-3. **Report only, or eventually write back** (v3).
-4. **Pre-rotate or post-rotate** on the parts in use. Post-rotate is the case where the current code
-   does not compensate the displacement at all, and a check is the only way to know how much that
-   costs in practice.
-5. Whether a check should be runnable unattended (overnight self-test) or is something you start by
-   hand.
+**v1 - report-only module.** `org.openpnp.machine.reference.vision.DisplacementCheck` plus one entry
+in Issues & Solutions. Runs as a machine action so it is cancelable and refused during a job. Per
+camera: displacement dx, dy (and dθ if the parts have a defined orientation), residual vs position
+slope, d(residual)/dZ, runout amplitude and phase, all compared with the stored calibration and with
+`displacement-max-distance` / `-max-Z-diff` / `-max-rotation`. Log + CSV. It writes nothing.
 
-## 6. Limits of the method, stated plainly
+**v2 - assist while adjusting.** One camera selected, static target, no head motion, looped at frame
+rate: residual in mm with direction, plus the tilt figure. This is the "I am holding the camera in my
+hand, tell me when it is right" tool. The live part is cheap; the honest part (telling tilt from
+offset in real time) needs the Z variation, i.e. two measurements, so the assist should show both and
+let the operator take them.
 
-- Differential checks find inconsistency, not truth. A calibration that is wrong in a
-  self-consistent way (pixel size and camera distance both wrong in the same direction) can pass
-  every check above and still place wrong. Only a real artifact, or measuring a placed board, finds
-  that.
-- Everything is bounded by machine repeatability and by settling after each move. Each measurement
-  therefore has to be taken N times, reported as median **and spread**, and the check must refuse to
-  claim an error smaller than the spread it measures.
-- Part-to-part size variation inside one package pollutes E1/E2 unless the *same physical part* is
-  used throughout.
-- Auto-exposure or a lighting change moves the outline. Run it with the production lighting and
-  auto-exposure off.
-- Tilt cannot be separated from pixel size error from a single height. Two heights minimum (E3), or
-  a checkerboard.
-- Nozzle tilt needs a part tall enough for the tilt to rise above the noise.
+**v3 - only after v1/v2 have proved themselves.** Write back, and drift alarms.
+
+## 5. The write-back problem
+
+Because there is no per-camera displacement field (§1), "store what you measured" means choosing one:
+
+1. put the residual into the camera calibration (correct place for a mounting error, but it fights
+   the advanced calibration workflow: re-running that calibration would overwrite it);
+2. put it into the mechanical alignment (v2 helps here; no code at all);
+3. add a per-camera displacement offset applied in `getCameraLocationAtPartHeight()`, i.e. resurrect
+   the `multi-bottom-vision` idea as a *calibration* value rather than the runtime value it was.
+
+Option 3 is the one that matches `machine.md`, and it is a small, well-contained change, but it adds a
+knob that overlaps with the camera calibration, which is exactly the kind of overlap that makes the
+current manual procedure hard to reason about. It should not be added before the measurements from v1
+show how often the residual is a stable offset (needs a knob) versus a wobble in the calibration
+(needs a calibration, not a knob).
+
+## 6. What is still needed
+
+1. Which part to use as the target, and does it outline cleanly on both nozzles at balance level
+   (a 0402 was suggested; something with a defined edge/angle is better if rotation is to be checked).
+2. The inter-nozzle vector as currently trusted, and how it was obtained - the check is only absolute
+   if that vector is; without it the check is still valid as a constancy/drift test.
+3. Camera Z heights available at part height for the tilt measurement, and whether the balance level
+   can be moved ±1 mm reliably (parts are contact-probed here, so Z should be trustworthy - confirm).
+4. Report-only first (recommended) or straight to a knob.
+5. Whether the check should also run unattended as a self-test.
+
+## 7. Limits
+
+- Residuals are computed **after** the advanced calibration corrections, in machine coordinates, so
+  the check reports what the machine actually does, not what the cameras are physically doing. The
+  position/Z slopes are the bridge back to the physical side; without them a residual cannot be
+  attributed to a mounting error.
+- The absolute result is only as good as the trusted inter-nozzle vector (§6.2). The *stability* and
+  *consistency* results do not depend on it at all, and those are what a periodic check is for.
+- Everything is bounded by settling after each move and by outline repeatability. Each number is
+  measured N times and reported with its spread; the check must not claim an error smaller than the
+  spread it just measured.
+- Parts vary within a package: swap the two parts and average, or the part error shows up in the
+  residual.
+- Lighting changes move outlines. Run with production lighting and auto-exposure off.
+
+## 8. Pre-rotate
+
+Pre-rotate is required on this machine and is enabled. That matters here for two reasons: it is the
+only path that applies the displacement delta to the nozzle location (`ReferenceBottomVision.java:271`
+and the comment at `:765-773`), so on this machine the compensation is actually in effect; and the
+uncompensated post-rotate case should therefore never occur - if
+`Bottom vision of nozzle ... uses post-rotate but the pre-captured image ...` appears in a log, a part
+or pipeline has slipped to post-rotate and should be treated as a configuration error, not as a
+warning to ignore.

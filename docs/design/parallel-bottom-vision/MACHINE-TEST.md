@@ -32,6 +32,12 @@ reject, how long does it take, does it run out of memory.
 
 ## Before starting
 
+The machine, as far as this test cares: one head, two nozzles (N1, N2) sharing the X and Y axes and
+therefore fixed relative to each other, separate Z and rotation; two fixed up-looking cameras, N1↔Up1
+and N2↔Up2; pre-rotate required and enabled; part height from contact probing. The distance between
+the cameras is close to, but not equal to, the distance between the nozzles - that difference is what
+"displacement" is about, and it is the reason both cameras can be used in one pass at all.
+
 1. `git checkout parallel-bottom-vision`, build the jar.
 2. Copy the working `config/` directory aside, then copy it into the configuration directory this
    build uses. Nothing else changes between runs.
@@ -103,9 +109,10 @@ grep -n "uses post-rotate but the pre-captured image" OpenPnP.log
   normally the camera calibration or nozzle tip runout, not this code, but it must be zero in a
   healthy run.
 - `Bottom vision of nozzle ... uses post-rotate but the pre-captured image ... is displaced by ...`
-  (`:770`) is the known unfixed gap: in post-rotate the displacement is not compensated. If this
-  appears with your normal setup (i.e. your parts are set to post-rotate rather than pre-rotate),
-  that is important and changes the plan - keep the log and say so.
+  (`:770`) is the known unfixed gap: in post-rotate the displacement is not compensated. This machine
+  is a **pre-rotate** machine (required by the setup, and enabled), so this must never appear. If it
+  does, a part or a pipeline has slipped to post-rotate - that is a configuration error to fix, not a
+  warning to live with. Note it in the results either way.
 
 ## 4. Long run and memory (R4)
 
