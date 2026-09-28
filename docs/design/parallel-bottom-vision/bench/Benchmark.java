@@ -66,16 +66,11 @@ public class Benchmark {
         double uppX = argv.length > 2 ? Double.parseDouble(argv[2]) : 0.0386;
         double uppY = argv.length > 3 ? Double.parseDouble(argv[3]) : 0.0341;
         double kernelMm = argv.length > 4 ? Double.parseDouble(argv[4]) : 0.1;
+        double footprintMm = argv.length > 5 ? Double.parseDouble(argv[5]) : 0.0;
 
         String xml = new String(Files.readAllBytes(Paths.get(xmlPath)), "UTF-8");
         CvPipeline pipeline = new CvPipeline();
         pipeline.fromXmlString(xml);
-        pipeline.setProperty("camera", mockCamera(uppX, uppY));
-        pipeline.setProperty("MinAreaRect.center", new Location(LengthUnit.Millimeters));
-        pipeline.setProperty("MinAreaRect.expectedAngle", 0.0);
-        pipeline.setProperty("MaskCircle.diameter", new Length(4.0, LengthUnit.Millimeters));
-        pipeline.setProperty("BlurGaussian.kernelSize", new Length(kernelMm, LengthUnit.Millimeters));
-
         List<CvStage> stages = new ArrayList<>();
         for(CvStage stage : pipeline.getStages()) {
             if(stage.isEnabled()) {
@@ -87,6 +82,10 @@ public class Benchmark {
 
         for(int i = 0; i < reps; i++) {
             pipeline.resetReusedPipeline();
+            // The reset puts the stage parameters back to their XML values, exactly as it does on the
+            // machine between two shots, where preparePipeline() then applies these very properties
+            // again. So they have to be applied per rep, not once.
+            apply(pipeline, uppX, uppY, kernelMm, footprintMm);
             long t0 = System.nanoTime();
             pipeline.process();
             totals[i] = System.nanoTime() - t0;
@@ -133,6 +132,20 @@ public class Benchmark {
         System.out.printf("  %7.2f ms  %s%n", totals[totals.length / 2] / 1e6, "(whole process())");
         System.out.println("  java.version=" + System.getProperty("java.version")
                 + " cores=" + Runtime.getRuntime().availableProcessors());
+    }
+
+    static void apply(CvPipeline pipeline, double uppX, double uppY, double kernelMm,
+            double footprintMm) {
+        pipeline.setProperty("camera", mockCamera(uppX, uppY));
+        pipeline.setProperty("MinAreaRect.center", new Location(LengthUnit.Millimeters));
+        pipeline.setProperty("MinAreaRect.expectedAngle", 0.0);
+        pipeline.setProperty("MaskCircle.diameter", new Length(4.0, LengthUnit.Millimeters));
+        pipeline.setProperty("BlurGaussian.kernelSize", new Length(kernelMm, LengthUnit.Millimeters));
+        if(footprintMm > 0) {
+            // What preparePipeline() sets from shot.getMaxMaskRadius(): sqrt(2) * radius.
+            pipeline.setProperty("footprint.maxWidth", new Length(footprintMm, LengthUnit.Millimeters));
+            pipeline.setProperty("footprint.maxHeight", new Length(footprintMm, LengthUnit.Millimeters));
+        }
     }
 
     static String abbreviate(Object model) {

@@ -266,3 +266,59 @@ Two things in the log that look wrong and are not:
 
 Not yet done: runs A, B and D, the abort and missing-part checks, the long run with the RSS sampling,
 the single-camera case and the settings round trip.
+
+### 2026-09-28, the pipeline is cropped to the part (`vision-settings.xml` on the machine)
+
+Because §3 of `PRE-CHECK-ASSESSMENT.md` measured the analysis at 23 ms on a megapixel frame for a 30 px
+part, the new `CropCentered` stage was installed on the machine ahead of the next run. Two things had to
+change, and both are reversible; OpenPnP was closed for it (`pgrep -af openpnp-gui` empty) because the GUI
+rewrites the settings it has open.
+
+1. **The build.** The machine starts OpenPnP with `./openpnp.sh`, which runs
+   `<repo>/target/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`, i.e. the build directory of this very repository
+   (the share is mounted there as `/mnt/public/stuff/OpenPnP/openpnp`). `mvn package` was run here at
+   23:04, so the jar now contains `org/openpnp/vision/pipeline/stages/CropCentered.class`. That ties the
+   settings file to this build: a jar built from a branch without the stage will not know the stage this
+   pipeline now names, so restore the settings file too, not only the jar, if this experiment is undone.
+2. **The pipeline.** In `~/.openpnp2/vision-settings.xml`, settings `BVS1750dee5e50a6b58` (`R0402`), one
+   stage was inserted directly under the capture and nothing else in the file was touched:
+
+   ```xml
+   <cv-stage class="org.openpnp.vision.pipeline.stages.CropCentered" name="crop"
+             enabled="true" width="0" height="0" margin="0" minimum="200"/>
+   ```
+
+   19 stages became 20. `width`/`height` of 0 means "take it from the part", which is
+   `footprint.maxWidth`/`maxHeight` as `preparePipeline()` sets them from the mask radius; `minimum="200"`
+   is the floor, about 7.7 mm on this camera, deliberately far above what a 0402 needs because the same
+   `R0402` setting is shared by 27 parts here, `C0402` and `C0603` both.
+
+Backup and undo, on the machine:
+
+    cp ~/.openpnp2/vision-settings.xml.bak-before-cropcentered-2026-09-28 ~/.openpnp2/vision-settings.xml
+
+The backup is the file as it ran the job of the previous entry, byte for byte (verified with `diff` before
+installing). Deleting the `crop` stage in the vision pipeline editor does the same thing through the GUI.
+
+What the run has to show, in order of importance:
+
+- **The part is found, every time.** `Offsets accepted` 8, no `Parallel alignment failed`, no retries. A
+  crop that is too small does not fail loudly: the masks black out the part, no contour survives, and the
+  alignment falls back with a much larger offset or an error.
+- **The offsets did not move.** Compare the accepted offsets of the same placements against
+  `tests_2026-09-28/log_a.txt`; they should agree to well under half a pixel, which is what the crop
+  measurement of §3 predicted. A systematic half pixel would mean the crop is not centred.
+- **The cost.** `CropCentered` and the stages after it are debug logged per stage, and the
+  `[ALIGN-TIMING]` line gives `prepare` and `process` per shot - it needs debug level logging for
+  `org.openpnp.machine.reference.vision.ReferenceBottomVision`, or the line simply is not there. The
+  measured expectation is a `process` of about 20 ms against the 45-55 ms of the first run, of which the
+  capture and the recall stay where they were.
+- Note the CPU governor: it is on `performance` now, it was on `powersave` for `log_a.txt`. Say so in the
+  run notes, or the two runs are not comparable.
+
+If the run is good, this stops being an experiment in one package and becomes a default: the other bottom
+vision settings on the machine, the stock settings in `src/main/resources`, and the pipeline templates the
+setup wizard writes all want the stage, and it is worth proposing upstream on its own. The floor is the
+open design question: `minimum` is in pixels today, so a 200 px floor means a different number of
+millimetres on every camera, and it is what held this pipeline at 200 px instead of the 105 px the part
+actually needs.

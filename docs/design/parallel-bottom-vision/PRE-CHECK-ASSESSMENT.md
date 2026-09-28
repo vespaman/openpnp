@@ -141,10 +141,28 @@ result with the fork's own classes and a camera stub and prints the stages. On t
     javac -cp "classes:lib/*" -d out Benchmark.java Crop.java
     java -cp "out:classes:lib/*" org.openpnp.vision.pipeline.Benchmark p_full.xml 40
 
-Putting the crop stage of §7 option 1 into that same pipeline under the capture gives the identical rect
-(`39x21` at 50.5, 54.5) with the pixel-wise stages at 0.2 ms instead of 20 ms. The 1.4 ms of `ImageRecall`
-is still there, because this pipeline recalls the full frame anyway in order to draw on it: a crop makes
-the analysis cheap, it does not make the frame disappear.
+Putting the crop stage of §7 option 1 into that same pipeline under the capture, and letting it take its
+size from the `footprint.maxWidth` property the way it does on the machine, is the row that matters,
+because it is the configuration that has now been installed on the machine:
+
+| | full frame | with `crop` under the capture |
+|---|--:|--:|
+| sum of stages | 34.5 | 14.0 |
+| analysis alone | 23.1 | 2.6 |
+| whole `process()` | 44.9 | 20.1 |
+| detection | `39x21` at 537.5, 464.5 | `39x21` at 97.5, 101.5 |
+| px from image centre | -2.5, +1.5 | -2.0, +2.0 |
+
+The stage derived 78 px from a 2.83 mm footprint and then took the `minimum="200"` floor, so it cropped to
+200 px rather than to the 105 px of the table above; that is the conservative setting, and it is still a
+factor of nine. The 1.3 ms of `ImageRecall` is still there, because this pipeline recalls the full frame
+anyway in order to draw on it: a crop makes the analysis cheap, it does not make the frame disappear.
+
+One trap worth writing down, because it silently produced a wrong measurement here first: the benchmark
+calls `resetReusedPipeline()` between runs the way the real code does, and that reset puts the stage
+parameters back to their XML values - on the machine `preparePipeline()` then applies them again before
+every shot. Properties applied once before the loop are therefore only in force for the first run, and the
+median describes the uncropped pipeline. They are applied per run in `bench/Benchmark.java` now.
 
 Two caveats. The job measured 48-55 ms for the window and `process()` here is 45 ms, of which 11.5 ms is
 a PNG decode standing in for the captured image - so the real capture path, `preparePipeline()` and
@@ -340,14 +358,24 @@ with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons a
 
 ## 8. Recommended sequence
 
-1. **Enable `CropCentered` on the machine and measure it.** The stage of option 1 is written and tested;
-   what is left is the part that can only be done there. Put it under the capture in `R0402`, run the same
-   8 part job, and compare the `[ALIGN-TIMING]` lines. Measured off the machine, 22.9 ms became 0.7 ms
-   (§3), which is worth more than every scheduling trick in this document put together, and it is a
-   stage rather than a change to the job state machine, so one package can carry the risk before all of
-   them do. Two things to look for specifically: that the offsets are the same as they were without the
-   crop to within half a pixel, and that a part deliberately presented near the 1 mm offset limit is still
-   found - the full frame fallback has to be exercised deliberately, not discovered.
+1. **Enable `CropCentered` on the machine and measure it.** *Installed on the machine 2026-09-28, so what
+   is left is the run itself; see the second results entry of `MACHINE-TEST.md` for exactly what was
+   changed there and how to undo it.* The stage of option 1 is written and tested; what is left is the part
+   that can only be done there. It is in `R0402` under the capture; run the same 8 part job, and compare
+   the `[ALIGN-TIMING]` lines. Measured off the machine, 22.9 ms became 2.6 ms at the conservative 200 px
+   floor and 0.7 ms at 105 px (§3), which is worth more than every scheduling trick in this document put
+   together, and it is a stage rather than a change to the job state machine, so one package can carry the
+   risk before all of them do. Two things to look for specifically: that the offsets are the same as they
+   were without the crop to within half a pixel, and that a part deliberately presented near the 1 mm
+   offset limit is still found - the full frame fallback has to be exercised deliberately, not discovered.
+
+   **If the run is good, the crop is not a experiment to be left in one package, it is a default.** `R0402`
+   is shared by 27 parts on this machine and the job only aligned one of them, so the run proves the
+   setting and not the fleet. Then: the rest of the bottom vision settings on the machine, the stock
+   settings that ship in `src/main/resources`, and the pipeline templates the setup wizard writes, all want
+   the same stage under the capture; and it is worth an upstream proposal on its own, independently of
+   everything else in this document, because it speeds up vanilla OpenPnP with no change to its job state
+   machine.
 2. **The rest of option 0**, i.e. separate capture, settle and display in the `[ALIGN-TIMING]` line, so
    the next run shows what the remaining 10-20 ms of the window are. Run the same job with the governor on
    `performance` and say so in the log, otherwise the numbers cannot be compared with
