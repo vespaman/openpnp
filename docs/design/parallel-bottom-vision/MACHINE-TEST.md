@@ -204,7 +204,11 @@ copying the log out.
 
 The file is called `log_a.txt` but it is **run C** by the definition above: the `machine.xml` copied
 with it has `parallel-alignment-enabled` `true` and `displacement-enabled` `true`, and the log says
-`Using parallel alignment` four times and `Using sequential alignment` never.
+`Using parallel alignment` four times and `Using sequential alignment` never. The log and the two
+settings files are committed in `tests_2026-09-28/` so the numbers below can be rechecked; keep later
+runs in a directory of the same shape (`tests_<date>/` with the log and the settings), which is also
+why `.gitignore` has an exception for `tests_*/machine.xml` - `machine.xml` is otherwise ignored
+everywhere in this repository.
 
 Small job: 8 placements, all `C0402-22p/50V`, two nozzles, two up-looking cameras (`Upp1`, `Upp2`),
 two placements per alignment step.
