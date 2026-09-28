@@ -1,5 +1,7 @@
 package org.openpnp.machine.reference;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import org.openpnp.spi.CameraBatchOperation;
 import org.openpnp.spi.Camera;
@@ -15,6 +17,9 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
     // null if there is no batch operation in progress
     private List<Camera> cameras;
     private int nestingLevel = 0;
+    // The names of the batches that are open, innermost first, so that a batch nested inside
+    // another one does not rename the batch around it.
+    private final Deque<String> batchNames = new ArrayDeque<String>();
     private String currentBatchName = null;
 
     // Start a batch
@@ -23,6 +28,7 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
             cameras = new ArrayList<Camera>();
         }
         nestingLevel += 1;
+        batchNames.push(name);
         currentBatchName = name;
         Logger.trace("Batch START level {} '{}' - cameras: {}",nestingLevel, name, cameras.size());
     }
@@ -32,6 +38,10 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
         Logger.trace("Batch END level {} '{}' - expected: {}",nestingLevel, name, currentBatchName);
 
         nestingLevel -= 1;
+        if(!batchNames.isEmpty()) {
+            batchNames.pop();
+        }
+        currentBatchName = batchNames.peek();
 
         if (nestingLevel==0) {
             List<Camera> camerasFormerlyInUse = cameras;
@@ -68,5 +78,12 @@ public class ReferenceCameraBatchOperation implements CameraBatchOperation {
         }
 
         return true;
+    }
+
+    /**
+     * @return The name of the innermost batch operation in progress, or null if there is none.
+     */
+    public synchronized String getCurrentBatchName() {
+        return currentBatchName;
     }
 }
