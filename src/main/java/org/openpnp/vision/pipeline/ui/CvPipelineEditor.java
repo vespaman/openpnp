@@ -27,6 +27,7 @@ import org.openpnp.vision.pipeline.stages.ConvertModelToPoints;
 import org.openpnp.vision.pipeline.stages.CreateFootprintTemplateImage;
 import org.openpnp.vision.pipeline.stages.CreateModelTemplateImage;
 import org.openpnp.vision.pipeline.stages.CreateShapeTemplateImage;
+import org.openpnp.vision.pipeline.stages.CropCentered;
 import org.openpnp.vision.pipeline.stages.DetectCirclesHough;
 import org.openpnp.vision.pipeline.stages.DetectCircularSymmetry;
 import org.openpnp.vision.pipeline.stages.DetectEdgesCanny;
@@ -115,6 +116,7 @@ public class CvPipelineEditor extends JPanel {
         registerStageClass(CreateFootprintTemplateImage.class);
         registerStageClass(CreateModelTemplateImage.class);
         registerStageClass(CreateShapeTemplateImage.class);
+        registerStageClass(CropCentered.class);
         registerStageClass(DetectCirclesHough.class);
         registerStageClass(DetectLinesHough.class);
         registerStageClass(DetectRectangleHough.class);
