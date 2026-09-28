@@ -132,6 +132,20 @@ Three things follow:
   of 35-60 ms. An analysis of 0.7 ms hides in it four times over, and so do two of them, one per nozzle.
   The pre-check could never pay for itself on the full frame; on a 4 mm crop it can.
 
+How it was measured, so that it can be done again: `bench/make_pipeline.py` pulls the pipeline of a part
+out of the machine's own `parts.xml`, `packages.xml` and `vision-settings.xml` and turns its capture into
+an image read, `bench/Crop.java` cuts the centred copies of a frame, and `bench/Benchmark.java` runs the
+result with the fork's own classes and a camera stub and prints the stages. On the OpenPnP PC, with
+`classes` and `lib` copied out of `target/`:
+
+    javac -cp "classes:lib/*" -d out Benchmark.java Crop.java
+    java -cp "out:classes:lib/*" org.openpnp.vision.pipeline.Benchmark p_full.xml 40
+
+Putting the crop stage of §7 option 1 into that same pipeline under the capture gives the identical rect
+(`39x21` at 50.5, 54.5) with the pixel-wise stages at 0.2 ms instead of 20 ms. The 1.4 ms of `ImageRecall`
+is still there, because this pipeline recalls the full frame anyway in order to draw on it: a crop makes
+the analysis cheap, it does not make the frame disappear.
+
 Two caveats. The job measured 48-55 ms for the window and `process()` here is 45 ms, of which 11.5 ms is
 a PNG decode standing in for the captured image - so the real capture path, `preparePipeline()` and
 `displayResult()` together account for the remaining 10-20 ms, and that is precisely what the
@@ -266,6 +280,24 @@ Two constraints on how it is done:
   preview too. A centred crop belongs at the head of the vision pipeline, with the original frame kept
   for the diagnostics, and a fallback to the full frame when nothing is found inside the crop.
 
+*The stage exists now*: `CropCentered` (`org.openpnp.vision.pipeline.stages.CropCentered`). Its width and
+height come from `footprint.maxWidth`/`footprint.maxHeight` unless they are set explicitly, which is the
+number `preparePipeline()` already computes, so no new per-part number is introduced; it then adds a
+`margin` and refuses to go below a `minimum` (200 px by default, already fifteen times less area than the
+full frame of this camera and most of the measured win); it passes the frame through unchanged when it
+cannot work out a size, because a badly configured stage must not fail a job; and it cannot be made
+off-centre, because it has no offset parameter to give it. To try it on the machine, add it to `R0402`
+directly under the capture and read the `[ALIGN-TIMING]` line of the next run. The image from before the
+crop is not lost: it is still the result of the capture stage, so `ImageRecall` of that stage brings the
+full frame back, either for `ImageWriteDebug` or for a second pass at full size when the crop found
+nothing.
+
+One effect the first machine comparison will have to live with: the crop side length is rounded to a whole
+pixel, and a crop of odd side and a crop of even side put the image centre half a pixel apart, i.e. 19 µm
+on this camera. That is visible in the table of §3 (-2.5, +1.5 px against -2.0, +2.0 px) and it is well
+inside the 0.05 mm the offsets are checked against, but it means two runs with different crop sizes are
+not comparable to better than half a pixel.
+
 Secondary benefit: each shot of a multi-shot alignment currently analyses the whole frame, so the crop
 pays per shot there.
 
@@ -308,13 +340,14 @@ with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons a
 
 ## 8. Recommended sequence
 
-1. **The centred crop of option 1**, as a new pipeline stage at the head of the vision pipeline
-   (`org.openpnp.vision.pipeline.stages`), deriving its size from the `maxMaskRadius` that
-   `preparePipeline()` already computes, centred, keeping the original frame for diagnostics, and falling
-   back to the full frame when nothing is found inside the crop. Measured 22.9 ms to 0.7 ms (§3), which
-   is worth more than every scheduling trick in this document put together, and it is a stage rather than
-   a change to the job state machine, so it can be tried on one package before it is trusted by all of
-   them.
+1. **Enable `CropCentered` on the machine and measure it.** The stage of option 1 is written and tested;
+   what is left is the part that can only be done there. Put it under the capture in `R0402`, run the same
+   8 part job, and compare the `[ALIGN-TIMING]` lines. Measured off the machine, 22.9 ms became 0.7 ms
+   (§3), which is worth more than every scheduling trick in this document put together, and it is a
+   stage rather than a change to the job state machine, so one package can carry the risk before all of
+   them do. Two things to look for specifically: that the offsets are the same as they were without the
+   crop to within half a pixel, and that a part deliberately presented near the 1 mm offset limit is still
+   found - the full frame fallback has to be exercised deliberately, not discovered.
 2. **The rest of option 0**, i.e. separate capture, settle and display in the `[ALIGN-TIMING]` line, so
    the next run shows what the remaining 10-20 ms of the window are. Run the same job with the governor on
    `performance` and say so in the log, otherwise the numbers cannot be compared with
