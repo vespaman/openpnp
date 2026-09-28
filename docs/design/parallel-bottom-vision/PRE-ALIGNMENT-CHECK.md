@@ -3,6 +3,10 @@
 Status: **not implemented**. Written 2026-09-27 from a mid-development snapshot; this is a
 requirement and design note for a future implementation, not a description of the current code.
 
+2026-09-28: re-assessed against a real machine run in `PRE-CHECK-ASSESSMENT.md`. Its R1 (the check
+must fit inside the settling time) is the requirement that cannot be met, and the assessment says
+what to do instead.
+
 ## Where the snapshot comes from
 
 The idea was worked on 2026-04-29 to 2026-05-03 in the development checkout that also produced

@@ -58,4 +58,5 @@ sorts them below the documents written in this fork.
 | `SALVAGE-PLAN.md` | how the work was rescued from the development checkout, the risk register, and what the hardening did about it |
 | `MACHINE-TEST.md` | what to run on the real machine before this branch is trusted, and what deliberately is not measured |
 | `PRE-ALIGNMENT-CHECK.md` | the unimplemented pre-alignment check, as a requirement note |
+| `PRE-CHECK-ASSESSMENT.md` | whether the pre-check and an earlier departure from the vision position are worth doing, measured on the machine on 2026-09-28; supersedes the timing requirements of `PRE-ALIGNMENT-CHECK.md` |
 | `DISPLACEMENT-VERIFICATION.md` | assessment of letting the machine measure its own displacement data instead of re-calibrating by hand |
