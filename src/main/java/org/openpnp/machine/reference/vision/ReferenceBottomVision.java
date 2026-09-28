@@ -713,7 +713,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     }
 
     public static CvPipeline getThreadLocalPipeline(BottomVisionSettings bottomVisionSettings) throws CloneNotSupportedException {
-        return bottomVisionSettings.getPipeline().clone();
+        // Every thread gets a pipeline of its own, the one of the vision settings is shared. It is
+        // cloned without resetting the parameter stages: those are applied again by preparePipeline()
+        // below, and the pipeline of the vision settings has no camera of its own to reset them with.
+        return bottomVisionSettings.getPipeline().cloneWithoutReset();
     }
 
     private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,

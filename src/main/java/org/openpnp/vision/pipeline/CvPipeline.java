@@ -399,6 +399,21 @@ public class CvPipeline implements AutoCloseable {
      */
     public String toXmlString() throws Exception {
         resetToDefaults();
+        return toXmlStringWithoutReset();
+    }
+
+    /**
+     * Convert the pipeline to an XML string without resetting the parameter stages first.
+     * 
+     * Resetting is what #toXmlString() does to keep the runtime values of the parameters out of
+     * the saved pipeline, but it needs the context the parameters were applied in (e.g. the camera
+     * of a pipeline that holds a size in square millimeters), and it writes to the stages of this
+     * pipeline. A pipeline that is merely being read must not be changed by that.
+     * 
+     * @return
+     * @throws Exception
+     */
+    public String toXmlStringWithoutReset() throws Exception {
         Serializer ser = createSerializer();
         StringWriter sw = new StringWriter();
         ser.write(this, sw);
@@ -451,6 +466,28 @@ public class CvPipeline implements AutoCloseable {
     public CvPipeline clone() throws CloneNotSupportedException {
         try {
             return new CvPipeline(toXmlString());
+        }
+        catch (Exception e) {
+            throw new CloneNotSupportedException(e.getMessage());
+        }
+    }
+
+    /**
+     * Clone the pipeline without resetting the parameter stages of the pipeline that is cloned, see
+     * #toXmlStringWithoutReset().
+     * 
+     * Use this when a pipeline is cloned so that it can be processed by one worker thread, while
+     * the pipeline being cloned is the one owned by the vision settings and shared with everything
+     * else. Such a clone is always given its parameter values again from the settings before it is
+     * processed, so resetting the shared pipeline buys nothing, and it would modify that shared
+     * pipeline as a side effect, once per clone.
+     * 
+     * @return
+     * @throws CloneNotSupportedException
+     */
+    public CvPipeline cloneWithoutReset() throws CloneNotSupportedException {
+        try {
+            return new CvPipeline(toXmlStringWithoutReset());
         }
         catch (Exception e) {
             throw new CloneNotSupportedException(e.getMessage());
