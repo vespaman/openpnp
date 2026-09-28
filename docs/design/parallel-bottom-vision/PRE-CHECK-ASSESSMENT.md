@@ -36,11 +36,11 @@ These two rows are the ceiling of anything in this document. Perfectly hidden vi
 and this job is 2,614 CPH becoming 2,711 CPH. The approach move to the vision position (975 ms,
 8.9 %) is only reachable by not stopping there at all, see option 5.
 
-## 2. Before anything else: the pipeline writes PNG files during the job
+## 2. Ruled out: the debug images the log level makes the pipeline write
 
-The run had the global log level at DEBUG (2,088 DEBUG lines in `log_a.txt`, against 16 INFO). That
-level is set by the *Global log level* combo in the Log panel, which configures tinylog itself
-(`LogPanel.java:204`), and `ImageWriteDebug` decides to write on nothing else:
+Worth writing down because it is a trap, even though it does not explain this run.
+
+`ImageWriteDebug` decides to write a PNG on nothing but the global log level:
 
 ```java
 if (!LogUtils.isDebugEnabled()) {          // ImageWriteDebug.java:41
@@ -49,56 +49,46 @@ if (!LogUtils.isDebugEnabled()) {          // ImageWriteDebug.java:41
 Imgcodecs.imwrite(file.getAbsolutePath(), pipeline.getWorkingImage());
 ```
 
-with `LogUtils.isDebugEnabled()` meaning *level ≤ DEBUG* (`LogUtils.java:8`). Nothing in the pipeline
-settings or the machine settings is consulted.
+with `LogUtils.isDebugEnabled()` meaning *level ≤ DEBUG* (`LogUtils.java:8`), and that level is the
+*Global log level* combo in the Log panel, which reconfigures tinylog itself (`LogPanel.java:204`). The
+run had Debug (2,088 DEBUG lines against 16 INFO). The stock pipeline in `vision-settings.xml` has two
+`ImageWriteDebug` stages enabled, `deb0` right after the capture and `deb1` at the end, and a PNG encode
+of a 960x1080 frame measures 27.6 ms on this workstation. Two of them would have been the entire
+measured pipeline window of 48-55 ms.
 
-The bottom vision settings in use are `BVS_Stock` (`machine.xml`, `bottom-vision-id="BVS_Stock"`), and
-the stock pipeline stored for it in `vision-settings.xml` has **two enabled `ImageWriteDebug`
-stages** - `deb0` immediately after the `ImageCapture`, `deb1` at the end - each writing the full
-frame.
+Checked on the machine: `<configuration directory>/org.openpnp.vision.pipeline.stages.ImageWriteDebug/`
+(where `Configuration.createResourceFile`, `Configuration.java:385`, puts them, one file per write,
+never cleaned up) contains only old files. The pipeline the package in the test job actually uses has
+its debug stages disabled, so this run paid nothing for them. The per-package pipelines live in
+`packages.xml`, which was not part of the copied configuration, so the pipeline the job ran cannot be
+inspected from here.
 
-Same operation, measured on this workstation (OpenCV `imwrite`, PNG, 960×1080):
+What does survive:
 
-| written | time |
-|---|---|
-| PNG 960×1080 | **27.6 ms** |
-| PNG 200×200 | 1.1 ms |
-| JPEG q95 960×1080 | 2.7 ms |
-
-Two full-frame PNG encodes are thus worth about **55 ms**, i.e. the entire measured pipeline window
-of 48-55 ms, and the vision computer is not faster than the workstation used for the measurement. For
-scale, the whole pixel-wise part of a bottom vision pipeline at full resolution - copy, 9×9 Gaussian,
-BGR→HSV, `inRange`, threshold, `findContours`, `drawContours` - is **2.1 ms** on that same workstation
-and **0.2 ms** in a 200×200 crop. The pixel work is not what costs anything; the diagnostics are.
-
-The files go to `<configuration directory>/org.openpnp.vision.pipeline.stages.ImageWriteDebug/` with a
-nanosecond name per write (`Configuration.createResourceFile`, `Configuration.java:385`) and are never
-cleaned up, so the evidence of this is sitting on the machine: the number of files there should be
-about two per vision pass.
-
-**Do this before writing any code:** set *Global log level* to `Info` and run the same job. If the
-pipeline window falls from ~50 ms towards the handful of milliseconds the pixel work accounts for,
-then §3 has to be re-read - a pre-check may fit inside the settle after all - and the real fix is to
-decouple the debug images from the log level, because turning DEBUG off is not an option for someone
-debugging a machine that is also being produced on. A per-pipeline or per-machine flag is the shape of
-that fix.
-
-Smaller and of the same kind: both up cameras have `settle-diagnostics="true"`, which makes the
-settling loop convert every frame into a `BufferedImage` for playback (`AbstractSettlingCamera.java:377`).
-The frames are downscaled by 3 first (from the configured `settle-gaussian-blur="15"`), so it is a few
-milliseconds rather than tens, but they are milliseconds inside the settle window, spent on something
-only the camera wizard ever looks at.
+- Any part that inherits the stock pipelines gets a full-frame PNG encode per enabled stage per vision
+  pass for as long as the log level is Debug, and nothing says so in the log. If a future timing
+  investigation finds unexplained milliseconds, the timestamps in that directory are the first thing to
+  look at, and the fix is a flag of the pipeline or machine rather than the log level.
+- `settle-diagnostics="true"` is set on both up cameras in `machine.xml`, which makes the settling loop
+  convert every frame into a `BufferedImage` for playback (`AbstractSettlingCamera.java:377`), inside
+  the settle window. The frames are downscaled by 3 first (from `settle-gaussian-blur="15"`), so this is
+  milliseconds rather than tens, spent on something only the camera wizard ever looks at.
+- **Benchmarks from another machine do not transfer and must not be used to size anything.** The
+  pixel-wise part of the pipeline (copy, 9x9 Gaussian, BGR-HSV, `inRange`, threshold, `findContours`,
+  `drawContours`) measures 2.1 ms at full resolution here and 0.2 ms in a 200x200 crop, which tells us
+  nothing about the vision computer, the OpenCV build OpenPnP bundles, the Java/JNI and `Mat` allocation
+  overhead per stage, or the two pipelines running concurrently. Where the 48-55 ms really goes is
+  **unknown**, and that is now the first thing to fix, not the second.
 
 ## 3. Why the pre-check does not fit in the settle window
 
 The pipeline takes 48-55 ms, the settle it would have to hide inside takes 35-60 ms. That is the
-whole problem - **with the PNG writes of §2 still inside that 48-55 ms.** If they come out and the
-pipeline drops to single-digit milliseconds, the arithmetic below no longer holds and the pre-check
-does fit. Everything in this section is conditional on that measurement.
-
-It is otherwise the same problem the 2026-04 attempt ran into (50-70 ms measured against a
+whole problem, and it is the same problem the 2026-04 attempt ran into (50-70 ms measured against a
 ~30 ms budget, `PRE-ALIGNMENT-CHECK.md` *Why it stopped*): the absolute numbers have improved, the
-relation has not. Two things make it worse than a ratio:
+relation has not. What the 48-55 ms is made of is not known (§2), so this conclusion is provisional in
+one direction: if a per-stage measurement turns up one stage costing most of it, and the part it is
+spending that time on is 30 px across, the relation may change. Two things make it worse than a ratio
+either way:
 
 - Both nozzles need the analysis, and the two alignment pipelines already run concurrently on
   separate threads. A pre-check per nozzle is two more pipeline runs competing for the same cores
@@ -180,9 +170,10 @@ one `[ALIGN-TIMING]` line per alignment step. Without it every number in this do
 long is a pipeline stage, really, and what dominates) and it is the thing `PRE-ALIGNMENT-CHECK.md`
 already says to do first. Cost: a day, including a test that the line is produced. Risk: none.
 
-**1. Make the pipeline faster - and the crop that goes with it.** Once the debug writes of §2 are out
-of the way, the pixel work itself is a handful of milliseconds, so this is worth doing for headroom
-and robustness rather than for cycle time. The geometry, from the advanced calibration of Upp1 in
+**1. Make the pipeline faster - and the crop that goes with it.** How much this is worth cannot be
+said until option 0 says where the 48-55 ms goes (§2). What can be said is that the frames are a
+megapixel and the part is 30 px, so every pixel-wise stage is working over some thirty times the area
+the answer can possibly come from. The geometry, from the advanced calibration of Upp1 in
 `machine.xml`:
 
 | | |
@@ -256,25 +247,33 @@ with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons a
 
 ## 7. Recommended sequence
 
-1. **The experiment in §2, today, with no code**: set the global log level to `Info` and re-run the
-   same 8 part job. Compare the pipeline window (48-55 ms) and the total standing-at-vision time
-   (399 ms). Count the files in
-   `<configuration directory>/org.openpnp.vision.pipeline.stages.ImageWriteDebug/` before and after.
-   This is free, reversible, and it decides what the rest of the document is about.
-2. Option 0, the `[ALIGN-TIMING]` line, so that the next run is measured per stage rather than inferred
-   from log timestamps that contain each other.
-3. Whatever §2 leaves standing: the debug-image flag decoupled from the log level, `settle-diagnostics`
-   off during jobs, then option 1 (crop) for headroom.
+1. **Option 0: measure per stage.** One `[ALIGN-TIMING]` line per alignment step: approach complete,
+   per-camera capture duration, settle duration, **per pipeline stage** duration, offsets accepted,
+   next motion command issued. Everything else in this document is scheduled by what that says, and
+   the one thing it currently says is that 48-55 ms is being spent somewhere nobody can name. The data
+   is already collected per stage (`CvStage.Result.processingTimeNs`, `CvPipeline.java:54`); it is
+   simply never logged.
+   Interim, without code: the vision settings editor reports the processing time of a pipeline run
+   against a grabbed frame, so an obviously expensive stage can be found by disabling stages one at a
+   time. It is interactive rather than in-job, so it will not show the two pipelines competing for
+   cores - treat it as a smoke test, not as the measurement.
+2. **Copy the whole configuration next run.** `packages.xml` and `parts.xml` were not in
+   `tests_2026-09-28/`, so the pipeline the job actually ran cannot be inspected from here at all; see
+   the *Recording* section of `MACHINE-TEST.md`.
+3. Then whatever the numbers ask for: the centred crop of option 1 if the pixel-wise stages dominate,
+   `settle-diagnostics` off during jobs (it is on for both up cameras), the settle change of option 2
+   if the capture window dominates.
 4. `MACHINE-TEST.md` runs A, B, D plus the abort/retry checks (R6) - the baseline option 3 needs.
 5. Option 3, behind a setting, default off, with the late failure path designed explicitly.
 6. Option 4 on top, report only.
 
 Open questions for the machine owner:
 
-- With the log level at `Info`, how much of the 48-55 ms pipeline window is left? Everything above
-  hinges on that one number.
-- What exposure do the up cameras really run at, and what is the light level headroom to shorten it?
-  The `Exposure="1"` property is meaningless without its unit and its real v4l2 value.
+- What does the bottom vision pipeline of the package in the test job look like, stage by stage? The
+  stock pipelines in `vision-settings.xml` are not necessarily what ran.
+- How long is each stage of it, on the machine, on a captured frame?
+- What exposure do the up cameras really run at, and how much light headroom is there to shorten it?
+  `Exposure="1"` is meaningless without its unit and its actual v4l2 value.
 
-Answered since this was first written: the captured size is 960×1080 (§6 option 1), and `/dev/video2`
-is the down looking camera.
+Answered since this was first written: the captured frame is 960x1080 (§6 option 1); `/dev/video2` is
+the down looking camera; and the debug image writes of §2 are **not** what made this run slow.

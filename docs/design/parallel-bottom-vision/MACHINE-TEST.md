@@ -198,6 +198,11 @@ the `machine.xml` used, and fill the table in section 2. If something fails, the
 keep are: the log, the settings, and *which* of the checks above failed - do not clean up before
 copying the log out.
 
+Copy the **whole configuration directory**, not only `machine.xml` and `vision-settings.xml`. The
+bottom vision pipeline a part actually runs is the per-package one, and those live in `packages.xml`;
+without it, the pipeline that produced the timings cannot be read by anyone who was not standing at
+the machine, which is exactly what happened to the analysis of the first run.
+
 ## Results
 
 ### 2026-09-28, first run on the machine (`tests_2026-09-28/log_a.txt`)
