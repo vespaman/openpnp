@@ -137,6 +137,11 @@ grep -n "uses post-rotate but the pre-captured image" OpenPnP.log
   is a **pre-rotate** machine (required by the setup, and enabled), so this must never appear. If it
   does, a part or a pipeline has slipped to post-rotate - that is a configuration error to fix, not a
   warning to live with. Note it in the results either way.
+- `Cannot reset the parameters of pipeline stage pDetail : Cannot invoke "org.openpnp.spi.Camera
+  .getUnitsPerPixel()" because "camera" is null` appeared sixteen times in the first real run, twice
+  per pipeline clone, in every pipeline that has a size parameter (`pDetail` in most of them). It was
+  the parallel path resetting the pipeline of the vision settings on every clone - see R15 - and it is
+  fixed in `a4f42fb1dd`; a DEBUG line rather than a fault, but it must be gone in the next run.
 
 ## 4. Long run and memory (R4)
 
@@ -192,3 +197,57 @@ Put the logs of each run in a directory per run (`~/pbv-test/A/`, `A2`, `B`, `C`
 the `machine.xml` used, and fill the table in section 2. If something fails, the useful things to
 keep are: the log, the settings, and *which* of the checks above failed - do not clean up before
 copying the log out.
+
+## Results
+
+### 2026-09-28, first run on the machine (`tests_2026-09-28/log_a.txt`)
+
+The file is called `log_a.txt` but it is **run C** by the definition above: the `machine.xml` copied
+with it has `parallel-alignment-enabled` `true` and `displacement-enabled` `true`, and the log says
+`Using parallel alignment` four times and `Using sequential alignment` never.
+
+Small job: 8 placements, all `C0402-22p/50V`, two nozzles, two up-looking cameras (`Upp1`, `Upp2`),
+two placements per alignment step.
+
+| Check | Result |
+|---|---|
+| Job completed without abort | yes, `Job finished 8 parts in 11.0 sec. This is 2,613.7 CPH` |
+| `Using parallel alignment` | 4 (one per alignment step, 2 placements + 2 cameras each) |
+| `Parallel alignment failed, falling back` | 0 |
+| `Offsets too large` | 0 |
+| `Offsets accepted` | 8, one per placement |
+| Pick failures, vacuum errors, retries | 0 |
+| `displacement (parallel)` | 8 |
+| `displacement (sequential)`, `nozzle not moved to the shot location` | 0, as expected: with two nozzles the pre-captured path always moves onto the shot location, R14 only applies when a nozzle is already there |
+| `exceeds the tolerated` | 0 |
+| `uses post-rotate but the pre-captured image` | 0 |
+| `ERROR` / `WARN` lines in the whole log | 0 |
+| `Cannot reset the parameters of pipeline stage pDetail` | 16 - see R15, fixed in `a4f42fb1dd` |
+
+Where the time of one alignment step goes (first step, `18:03:09.925` to `18:03:10.274`):
+
+| Phase | Time |
+|---|---|
+| nozzle order optimisation | 3 ms |
+| head move to the alignment position | 263 ms |
+| capture, including the settling of `Upp2` | 36 ms |
+| the two pipelines processed in parallel | 48 ms |
+| **alignment step total** | **349 ms** |
+
+The alignment is not the part of the cycle this feature can speed up much on this machine: three
+quarters of it is the one move that both nozzles share, and it is shared precisely because the
+alignment is parallel. The two pipelines did run at the same time - their `MaskHsv` stage lines
+interleave (`10.247`, `10.248`, `10.252`, `10.254`) and both finish within 2 ms of each other - which
+is the point of the branch.
+
+Two things in the log that look wrong and are not:
+
+- `Batch END level 1 'align step' - expected: parallel-align-precapture` is the diagnostic of
+  `CameraBatchOperation` lying about nested batches, see R16, fixed in `0f00b3f06f`.
+- `Camera 'Upp1' registration attempted but no batch in progress` followed by `turning OFF light (no
+  batch active)`: the pre-capture batch is closed when the images are taken, but the pipelines are
+  processed after it, and the end of the processing calls `actuateLightAfterCapture()` on a camera
+  whose batch is already gone. The light is off either way. Harmless, and the same happens upstream.
+
+Not yet done: runs A, B and D, the abort and missing-part checks, the long run with the RSS sampling,
+the single-camera case and the settings round trip.

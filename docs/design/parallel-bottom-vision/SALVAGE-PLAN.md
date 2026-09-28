@@ -110,6 +110,8 @@ Decisions taken:
 | R12 | The pre-check WIP is mid-debug and over budget: 50-70 ms measured against a ~30 ms settle window | `.opencode/plans/diagnose-precheck-timing.md` |
 | R13 | No way back: the parallel path has no setting of its own, it is taken whenever a batch has more than one bottom vision camera and more than one placement. Found while writing the outcome, it is not in the register above. | `ReferencePnpJobProcessor.Align.stepImpl()` and `performParallelAlignment()` |
 | R14 | What displacement actually is was unclear enough to be reported as missing. The MBV sequential trick (nozzle already within `displacement-max-distance` of the shot location, so do not move it, store the difference on the camera, let `ImageCapture` skip settling, compensate in `findOffsets`) is gone from the parallel rework: the non-pre-captured path always moves to the exact shot location. Displacement in this branch is only the per-shot delta of the pre-captured path plus the balance-level Z. | MBV `ReferenceBottomVision` (`camera.setDisplacements(...)`, `isDisplacementActive()`) and `ImageCapture` (`SettleOption.Skip`) against this branch, where `ImageCapture` has no displacement logic and `PipelineShot.apply()` says "Displacement fallback is NOT allowed" |
+| R15 | Every bottom vision clone resets the pipeline it clones. `clone()` goes through `toXmlString()`, which calls `resetToDefaults()`; the parallel path clones the pipeline of the vision settings once per pass per nozzle, so the pipeline shared with the GUI and the other threads is reset on every one of them, and the reset fails because that pipeline has no camera property for a size parameter to convert with. Found in the first machine run, where it filled the log with 16 messages in a job of 8 parts. | `CvPipeline.clone()`/`toXmlString()`, `ReferenceBottomVision.getThreadLocalPipeline()`; `tests_2026-09-28/log_a.txt`, `pDetail` is `SquareMillimetersToPixels` in 28 of the machine's vision settings |
+| R16 | A nested camera batch renames the batch around it, so the log of the outer close names the inner one and a camera is said to register with a batch that has already closed. The batch name exists only as a diagnostic of who forgot to close a batch, which the parallel pre-capture (nested inside the align step) breaks. | `ReferenceCameraBatchOperation.startBatchOperation()`/`endBatchOperation()`; `log_a.txt`: `Batch END level 1 'align step' - expected: parallel-align-precapture` |
 
 ## 5. Out of scope
 
@@ -133,12 +135,16 @@ Branch `parallel-bottom-vision`, based on `upstream/test` `16d29e7b33`:
 | `a66d0dad5d`, `8f9fb00a98` | this plan and `PRE-ALIGNMENT-CHECK.md` |
 | `a939b4e3df` | R13: the `parallel-alignment-enabled` setting |
 | `74cb7cc892` | R14: the sequential small-move saving of MBV, per shot instead of per camera |
+| `a4f42fb1dd` | R15: cloning for a vision thread no longer resets the shared pipeline |
+| `0f00b3f06f` | R16: nested camera batches keep their own names |
 
-The documentation commits in between are left out of the table, `git log --oneline` has them all.
+The documentation commits in between are left out of the table, `git log --oneline` has them all. The
+test suite is 285 tests now: `ShotDisplacementTest`, `PipelineCloneResetTest` and
+`CameraBatchNestingTest` were added along the way.
 
-Disposition of the risk register. The full test suite (277 tests) passed both before and after the
-hardening commits; none of the items below marked *fixed* changes what the machine does, they only
-remove the ways it could go wrong.
+Disposition of the risk register. The full test suite passed before and after every hardening commit;
+none of the items below marked *fixed* changes what the machine does, they only remove the ways it
+could go wrong.
 
 | # | Disposition |
 |---|-------------|
@@ -156,12 +162,21 @@ remove the ways it could go wrong.
 | R12 | documented in `PRE-ALIGNMENT-CHECK.md`, not implemented. |
 | R13 | **fixed** after the first test run of this outcome: `parallel-alignment-enabled` on `ReferenceMachine`, exposed as a `default` method on the `Machine` SPI, gating `Align.stepImpl()`. Defaults to `true`, i.e. the behaviour of the checkout this came from; set it to `false` to get the classic one-nozzle-at-a-time alignment without rebuilding. No GUI, like the displacement settings. |
 | R14 | **fixed** `74cb7cc892`, per-shot rather than per-camera: `CvPipeline.setShotDisplacement(shotIndex, ...)` records that the picture is taken without moving, `ImageCapture` skips the settling for that shot, and `findOffsetsPreRotate()` subtracts what is left. Narrower than MBV on purpose, because MBV kept the value on the `Camera` and never cleared it on the branch that did move, so a stale displacement could be applied to a later pass or to the other nozzle: it is only done for a single-shot part (a composited part is assembled from its shots in machine coordinates), only in pre-rotate (the post-rotate path returns offsets relative to the camera centre and has no nozzle location to correct), and the value is cleared on every `resetReusedPipeline()`. `ShotDisplacementTest` covers the bookkeeping; whether the compensation is right is run D of `MACHINE-TEST.md`. |
+| R15 | **fixed** `a4f42fb1dd`: `CvPipeline.cloneWithoutReset()`, used by `getThreadLocalPipeline()`. `clone()` still resets, because that is what keeps runtime parameter values out of a pipeline that is saved or opened in the editor. Nothing is lost for the vision threads: `preparePipeline()` gives the clone its parameter values again from the settings and the parameter stage applies them to its target stage on every `process()`. The catch in `resetToDefaults()` from `dec31fedef` stays - without it the failed reset would leave `clone()` as a `CloneNotSupportedException`, which is also why the parallel author had made `clone()` skip the reset. Note that the feeders that
+clone a pipeline (`ReferencePushPullFeeder`, `BlindsFeeder`, `AbstractPandaplacerVisionFeeder`) have
+the same exposure upstream and were left alone: they clone their own pipeline, not one shared with a
+GUI, and they are not what this branch runs. |
+| R16 | **fixed** `0f00b3f06f`: the open batch names are kept on a stack and the outer name is restored when the inner batch closes. Logging only, but it is the logging that tells us who leaked a batch, which is check 6 of `MACHINE-TEST.md`. |
 
 Still open, in the order they should be taken:
 
 1. `MACHINE-TEST.md`: the same job run four times, with `parallel-alignment-enabled` off, on with
    `displacement-enabled` off, on with `displacement-enabled` on, and off with
    `displacement-enabled` on, plus the abort, missing-part, single-camera and long-run checks.
+   Started: the parallel run with displacement on exists (`tests_2026-09-28/log_a.txt`, recorded
+   under *Results*), and it is clean - no fallback, no rejection, no warning, and the two pipelines
+   provably processed at the same time. It also produced R15. Runs A, B and D and the abort,
+   missing-part, single-camera and long-run checks are still to be done.
    Placement accuracy is deliberately not measured - on this machine it is dominated by mechanics and
    by the last calibration, so a change of this kind cannot be seen in it; behaviour, rejections,
    cycle time and memory can.
@@ -169,5 +184,7 @@ Still open, in the order they should be taken:
 3. R4 ownership audit.
 4. R8 class untangling, with the machine available.
 
-The branch has not been built on real hardware from this repository; the "verified on real hardware"
-status belongs to the author's checkout at `6343c999e9`.
+The branch has been run on the machine once, on a build made in the author's checkout rather than
+from this repository; which commit that build was is not recorded, so treat the first run as evidence
+about the design, not about a commit here. Re-run it (run C) from a build of this branch when the
+remaining runs are made.
