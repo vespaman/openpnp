@@ -77,18 +77,77 @@ What does survive:
   pixel-wise part of the pipeline (copy, 9x9 Gaussian, BGR-HSV, `inRange`, threshold, `findContours`,
   `drawContours`) measures 2.1 ms at full resolution here and 0.2 ms in a 200x200 crop, which tells us
   nothing about the vision computer, the OpenCV build OpenPnP bundles, the Java/JNI and `Mat` allocation
-  overhead per stage, or the two pipelines running concurrently. Where the 48-55 ms really goes is
-  **unknown**, and that is now the first thing to fix, not the second.
+  overhead per stage, or the two pipelines running concurrently. **Superseded**: §3 is that measurement,
+  on the vision computer, on the bundled OpenCV, on the pipeline that actually ran.
 
-## 3. Why the pre-check does not fit in the settle window
+## 3. What the pipeline is made of, measured stage by stage
+
+The OpenPnP PC (`pn52`, Ryzen 7 5800H) has the fork's own `target/classes` and the same OpenCV 4.5.5, so
+the pipeline can be timed there against a captured frame without touching hardware. It is the pipeline of
+`R0402` (`BVS1750dee5e50a6b58`), 19 stages, read out of `vision-settings.xml` **on the machine** - the
+stock pipelines in `tests_2026-09-28/` are not what the job ran - with its `ImageCapture` replaced by an
+`ImageRead` of a real 1080x926 bottom vision frame, its camera replaced by a stub returning the calibrated
+`units-per-pixel`, and every stage's `processingTimeNs` printed. Median of 40 runs. The other columns are
+the same pipeline against copies of the frame cropped to a centred square, which is what §7 option 1
+proposes.
+
+| stage | 1080x926 | 525 px | 300 px | 105 px |
+|---|--:|--:|--:|--:|
+| `ImageRead`, standing in for the capture | 11.5 | 3.4 | 1.2 | 0.3 |
+| `MaskHsv` x2 | 11.3 | 1.8 | 0.7 | 0.1 |
+| `ConvertColor` x3 | 3.5 | 1.5 | 0.8 | 0.2 |
+| `MaskCircle` x2 | 2.5 | 0.3 | 0.1 | 0.0 |
+| `MinAreaRect` | 2.0 | 0.3 | 0.2 | 0.1 |
+| `ImageRecall` | 1.4 | 0.4 | 0.1 | 0.0 |
+| `BlurGaussian` | 0.9 | 0.6 | 0.1 | 0.1 |
+| `FindContours` + `FilterContours` + `DrawContours` | 1.2 | 0.2 | 0.1 | 0.1 |
+| parameter stages, `DrawRotatedRects` | 0.2 | 0.1 | 0.0 | 0.1 |
+| **sum of stages** | **34.4** | **8.7** | **3.5** | **1.0** |
+| **analysis alone**, i.e. without the `ImageRead` | **22.9** | **5.2** | **2.3** | **0.7** |
+| whole `process()`, incl. inter-stage bookkeeping | 45.0 | 11.5 | 4.5 | 1.2 |
+
+The 525 px column is a coincidence of this particular pipeline: its `MaskCircle` is already 525 px in the
+XML, so that crop is the mask made real. 105 px is 4 mm, which is `maxMaskRadius` for a 0402 plus the 1.0
+mm `max-linear-offset` with room to spare. A 200 px run was measured and dropped: its median came out
+*above* the 300 px one, which says the medians below about 5 ms carry noise of that order. The ratio
+between the first and the last column is not noise.
+
+Three things follow:
+
+- **The pixel-wise stages are the cost, and they are all of it.** Two `MaskHsv`, three colour conversions,
+  two `MaskCircle` and the blur are 20 of the 22.9 ms. Contours, which everyone assumes are the expensive
+  part, are 1.2 ms. A megapixel analysed to locate a 30 px body is the story §7 option 1 predicted, now
+  with numbers: **a 4 mm crop makes the analysis 0.7 ms instead of 22.9 ms**, a factor of thirty.
+- **A centred crop does not move the answer.** The same part is found at these centres, and its distance
+  from the centre of each image is the same to within a pixel:
+
+  | frame | detection centre | px from image centre |
+  |---|---|---|
+  | 1080x926 | 537.5, 464.5 | -2.5, +1.5 |
+  | 525 px | 260.5, 264.5 | -2.0, +2.0 |
+  | 300 px | 147.5, 151.5 | -2.5, +1.5 |
+  | 105 px | 50.5, 54.5 | -2.0, +2.0 |
+
+- **The pre-check relation flips.** §4 concluded that an analysis of 48-55 ms cannot hide inside a settle
+  of 35-60 ms. An analysis of 0.7 ms hides in it four times over, and so do two of them, one per nozzle.
+  The pre-check could never pay for itself on the full frame; on a 4 mm crop it can.
+
+Two caveats. The job measured 48-55 ms for the window and `process()` here is 45 ms, of which 11.5 ms is
+a PNG decode standing in for the captured image - so the real capture path, `preparePipeline()` and
+`displayResult()` together account for the remaining 10-20 ms, and that is precisely what the
+`[ALIGN-TIMING]` line of option 0 now measures separately. And this ran with the CPU governor on
+`performance`, which the machine was not on during the logged job; how much of the gap between 45 and
+55 ms that is, only the next run can say.
+
+## 4. Why the pre-check does not fit in the settle window
 
 The pipeline takes 48-55 ms, the settle it would have to hide inside takes 35-60 ms. That is the
 whole problem, and it is the same problem the 2026-04 attempt ran into (50-70 ms measured against a
 ~30 ms budget, `PRE-ALIGNMENT-CHECK.md` *Why it stopped*): the absolute numbers have improved, the
-relation has not. What the 48-55 ms is made of is not known (§2), so this conclusion is provisional in
-one direction: if a per-stage measurement turns up one stage costing most of it, and the part it is
-spending that time on is 30 px across, the relation may change. Two things make it worse than a ratio
-either way:
+relation has not. It holds for the pipeline as it is configured today, and §3 is what shows it: the
+22.9 ms of analysis is spread over a megapixel by nine pixel-wise stages, none of which can be dropped
+on its own - they are cheap only together, and only once the frame is small. Two things make it worse
+than a ratio either way:
 
 - Both nozzles need the analysis, and the two alignment pipelines already run concurrently on
   separate threads. A pre-check per nozzle is two more pipeline runs competing for the same cores
@@ -106,7 +165,7 @@ The other thing that went wrong last time and must not go wrong again: the measu
 included the image capture and the settle. Any new measurement must report capture, settle and
 pipeline as three separate numbers, and it must be in the log from the first commit.
 
-## 4. What an image taken before settling can and cannot tell
+## 5. What an image taken before settling can and cannot tell
 
 The cameras are global shutter, so an unseltled frame is sharp. What is wrong with it is the *position
 of the head* when it was exposed: the commanded position is known, the actual position is not, because
@@ -126,7 +185,7 @@ Nor can the error be measured away: `GcodeDriver.getReportedLocation()`
 (`GcodeDriver.java:779`) is an `M114` round trip, which is slow, and reports what the controller
 thinks the motors are, not where the tool is.
 
-## 5. What the code already has, and where it resists
+## 6. What the code already has, and where it resists
 
 Already in place, on this branch:
 
@@ -161,19 +220,21 @@ What resists:
 - No per-stage timing exists today. `CvStage.Result` carries `processingTimeNs`
   (`CvPipeline.java:54`) and `CvPipeline.getProcessingTimeNs()` exists, but nothing logs them.
 
-## 6. Options, ordered by what they are worth per unit of risk
+## 7. Options, ordered by what they are worth per unit of risk
 
-**0. Measure. No behaviour change.** Log, per alignment: approach complete, per-camera capture
-duration, settle duration, per-stage pipeline duration, offsets accepted, next motion command issued -
-one `[ALIGN-TIMING]` line per alignment step. Without it every number in this document comes from one
-8 part job and from log timestamps that include each other. It also settles the R12 question (how
-long is a pipeline stage, really, and what dominates) and it is the thing `PRE-ALIGNMENT-CHECK.md`
-already says to do first. Cost: a day, including a test that the line is produced. Risk: none.
+**0. Measure. No behaviour change.** *Partly done.* `processPipelineAndGetResult()` now writes one
+`[ALIGN-TIMING]` line per shot, debug gated like the rest of the diagnostics
+(`ReferenceBottomVision.logAlignTimings`): `preparePipeline()`, `process()`, and every stage's
+`processingTimeNs` in pipeline order. What it does not yet separate is the capture, the settle and the
+`displayResult()` conversion, so the three numbers `PRE-ALIGNMENT-CHECK.md` asks for are still not all
+there. The off-machine measurement of §3 has meanwhile answered the R12 question that this option was
+supposed to answer.
 
-**1. Make the pipeline faster - and the crop that goes with it.** How much this is worth cannot be
-said until option 0 says where the 48-55 ms goes (§2). What can be said is that the frames are a
-megapixel and the part is 30 px, so every pixel-wise stage is working over some thirty times the area
-the answer can possibly come from. The geometry, from the advanced calibration of Upp1 in
+**1. Make the pipeline faster - and the crop that goes with it.** This is now the lead option: §3
+measured it, and a centred 4 mm crop takes the analysis from 22.9 ms to 0.7 ms while reporting the same
+part within a pixel. The reason it was always going to be worth it is visible without measuring - the
+frames are a megapixel and the part is 30 px, so every pixel-wise stage works over some thirty times the
+area the answer can possibly come from. The geometry, from the advanced calibration of Upp1 in
 `machine.xml`:
 
 | | |
@@ -245,35 +306,34 @@ residual that matters is in the belts and the nozzle holder. The `exposure_time_
 bottom vision at all - but it does mean the exposure the up cameras actually use should be confirmed
 with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons about smear budgets.
 
-## 7. Recommended sequence
+## 8. Recommended sequence
 
-1. **Option 0: measure per stage.** One `[ALIGN-TIMING]` line per alignment step: approach complete,
-   per-camera capture duration, settle duration, **per pipeline stage** duration, offsets accepted,
-   next motion command issued. Everything else in this document is scheduled by what that says, and
-   the one thing it currently says is that 48-55 ms is being spent somewhere nobody can name. The data
-   is already collected per stage (`CvStage.Result.processingTimeNs`, `CvPipeline.java:54`); it is
-   simply never logged.
-   Interim, without code: the vision settings editor reports the processing time of a pipeline run
-   against a grabbed frame, so an obviously expensive stage can be found by disabling stages one at a
-   time. It is interactive rather than in-job, so it will not show the two pipelines competing for
-   cores - treat it as a smoke test, not as the measurement.
-2. **Copy the whole configuration next run.** `packages.xml` and `parts.xml` were not in
-   `tests_2026-09-28/`, so the pipeline the job actually ran cannot be inspected from here at all; see
+1. **The centred crop of option 1**, as a new pipeline stage at the head of the vision pipeline
+   (`org.openpnp.vision.pipeline.stages`), deriving its size from the `maxMaskRadius` that
+   `preparePipeline()` already computes, centred, keeping the original frame for diagnostics, and falling
+   back to the full frame when nothing is found inside the crop. Measured 22.9 ms to 0.7 ms (§3), which
+   is worth more than every scheduling trick in this document put together, and it is a stage rather than
+   a change to the job state machine, so it can be tried on one package before it is trusted by all of
+   them.
+2. **The rest of option 0**, i.e. separate capture, settle and display in the `[ALIGN-TIMING]` line, so
+   the next run shows what the remaining 10-20 ms of the window are. Run the same job with the governor on
+   `performance` and say so in the log, otherwise the numbers cannot be compared with
+   `tests_2026-09-28/log_a.txt`.
+3. **Copy the whole configuration next run.** `packages.xml` and `parts.xml` were not in
+   `tests_2026-09-28/`, so the pipeline the job actually ran could only be read off the machine itself; see
    the *Recording* section of `MACHINE-TEST.md`.
-3. Then whatever the numbers ask for: the centred crop of option 1 if the pixel-wise stages dominate,
-   `settle-diagnostics` off during jobs (it is on for both up cameras), the settle change of option 2
-   if the capture window dominates.
 4. `MACHINE-TEST.md` runs A, B, D plus the abort/retry checks (R6) - the baseline option 3 needs.
 5. Option 3, behind a setting, default off, with the late failure path designed explicitly.
-6. Option 4 on top, report only.
+6. Option 4 on top, report only. It is the crop of step 1 that makes it affordable: see the last bullet of
+   §3.
 
 Open questions for the machine owner:
 
-- What does the bottom vision pipeline of the package in the test job look like, stage by stage? The
-  stock pipelines in `vision-settings.xml` are not necessarily what ran.
-- How long is each stage of it, on the machine, on a captured frame?
 - What exposure do the up cameras really run at, and how much light headroom is there to shorten it?
   `Exposure="1"` is meaningless without its unit and its actual v4l2 value.
+- Does the crop survive a part presented at the far end of the allowed 1 mm offset, and a bent lead
+  hanging outside the mask? The full frame fallback has to be exercised deliberately, not discovered.
 
-Answered since this was first written: the captured frame is 960x1080 (§6 option 1); `/dev/video2` is
-the down looking camera; and the debug image writes of §2 are **not** what made this run slow.
+Answered since this was first written: the captured frame is 960x1080 (§7 option 1); `/dev/video2` is
+the down looking camera; the debug image writes of §2 are **not** what made this run slow; the pipeline
+that ran is `R0402` from the machine's own `vision-settings.xml`; and its stages are now timed, §3.
