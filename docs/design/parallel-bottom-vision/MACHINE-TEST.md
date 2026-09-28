@@ -248,6 +248,12 @@ Two things in the log that look wrong and are not:
   batch active)`: the pre-capture batch is closed when the images are taken, but the pipelines are
   processed after it, and the end of the processing calls `actuateLightAfterCapture()` on a camera
   whose batch is already gone. The light is off either way. Harmless, and the same happens upstream.
+- `UPLED.actuate(true)` a millisecond after `Job finished`. The ring light does not go off with the
+  job, it goes off when the machine is disabled (`M811 ; Turn off UPLED`). This is the preview: the
+  cameras have `suspend-preview-in-tasks` and `user-action-light-on` on, so when the machine falls
+  idle the preview resumes and `AbstractBroadcastingCamera.captureCameraView()` turns the light back
+  on for it. Upstream, and nothing to do with the batch bookkeeping - but it means check 6 (lights
+  off after a job) has to be judged with the preview closed, or with the machine disabled.
 
 Not yet done: runs A, B and D, the abort and missing-part checks, the long run with the RSS sampling,
 the single-camera case and the settings round trip.
