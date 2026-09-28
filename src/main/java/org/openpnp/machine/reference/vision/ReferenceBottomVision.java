@@ -3,6 +3,7 @@ package org.openpnp.machine.reference.vision;
 import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import org.apache.commons.io.IOUtils;
@@ -45,12 +46,14 @@ import org.openpnp.spi.PartAlignment;
 import org.openpnp.spi.PropertySheetHolder;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Machine;
+import org.openpnp.util.LogUtils;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
 import org.openpnp.vision.pipeline.CvPipeline;
 import org.openpnp.vision.pipeline.CvPipeline.PipelineShot;
+import org.openpnp.vision.pipeline.CvStage;
 import org.openpnp.vision.pipeline.CvStage.Result;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
@@ -733,8 +736,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
             Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings,
             boolean skipMovement, CapturedShot preCapturedShot) throws Exception {
+        long prepareStartNs = System.nanoTime();
         preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), camera, part.getPackage(), 
                 nozzle, nozzle.getNozzleTip(), wantedLocation, adjustedNozzleLocation, bottomVisionSettings, skipMovement);
+        long prepareNs = System.nanoTime() - prepareStartNs;
         // Set pre-captured shot AFTER preparePipeline (which calls resetReusedPipeline and clears pre-captured shots)
         if (preCapturedShot != null) {
             pipeline.setPreCapturedShot(0, preCapturedShot);
@@ -742,7 +747,12 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         for (PipelineShot pipelineShot : pipeline.getPipelineShots()) {
             pipelineShot.apply();
 
+            long processStartNs = System.nanoTime();
             pipeline.process();
+            long processNs = System.nanoTime() - processStartNs;
+            logAlignTimings(pipeline, part, camera, prepareNs, processNs);
+            // Only the first shot pays for the preparation of the pipeline.
+            prepareNs = 0;
             Result result = pipeline.getResult(VisionUtils.PIPELINE_RESULTS_NAME);
 
             // Fall back to the old name of "result" instead of "results" for backwards
@@ -782,6 +792,35 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
         
         return resultRect;
+    }
+
+    /**
+     * Log how long the vision analysis really took, stage by stage. Whether the analysis can be
+     * overlapped with the move to placement is decided by this cost, so it has to be measured on the
+     * machine instead of guessed. Gated on debug logging to keep production logs as they are.
+     */
+    protected void logAlignTimings(CvPipeline pipeline, Part part, Camera camera, long prepareNs,
+            long processNs) {
+        if(!LogUtils.isDebugEnabled()) {
+            return;
+        }
+        StringBuilder stages = new StringBuilder();
+        for(CvStage stage : pipeline.getStages()) {
+            if(!stage.isEnabled()) {
+                continue;
+            }
+            Result stageResult = pipeline.getResult(stage);
+            if(stages.length() > 0) {
+                stages.append(", ");
+            }
+            stages.append(stage.getName())
+                    .append(String.format(Locale.US, "=%.1f", (stageResult == null ? 0 : stageResult.processingTimeNs)/1e6));
+        }
+        Logger.debug("[ALIGN-TIMING] part {} camera {} prepare {} ms process {} ms stages [{}]",
+                part.getId(), camera.getName(),
+                String.format(Locale.US, "%.1f", prepareNs/1e6),
+                String.format(Locale.US, "%.1f", processNs/1e6),
+                stages);
     }
 
     /**
