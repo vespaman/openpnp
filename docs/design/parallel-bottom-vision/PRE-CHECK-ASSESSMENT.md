@@ -312,7 +312,8 @@ nothing.
 
 **The first machine run of the crop failed, and not because the crop was wrong** (`tests_2026-09-28/log_b.txt`,
 2026-09-28 23:14). The crop did exactly what it was measured to do: `process 20.1 ms` instead of the
-48-55 ms of `log_a.txt`, and `MinAreaRect` reported the part at `(97.5, 101.5)` inside the 200 px crop,
+48-55 ms *window* of `log_a.txt` (which predates the timing line), and `MinAreaRect` reported the part at
+`(97.5, 101.5)` inside the 200 px crop,
 which for a `Upp1` of 0.038595 x 0.034126 mm is `-0.096, -0.051 mm` - a good find of a part sitting
 essentially where the nozzle expected it, and the same find that the benchmark below makes of the same part.
 What the machine then steered to was `-11.640, +9.544 mm`, the center offset check failed at
@@ -371,7 +372,8 @@ evening was not 1080x926 either, which is exactly the point of the fix: the pipe
 Two things this also settled. The analysed bottom vision frame is about 1080x926, the same size as the PNG
 the benchmark uses - the part sits at its middle in `log_a.txt` and the advanced calibration of both up
 cameras stores image points out to x ≈ 1002 - so the **absolute** stage times of §3 are representative of the
-machine and not an artefact of an over-sized test frame; the machine's own 48-55 ms full frame against the
+machine and not an artefact of an over-sized test frame; the machine's own 49-57 ms full frame window against
+the
 8-13 ms cropped of `log_c.txt` agrees with them. And `ImageRecall` of the capture stage remains available as
 the full frame fallback, but only *after* the geometry stages: recalling the frame in front of them puts them
 back in an image whose center they are not.
@@ -382,8 +384,11 @@ provably in the path and provably centred - the rects come back at `(100.5, 92.0
 `(95.6, 102.1)` and `(104.5, 94.5)`, all within 5 px of the middle of the 200 px crop, on a part measured at
 37x18/37x19 against the 37x19/36x19 of the uncropped run - and the millimetres are the size they were: the
 largest of the eight accepted offsets is 0.26 mm against 0.25 mm in `log_a.txt`. `process` per shot fell from
-48-55 ms to 8.1-13.2 ms, the first two shots of the first alignment (19.0 and 22.7 ms) still carrying the
-pipeline warm-up, so the analysis of the job went from about 200 ms to about 110 ms. What that does and does
+to a `process` of 8.1-13.2 ms in `log_c.txt`, the first two shots of the first alignment (19.0 and 22.7 ms)
+still carrying the pipeline warm-up, i.e. about 92 ms of window for the four alignments where `log_a.txt` had
+about 208 ms; `log_a.txt` predates the `[ALIGN-TIMING]` line, so that window is the only comparison of the
+two, and `log_b.txt` shows what the other 180 ms of a `process` are when the pipeline has to capture the
+frame itself instead of being handed it. What that does and does
 not buy at job level, including why the reported job time went the other way, is in the run record in
 `MACHINE-TEST.md`.
 

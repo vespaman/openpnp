@@ -30,6 +30,31 @@ difference of a few hundredths of a mm cannot be attributed to a code change, an
 a day. What is measured instead is whether the machine still *behaves*: does it place, does it
 reject, how long does it take, does it run out of memory.
 
+## What is already automated
+
+Part of this list is a JUnit test now, and should not be repeated by hand unless a machine result
+contradicts it. From the repo root, one class at a time (see `SALVAGE-PLAN.md` for why not the whole
+suite at once):
+
+```
+JAVA_HOME=/opt/android-studio/jbr ~/tools/apache-maven-3.9.6/bin/mvn -B -o \
+    -Djvm=/opt/openjdk-jre-bin-17/bin/java test -Dtest=ParallelAlignmentTest
+```
+
+| test | covers | of this document |
+|---|---|---|
+| `ParallelAlignmentTest` | two nozzles really align concurrently, results are matched to the right nozzle, one nozzle alone falls back to sequential, a part with no vision is placed without a camera call, repeated batches on one machine stay consistent | 1, 2 (mechanics), 7 |
+| `ParallelAlignmentLightControlTest` | lights on before the shot and off after the batch, in parallel, sequential, mixed and nested batches | 6 |
+| `CameraBatchOperationTest`, `CameraBatchNestingTest` | the batch bookkeeping and what happens when a batch opens inside a batch | 1, 6 |
+| `BottomVisionSettingsRoundTripTest` | `parallel-alignment-enabled`, the four displacement settings and the `CropCentered` stage surviving save/restart of `machine.xml` and `vision-settings.xml` | 8 |
+| `CropCenteredTest` | the crop is centred and its output is in millimetres like the pipeline it sits in | 7 of `PRE-CHECK-ASSESSMENT.md` |
+| `ReferenceJobProcessorRetryTests` | feeder, pick and place retries and failover | 5 (retry half) |
+| `check_run.py` | the log greps and timings of sections 1, 2 and 3 for a pair of runs, in one command | 1, 2, 3 |
+
+What stays on the machine is what a simulated machine cannot see: that the offsets are the size they
+should be for these parts and this camera, that the lamps actually come on at the right moment, that
+the machine does not knock anything over, and anything involving a real part being lost.
+
 ## Before starting
 
 The machine, as far as this test cares: one head, two nozzles (N1, N2) sharing the X and Y axes and
@@ -145,6 +170,12 @@ grep -n "uses post-rotate but the pre-captured image" OpenPnP.log
 
 ## 4. Long run and memory (R4)
 
+Not run. A long run was dropped on 2026-09-29: the branch changes no allocation that is not per
+placement, and the RSS sampling of an eleven second job says nothing. If a real job ever grows
+thousands of placements, sample the resident set size of the JVM every few minutes over an hour and
+look for a slope; a flat curve is the pass.
+
+
 While run C is going, sample the process memory:
 
 ```
@@ -181,6 +212,9 @@ behaviour must be that of run A exactly, including for a single placement in the
 case that must not change for anyone else either.
 
 ## 8. Settings round trip
+
+Automated by `BottomVisionSettingsRoundTripTest`. Keep the manual half only if a machine refuses to
+come back with the switch on, which is a machine configuration problem and not a code one.
 
 Set `parallel-alignment-enabled` to `false`, save the machine (`Machine` → `Save`), restart, and
 check the value is still `false` and that `machine.xml` contains
@@ -311,21 +345,33 @@ What the run has to show, in order of importance:
 - **The cost.** `CropCentered` and the stages after it are debug logged per stage, and the
   `[ALIGN-TIMING]` line gives `prepare` and `process` per shot - it needs debug level logging for
   `org.openpnp.machine.reference.vision.ReferenceBottomVision`, or the line simply is not there. The
-  measured expectation is a `process` of about 20 ms against the 45-55 ms of the first run, of which the
-  capture and the recall stay where they were.
+  expectation is a `process` of about 20 ms, of which the `ImageCapture` stage keeps its ~2 ms and the
+  stages after the crop keep theirs. `log_a.txt` predates the `[ALIGN-TIMING]` line and has none of its own,
+  so what can be compared across the two runs is the pipeline window, the tail of the alignment step, not a
+  per shot `process`.
 - Note the CPU governor: it is on `performance` now, it was on `powersave` for `log_a.txt`. Say so in the
   run notes, or the two runs are not comparable.
 
 The run happened the same evening, and the three bullets come out one good, one good, one broken
 (`tests_2026-09-28/log_b.txt`):
 
-- **The cost was as predicted.** `process 20.1 ms` against the 48-55 ms of `log_a.txt`, with the capture and
-  the recall unchanged, i.e. the analysis did most of what the off-machine measurement said it would.
+- **The cost was as predicted.** `process 20.1 ms` against the 48-55 ms *window* of `log_a.txt`, with the
+  capture and the recall unchanged, i.e. the analysis did most of what the off-machine measurement said it
+  would.
 - **The part was found**, and found where it should be: `MinAreaRect` in the 200 px crop at
   `(97.5, 101.5)`, which is `-0.096, -0.051 mm` off the center of that crop.
 - **The offsets moved by 15 mm.** The same find was reported to the job as `-11.640, +9.544 mm`, so
   `center offset 15.05 > 1.0` rejected it, the parallel attempt fell back to sequential, and the retries
   then presented the part somewhere the crop was not looking and the job ended with no result.
+- **The sequential fallback is far more expensive than the parallel shot, and this log measures it.** The
+  twelve retries of `log_b.txt` report a `process` of 185-232 ms for a pipeline that costs 20.1 ms in the
+  parallel shots, and the per stage lines put all of it in one stage, `0`, which is `ImageCapture`:
+  `0=216.2` of `process 218.6 ms`. The parallel path hands the pipeline a frame it has already taken
+  (~2 ms of capture); the sequential path calls the camera itself and sits out the settle inside the
+  pipeline, and `Upp1`/`Upp2` are configured with `settle-time-ms="250"`. So a fallback shot costs about ten
+  times a parallel one, which is worth knowing both when reading a bad run and when weighing how much the
+  parallel path is worth. It also means the `process` of a fallback run must have its capture stage
+  subtracted before it is compared with anything: `check_run.py` reports the two apart.
 
 The settings were therefore reverted with the command above and the machine is back on the 19 stage
 pipeline; `grep -c CropCentered ~/.openpnp2/vision-settings.xml` is 0 again. The jar was left as built,
@@ -372,9 +418,10 @@ The job then ran clean, and this time all three questions came out the right way
   placement by placement, because they are measured against the pick and the pick scatter of this feeder is
   of the same order as the difference, but 15 mm is not on offer any more and neither is anything else of
   that class.
-- **The cost.** `process` per shot is 8.1-13.2 ms against the 48-55 ms of `log_a.txt`; the first two shots of
-  the first alignment, 19.0 and 22.7 ms, still carry the pipeline warm-up. Over the eight shots of the job
-  that is about 200 ms become about 110 ms.
+- **The cost.** `process` per shot is 8.1-13.2 ms, the first two shots of the first alignment, 19.0 and
+  22.7 ms, still carrying the pipeline warm-up, and 110 ms for the eight shots of the job together.
+  `log_a.txt` has no `[ALIGN-TIMING]` line to set against that, so the comparison is the window below:
+  49-57 ms become 19-35 ms.
 
 What that buys is smaller than it sounds, and it is worth writing down before someone quotes the 4x at the
 job: an alignment step runs from `Moving head to alignment position` to the last `Vision.PartAlignment.After`
