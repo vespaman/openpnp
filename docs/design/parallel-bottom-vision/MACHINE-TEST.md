@@ -51,6 +51,7 @@ JAVA_HOME=/opt/android-studio/jbr ~/tools/apache-maven-3.9.6/bin/mvn -B -o \
 | `ReferenceJobProcessorRetryTests` | feeder, pick and place retries and failover | 5 (retry half) |
 | `JobAbortTest` | aborting a job ends the camera batch and the light with it, discards the part that was picked, leaves the batch bookkeeping usable, and the same job started again places what is left | 5 (abort half), 6 (the aborted half, as far as a simulation can see it) |
 | `check_run.py` | the log greps and timings of sections 1, 2 and 3 for a pair of runs, in one command | 1, 2, 3 |
+| `align_table.py` | one line per analysed shot - camera, rect, angle, accepted offsets, part size, pipeline time - so a shot of one worker thread is never read as a shot of the other | 2 (offsets), 3 |
 
 Three more tests are worth writing and are not written; see `LATER-TESTS.md`: the crop over a size matrix
 (the vision setting on this machine is shared by 27 parts and only one of them was ever looked at), the
@@ -233,6 +234,12 @@ machine work:
 
 After a finished job and after an aborted job, all camera lights must be off
 (`CameraBatchOperation`). An aborted job that leaves a light on is a bug worth reporting.
+
+On this machine `Upp1` and `Upp2` share one light actuator, `UPLED`, so the two up cameras can never be
+lit or switched independently and every light off is a deferred one until the batch covering both ends.
+The batch also spans the move after the alignment, so holding the light on for a second or two is normal;
+holding it on after a job that has stopped is not. See the `log_d.txt` entry below for how long it can be
+while the machine is merely idle between two steps at low speed.
 
 ## 7. Single camera
 
@@ -504,3 +511,44 @@ setup wizard writes all want the stage, and it is worth proposing upstream on it
 open design question: `minimum` is in pixels today, so a 200 px floor means a different number of
 millimetres on every camera, and it is what held this pipeline at 200 px instead of the 105 px the part
 actually needs.
+
+### 2026-09-29, a turned part, and a part that was not there at all (`tests_2026-09-28/log_d.txt`)
+
+Two runs of the test job at 10 % speed, 44.4 s and 133.6 s, with the parts interfered with by hand.
+Read them one shot at a time, not one job at a time - `align_table.py` in this directory prints exactly
+that, one line per analysed shot, because the two worker threads of a parallel batch write their lines
+back to back and a grep for `Offsets accepted` pairs the wrong rect with the wrong camera.
+
+- **A turned part is corrected, not rejected, and that is the feature.** Run 1 accepted
+  `-44.911°` on N1 at 13:52:33: the shot shows the part at `36x17 * 45.0` px, dead centred in the crop at
+  {104.5, 104.0}, with the size still `ok` at 0.96x0.47 mm. Run 2, after the part was turned by hand,
+  accepted `11.034°`, `13.143°` and `17.252°`. Nothing in the accept path looks at the rotation at all:
+  `Offsets accepted` guards the centre offset, the `size ok` line guards width and length, and the
+  rotation is handed to the placement as a correction so the part lands square on the pad. There is no
+  rotation tolerance to tick and no number of degrees that makes bottom vision complain. If a turned
+  part is supposed to be refused, that is a new setting, not a misbehaving measurement.
+- **The run did fail once, but not because of the rotation.** At 13:53:07 N2 had nothing in front of
+  Upp2: four captures in a row with `findCountours=0.0` and `contours=0.0`, then
+  `ReferenceBottomVision (C0402-22p/50V): No result found`, machine idle, job error dialog at
+  13:53:07.672. The light was on and the camera was fine (the same camera detected the part again at
+  13:53:28 after the re-pick), so there was genuinely no part on the tip. That is the correct behaviour,
+  and it is also the one case the parallel path must not paper over, which it does not: the sequential
+  fallback re-aligns, hits the same empty camera, and rethrows.
+- **The fallback used to hide its reason.** The parallel attempt failed first, and all that was logged
+  was `Parallel alignment failed, falling back to sequential alignment for all` - the exception was
+  dropped. The cause was only recoverable later, from the rethrow of the sequential pass. The catch in
+  `alignAllParallel()` now logs the cause, so a log says *which* of the two failed and why.
+- **What the fallback costs.** The three sequential re-alignments of that step took 198.5, 945.0 and
+  210.0 ms of `process` against 3-15 ms for the pre-captured shots of the same job, all of it in stage
+  `0` (`ImageCapture`): the sequential path captures inside the pipeline and pays the camera settle
+  there. See the `log_b.txt` entry above.
+- **Lights: one actuator for both up cameras, and the batch bookkeeping is clean on this machine.**
+  `Upp1` and `Upp2` share `UPLED` (`light-actuator-id="ACT1579799618401"` in `machine.xml`), so they can
+  never be lit independently and the light off is always deferred until the batch that covers both ends.
+  Every `Batch START` in both runs has its `Batch END`, including the run that errored, and nothing is
+  left open at either job end. What the batch does do is hold the light on: the `align step` batch spans
+  `StartCameraBatchOperation` to `EndCameraBatchOperation`, i.e. the alignment *and* the slow move that
+  follows it, so at 10 % speed the up-light stays on for 11-12 s after the shots are taken, and after the
+  error at 13:53:07 it stayed on for 20.6 s, until the retried step unwound the batch. That is not a
+  leak - aborting closes it, which `JobAbortTest` covers - but it is what "the light is still on while I
+  am looking at the error dialog" is.

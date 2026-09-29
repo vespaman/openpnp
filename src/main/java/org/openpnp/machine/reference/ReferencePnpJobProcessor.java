@@ -1899,8 +1899,12 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                         new CompletableFuture[0])).join();
                 }
                 catch (Exception e) {
-                    // One or more background threads failed - fall back to sequential for ALL
-                    Logger.info("Parallel alignment failed, falling back to sequential alignment for all");
+                    // One or more background threads failed - fall back to sequential for ALL.
+                    // Say why: the sequential retry below can fail (or succeed) for a different
+                    // reason than the parallel attempt, and without this the operator only ever
+                    // sees the second one.
+                    Logger.info("Parallel alignment failed {}, falling back to sequential alignment for all",
+                            e.getCause() == null ? e : e.getCause());
                     for (PlannedPlacement p : plannedPlacements) {
                         super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
                     }
