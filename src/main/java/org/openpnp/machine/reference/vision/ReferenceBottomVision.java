@@ -268,8 +268,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             RotatedRect rect;
             // Try getting a good fix on the part in multiple passes.
             for(int pass = 0;;) {
-                rect = processPipelineAndGetResult(pipeline, camera, part, nozzle,
+                PipelineGeometry geometry = processPipelineAndGetResult(pipeline, camera, part, nozzle,
                         wantedLocation, nozzleLocation, bottomVisionSettings, skipMovement, preCapturedShot);
+                rect = geometry.rect;
 
                 // For parallel alignment with pre-captured shots, use displacement delta from the shot
                 if (preCapturedShot instanceof PreCapturedPlacement) {
@@ -294,7 +295,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
 
                 // Create the offsets object. This is the physical distance from
                 // the center of the camera to the located part.
-                offsets = VisionUtils.getPixelCenterOffsets(camera, rect.center.x, rect.center.y);
+                offsets = geometry.getCenterOffsets(camera);
 
                 double angleOffset = VisionUtils.getPixelAngle(camera, rect.angle) - wantedAngle;
                 // Most OpenCV Pipelines can only tell us the angle of the recognized rectangle in a   
@@ -333,7 +334,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 // so a large part will react more sensitively to angular offsets.
                 Point corners[] = new Point[4];
                 rect.points(corners);
-                Location corner = VisionUtils.getPixelCenterOffsets(camera, corners[0].x, corners[0].y)
+                Location corner = geometry
+                        .getPixelCenterOffsets(camera, corners[0].x, corners[0].y)
                         .convertToUnits(maxLinearOffset.getUnits());
                 Location cornerWithAngularOffset = corner.rotateXy(angleOffset);
 
@@ -387,13 +389,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, 0., skipMovement);
 
         try (CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings)) {
-            RotatedRect rect = processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, wantedLocation, bottomVisionSettings, skipMovement, preCapturedShot);
+            PipelineGeometry geometry = processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, wantedLocation, bottomVisionSettings, skipMovement, preCapturedShot);
+            RotatedRect rect = geometry.rect;
 
             Logger.debug("Bottom vision part {} result rect {}", part.getId(), rect);
 
             // Create the offsets object. This is the physical distance from
             // the center of the camera to the located part.
-            Location offsets = VisionUtils.getPixelCenterOffsets(camera, rect.center.x, rect.center.y);
+            Location offsets = geometry.getCenterOffsets(camera);
 
             double angleOffset = VisionUtils.getPixelAngle(camera, rect.angle);
             // Most OpenCV Pipelines can only tell us the angle of the recognized rectangle in a   
@@ -722,18 +725,55 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         return bottomVisionSettings.getPipeline().cloneWithoutReset();
     }
 
-    private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
+    /**
+     * The geometry a bottom vision pipeline has detected, together with the size of the image it was
+     * detected in.
+     *
+     * The two belong together and must never be mixed up with something else: a
+     * {@link org.openpnp.vision.pipeline.stages.CropCentered} stage makes the pipeline analyse a
+     * centred part of the captured frame, and then the pixels of the detection are counted from the
+     * corner of that crop, while the Camera still reports the size of the whole frame. Interpret one
+     * against the center of the other and a part found dead center is reported half an image away -
+     * which is exactly the 15 mm of nonsense this produced on the machine on 2026-09-28.
+     */
+    private static class PipelineGeometry {
+        final RotatedRect rect;
+        final double imageWidth;
+        final double imageHeight;
+
+        PipelineGeometry(RotatedRect rect, Result result) {
+            this.rect = rect;
+            this.imageWidth = (result == null || result.image == null ? 0 : result.image.cols());
+            this.imageHeight = (result == null || result.image == null ? 0 : result.image.rows());
+        }
+
+        /**
+         * The physical distance from the center of the image the part was found in to that part.
+         */
+        Location getCenterOffsets(Camera camera) {
+            return getPixelCenterOffsets(camera, rect.center.x, rect.center.y);
+        }
+
+        Location getPixelCenterOffsets(Camera camera, double x, double y) {
+            return VisionUtils.getPixelCenterOffsets(camera,
+                    imageWidth > 0 ? imageWidth : camera.getWidth(),
+                    imageHeight > 0 ? imageHeight : camera.getHeight(),
+                    x, y);
+        }
+    }
+
+    private PipelineGeometry processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
             Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings) throws Exception {
         return processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, adjustedNozzleLocation, bottomVisionSettings, false);
     }
 
-    private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
+    private PipelineGeometry processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
             Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings,
             boolean skipMovement) throws Exception {
         return processPipelineAndGetResult(pipeline, camera, part, nozzle, wantedLocation, adjustedNozzleLocation, bottomVisionSettings, skipMovement, null);
     }
 
-    private RotatedRect processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
+    private PipelineGeometry processPipelineAndGetResult(CvPipeline pipeline, Camera camera,
             Part part, Nozzle nozzle, Location wantedLocation, Location adjustedNozzleLocation, BottomVisionSettings bottomVisionSettings,
             boolean skipMovement, CapturedShot preCapturedShot) throws Exception {
         long prepareStartNs = System.nanoTime();
@@ -744,6 +784,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         if (preCapturedShot != null) {
             pipeline.setPreCapturedShot(0, preCapturedShot);
         }
+        // The image the geometry was measured in, i.e. the image the offsets have to be referred to.
+        Result geometryResult = null;
         for (PipelineShot pipelineShot : pipeline.getPipelineShots()) {
             pipelineShot.apply();
 
@@ -779,6 +821,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         part.getId(), result.model.getClass().getSimpleName()));
             }
             pipelineShot.processResult(result);
+            geometryResult = result;
             // Display the shot result.   
             displayResult(OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()), part, null, camera, nozzle);
         }
@@ -791,7 +834,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             displacementCheck((PreCapturedPlacement) preCapturedShot);
         }
         
-        return resultRect;
+        return new PipelineGeometry(resultRect, geometryResult);
     }
 
     /**

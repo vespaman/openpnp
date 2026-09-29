@@ -1,17 +1,23 @@
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
 
 import org.junit.jupiter.api.Test;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
+import org.opencv.core.RotatedRect;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
+import org.openpnp.model.Location;
 import org.openpnp.spi.Camera;
+import org.openpnp.util.VisionUtils;
+import org.openpnp.vision.FluentCv;
 import org.openpnp.vision.pipeline.CvPipeline;
 import org.openpnp.vision.pipeline.CvStage;
 import org.openpnp.vision.pipeline.stages.CropCentered;
+import org.openpnp.vision.pipeline.stages.MinAreaRect;
 
 import com.google.common.io.Files;
 
@@ -42,6 +48,22 @@ public class CropCenteredTest {
             }
             return new Result(mat);
         }
+    }
+
+    private static boolean configurationInitialized = false;
+
+    private static synchronized void initializeConfiguration() throws Exception {
+        // The stages convert millimetres through the machine as soon as a camera is involved. Once
+        // per JVM is enough; initializing a second machine over the first one is not something the
+        // rest of the test suite does either.
+        if(configurationInitialized) {
+            return;
+        }
+        File workingDirectory = Files.createTempDir();
+        workingDirectory = new File(workingDirectory, ".openpnp");
+        Configuration.initialize(workingDirectory);
+        Configuration.get().load();
+        configurationInitialized = true;
     }
 
     private CvPipeline build(double width, double height, double margin, double minimum,
@@ -90,10 +112,7 @@ public class CropCenteredTest {
     @Test
     public void testCropsToTheFootprintTheMachineComputes() throws Exception {
         // The test camera is 1 mm per pixel, so the footprint comes through as pixels.
-        File workingDirectory = Files.createTempDir();
-        workingDirectory = new File(workingDirectory, ".openpnp");
-        Configuration.initialize(workingDirectory);
-        Configuration.get().load();
+        initializeConfiguration();
         CvPipeline pipeline = build(0, 0, 0, 0,
                 new Length(30, LengthUnit.Millimeters), new Length(20, LengthUnit.Millimeters));
         assertEquals(30, pipeline.getWorkingImage().cols());
@@ -131,5 +150,127 @@ public class CropCenteredTest {
                 after[0] - cropped.getWorkingImage().cols()/2., 0.5);
         assertEquals(before[1] - full.getWorkingImage().rows()/2.,
                 after[1] - cropped.getWorkingImage().rows()/2., 0.5);
+    }
+
+    /**
+     * A frame the size of the test camera's, with a mark 20 mm to the right and 10 mm below the point
+     * the camera looks at, in the grayscale form the geometry stages want.
+     */
+    static class GeometrySourceStage extends CvStage {
+        @Override
+        public Result process(CvPipeline pipeline) {
+            Camera camera = (Camera) pipeline.getProperty("camera");
+            Mat mat = new Mat((int) camera.getHeight(), (int) camera.getWidth(), CvType.CV_8UC1);
+            mat.setTo(new org.opencv.core.Scalar(0));
+            double centerX = camera.getWidth()/2. + 20;
+            double centerY = camera.getHeight()/2. + 10;
+            for(int y = (int) centerY - 6; y < (int) centerY + 6; y++) {
+                for(int x = (int) centerX - 6; x < (int) centerX + 6; x++) {
+                    mat.put(y, x, 255);
+                }
+            }
+            return new Result(mat, FluentCv.ColorSpace.Gray);
+        }
+    }
+
+    /**
+     * Reads back how a millimetre location, e.g. the wanted location of the part, is turned into the
+     * pixels the stages work in.
+     */
+    static class ReadLocationStage extends CvStage {
+        @Override
+        public Result process(CvPipeline pipeline) throws Exception {
+            return new Result(null, getPossiblePipelinePropertyOverride(new org.opencv.core.Point(0, 0),
+                    pipeline, "wanted.center", org.opencv.core.Point.class, Location.class));
+        }
+    }
+
+    private CvStage.Result detectMark(double cropWidth, double cropHeight) throws Exception {
+        CvPipeline pipeline = new CvPipeline();
+        pipeline.setProperty("camera", new VisionUtilsTest.TestCamera());
+        pipeline.add(new GeometrySourceStage());
+        if(cropWidth > 0) {
+            CropCentered crop = new CropCentered();
+            crop.setWidth(cropWidth);
+            crop.setHeight(cropHeight);
+            crop.setMinimum(0);
+            pipeline.add(crop);
+        }
+        MinAreaRect minAreaRect = new MinAreaRect();
+        minAreaRect.setName("results");
+        minAreaRect.setThresholdMin(1);
+        minAreaRect.setThresholdMax(255);
+        pipeline.add(minAreaRect);
+        pipeline.process();
+        return pipeline.getResult("results");
+    }
+
+    @Test
+    public void testTheMillimetreOffsetsSurviveTheCrop() throws Exception {
+        // The machine reports where the part is relative to the center of the image the pipeline
+        // looked at, so a crop may not change the answer. This is the millimetre version of the check
+        // above, and it is the one that matters: the first machine trial of the crop found the part
+        // dead center and then steered 15 mm away from it, because the pixels of the crop were read
+        // against the center of the whole frame.
+        initializeConfiguration();
+        Camera camera = new VisionUtilsTest.TestCamera();
+        CvStage.Result full = detectMark(0, 0);
+        CvStage.Result cropped = detectMark(100, 100);
+        RotatedRect fullRect = (RotatedRect) full.model;
+        RotatedRect croppedRect = (RotatedRect) cropped.model;
+
+        Location fullOffsets = VisionUtils.getPixelCenterOffsets(camera,
+                full.image.cols(), full.image.rows(), fullRect.center.x, fullRect.center.y);
+        Location croppedOffsets = VisionUtils.getPixelCenterOffsets(camera,
+                cropped.image.cols(), cropped.image.rows(), croppedRect.center.x, croppedRect.center.y);
+
+        // Sanity: the mark is 20 mm right and 10 mm below where the camera looks.
+        assertEquals(20, Math.abs(fullOffsets.getX()), 0.5);
+        assertEquals(10, Math.abs(fullOffsets.getY()), 0.5);
+        assertEquals(fullOffsets.getX(), croppedOffsets.getX(), 0.01);
+        assertEquals(fullOffsets.getY(), croppedOffsets.getY(), 0.01);
+
+        // And this is what the bug was: the same pixels referred to the whole camera frame.
+        Location broken = VisionUtils.getPixelCenterOffsets(camera, croppedRect.center.x,
+                croppedRect.center.y);
+        assertTrue(Math.abs(broken.getX()) > 100);
+    }
+
+    @Test
+    public void testAWantedLocationFollowsTheCroppedImage() throws Exception {
+        // The other direction: a stage that is told where in millimetres to look, e.g. the wanted
+        // location of the part, has to be told in the pixels of the image the pipeline actually looks
+        // at, which a CropCentered has shrunk around the same center.
+        initializeConfiguration();
+        CvPipeline full = new CvPipeline();
+        full.setProperty("camera", new VisionUtilsTest.TestCamera());
+        full.setProperty("wanted.center", new Location(LengthUnit.Millimeters, 10, 0, 0, 0));
+        ReadLocationStage fullReader = new ReadLocationStage();
+        fullReader.setName("read");
+        full.add(fullReader);
+        full.process();
+        org.opencv.core.Point fullPoint = (org.opencv.core.Point) full.getResult("read").model;
+
+        CvPipeline cropped = new CvPipeline();
+        cropped.setProperty("camera", new VisionUtilsTest.TestCamera());
+        cropped.setProperty("wanted.center", new Location(LengthUnit.Millimeters, 10, 0, 0, 0));
+        cropped.add(new GeometrySourceStage());
+        CropCentered crop = new CropCentered();
+        crop.setWidth(100);
+        crop.setHeight(100);
+        crop.setMinimum(0);
+        cropped.add(crop);
+        ReadLocationStage croppedReader = new ReadLocationStage();
+        croppedReader.setName("read");
+        cropped.add(croppedReader);
+        cropped.process();
+        org.opencv.core.Point croppedPoint = (org.opencv.core.Point) cropped.getResult("read").model;
+
+        // Both are 10 mm right of the center of the image they end up in, so the cropped one has moved
+        // left by half a frame; had it stayed put, the stage would be looking at nothing.
+        assertEquals(330, fullPoint.x, 0.01);
+        assertEquals(60, croppedPoint.x, 0.01);
+        assertEquals(240, fullPoint.y, 0.01);
+        assertEquals(50, croppedPoint.y, 0.01);
     }
 }

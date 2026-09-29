@@ -66,14 +66,26 @@ public class CropCentered extends CvStage {
     }
 
     /**
-     * The crop is always centered, and that is not a limitation but the whole point: the millimetre to
-     * pixel conversion of MinAreaRect.center, DetectRectlinearSymmetry.center and the mask stages all
-     * assumes that the center of the image is the point the camera is looking at. A crop offset from the
-     * center would shift every offset the pipeline reports by half that offset, silently.
+     * The crop is always centered, and that is not a limitation but the whole point: everything that
+     * turns pixels into millimetres assumes that the center of the image is the point the camera is
+     * looking at, and a centered crop keeps that true of the crop as much as of the whole frame. A crop
+     * offset from the center would shift every offset the pipeline reports by half that offset,
+     * silently.
+     *
+     * The other half of that agreement is that the pixels of the crop must be read against the center of
+     * the crop, and not against the center of the frame the camera reports: a part found dead center in
+     * a 200 px crop of an 805 px frame is 0 mm away, but read against the frame it is 11 mm away, which
+     * is what the machine did on 2026-09-28 and why it steered away from a part it had just found. The
+     * image a detection was made in therefore travels with the detection, see
+     * VisionUtils#getPixelCenterOffsets(Camera, double, double, double, double) and the millimetre to
+     * pixel conversion in CvStage#getPossiblePipelinePropertyOverride, which uses the size of the working
+     * image for the same reason.
      *
      * The image before the crop is not lost: the stage that captured it still has its result, so an
      * ImageRecall of that stage brings the full frame back, which is how a pipeline falls back to
-     * analyzing everything when it has found nothing inside the crop.
+     * analyzing everything when it has found nothing inside the crop. Do that only at the end however,
+     * after the geometry stages have run, or those will again be looking at a frame they are not the
+     * center of.
      */
     @Override
     public Result process(CvPipeline pipeline) throws Exception {

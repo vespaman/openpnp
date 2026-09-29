@@ -310,6 +310,53 @@ crop is not lost: it is still the result of the capture stage, so `ImageRecall` 
 full frame back, either for `ImageWriteDebug` or for a second pass at full size when the crop found
 nothing.
 
+**The first machine run of the crop failed, and not because the crop was wrong** (`tests_2026-09-28/log_b.txt`,
+2026-09-28 23:20). The crop did exactly what it was measured to do: `process 20.1 ms` instead of the
+48-55 ms of `log_a.txt`, and `MinAreaRect` reported the part at `(97.5, 98.5)` inside the 200 px crop,
+which for a `Upp1` of 0.038595 x 0.034126 mm is `-0.077, +0.034 mm` - a good find of a part sitting
+essentially where the nozzle expected it. What the machine then steered to was `-11.775, +10.038 mm`, the
+center offset check failed at `15.06 > 1.0 mm`, the parallel attempt fell back to sequential, and the
+retries presented the part somewhere else than where the crop was looking, so the job ended with no result.
+
+Those two numbers are the bug in one line: the pixels of the crop were read against the center of the
+**frame**. `ReferenceBottomVision` converted the rect centre with
+`VisionUtils.getPixelCenterOffsets(camera, rect.center.x, rect.center.y)`, and the two-argument form takes
+the center from `camera.getWidth()/getHeight()`. The frame that camera produces after calibration is
+805x785, and indeed `(97.5 - 805/2) * 0.038595 = -11.771` and `(98.5 - 785/2) * 0.034126 = +10.034`, to
+three decimals of what was logged. Nothing about the detection was off by 11 mm; nothing about the crop was
+involved either - the same call was simply wrong for any image smaller than the frame, which is why a crop
+was the thing that finally walked into it.
+
+The rule the fix is built on: **a geometry belongs to the image it was computed in**, and that image is
+neither necessarily the camera frame nor recoverable from the camera. Three places now respect it:
+
+- `VisionUtils.getPixelCenterOffsets(camera, imageWidth, imageHeight, x, y)` and
+  `VisionUtils.getLocationPixels(camera, tool, imageWidth, imageHeight, location)` take the frame to
+  convert against as an argument; the old two-argument forms delegate to them with the camera size, so
+  every existing caller behaves exactly as before.
+- `ReferenceBottomVision.processPipelineAndGetResult()` returns the rect together with the size of the
+  image the results stage looked at (`PipelineGeometry`), and both the centre offsets and the corner
+  offsets of the maximum-offset check go through it. The composite of a multi-shot alignment is unchanged:
+  all shots share one frame.
+- `CvStage.getConvertedPipelineProperty()` converts a `Location` pipeline property - `MinAreaRect.center`,
+  `DetectRectlinearSymmetry.center` and the like, which the machine sets in millimetres - against the
+  current `CvPipeline.getWorkingImage()` instead of the nominal camera size, which is the same mistake
+  coming the other way: with a crop in the pipeline it would have told a stage to look 11 mm outside it.
+
+The benchmark of §3 could not have caught this, and that is worth saying plainly: it compared the detected
+rect between the full frame and the crop, inside the pipeline, where everything is self-consistent at any
+origin. The failure needed the millimetre conversion, i.e. the consumer, to appear. `CropCenteredTest` now
+runs that conversion for both cases and asserts the millimetres are the same, and asserts that the
+frame-referenced variant of the same pixels is more than 100 px away, so the shape of the old bug is pinned
+as well as the fix.
+
+Two things this also settled. The processed bottom vision frame is 805x785 and not the 1080x926 PNG the
+benchmark used, so the **absolute** stage times of §3 are high by about 1.35x in area terms; the ratios, and
+therefore the case for the crop, stand, and the machine's own 48-55 ms full frame against 20.1 ms cropped
+agrees with them. And `ImageRecall` of the capture stage remains available as the full frame fallback, but
+only *after* the geometry stages: recalling the frame in front of them puts them back in an image whose
+center they are not.
+
 One effect the first machine comparison will have to live with: the crop side length is rounded to a whole
 pixel, and a crop of odd side and a crop of even side put the image centre half a pixel apart, i.e. 19 µm
 on this camera. That is visible in the table of §3 (-2.5, +1.5 px against -2.0, +2.0 px) and it is well
@@ -358,9 +405,11 @@ with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons a
 
 ## 8. Recommended sequence
 
-1. **Enable `CropCentered` on the machine and measure it.** *Installed on the machine 2026-09-28, so what
-   is left is the run itself; see the second results entry of `MACHINE-TEST.md` for exactly what was
-   changed there and how to undo it.* The stage of option 1 is written and tested; what is left is the part
+1. **Enable `CropCentered` on the machine and measure it.** *Installed on the machine 2026-09-28 and run
+   once; it failed for the reason in §7 option 1 and the configuration was reverted to the backup. The
+   coordinate-frame fix is in this branch, so the trial is re-runnable: rebuild the jar, put the stage back,
+   run the same job. See the second results entry of `MACHINE-TEST.md` for what was changed there and how to
+   undo it.* The stage of option 1 is written and tested; what is left is the part
    that can only be done there. It is in `R0402` under the capture; run the same 8 part job, and compare
    the `[ALIGN-TIMING]` lines. Measured off the machine, 22.9 ms became 2.6 ms at the conservative 200 px
    floor and 0.7 ms at 105 px (§3), which is worth more than every scheduling trick in this document put
@@ -368,6 +417,8 @@ with `v4l2-ctl -d <up camera> -c exposure_time_absolute` before anyone reasons a
    risk before all of them do. Two things to look for specifically: that the offsets are the same as they
    were without the crop to within half a pixel, and that a part deliberately presented near the 1 mm
    offset limit is still found - the full frame fallback has to be exercised deliberately, not discovered.
+   The first run makes the first of those two the whole point of the second one: log the offsets, do not
+   just look at whether the job passed.
 
    **If the run is good, the crop is not a experiment to be left in one package, it is a default.** `R0402`
    is shared by 27 parts on this machine and the job only aligned one of them, so the run proves the

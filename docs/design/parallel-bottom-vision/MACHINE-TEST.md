@@ -316,6 +316,28 @@ What the run has to show, in order of importance:
 - Note the CPU governor: it is on `performance` now, it was on `powersave` for `log_a.txt`. Say so in the
   run notes, or the two runs are not comparable.
 
+The run happened the same evening, and the three bullets come out one good, one good, one broken
+(`tests_2026-09-28/log_b.txt`):
+
+- **The cost was as predicted.** `process 20.1 ms` against the 48-55 ms of `log_a.txt`, with the capture and
+  the recall unchanged, i.e. the analysis did most of what the off-machine measurement said it would.
+- **The part was found**, and found where it should be: `MinAreaRect` in the 200 px crop at
+  `(97.5, 98.5)`, which is `-0.077, +0.034 mm` off the center of that crop.
+- **The offsets moved by 15 mm.** The same find was reported to the job as `-11.775, +10.038 mm`, so
+  `center offset 15.06 > 1.0` rejected it, the parallel attempt fell back to sequential, and the retries
+  then presented the part somewhere the crop was not looking and the job ended with no result.
+
+The settings were therefore reverted with the command above and the machine is back on the 19 stage
+pipeline; `grep -c CropCentered ~/.openpnp2/vision-settings.xml` is 0 again. The jar was left as built,
+which is harmless while no pipeline names the stage.
+
+The cause was not the crop but the code that reads a crop, and §7 option 1 of
+`PRE-CHECK-ASSESSMENT.md` has the arithmetic: the pixels of the crop were converted to millimetres against
+the center of the whole camera frame. Fixed in this branch by carrying the analysed image size with the
+detected rect and by converting `Location` pipeline properties against the working image, with a
+`CropCenteredTest` that runs the real `VisionUtils` conversion both ways. Re-run the same job against the
+same `log_a.txt` offsets once the jar is rebuilt from this branch.
+
 If the run is good, this stops being an experiment in one package and becomes a default: the other bottom
 vision settings on the machine, the stock settings in `src/main/resources`, and the pipeline templates the
 setup wizard writes all want the stage, and it is worth proposing upstream on its own. The floor is the

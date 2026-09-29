@@ -593,7 +593,15 @@ public abstract class CvStage {
                     if (camera == null) {
                         throw new Exception("Unable to convert to pixels because pipeline property \"camera\" is not set");
                     }
-                    org.openpnp.model.Point p = VisionUtils.getLocationPixels(camera, (Location) pipelineProperty);
+                    // The location has to end up in the image this stage is looking at, which is not
+                    // necessarily the whole camera frame - a CropCentered stage narrows it to the part.
+                    // Both are centered on the point the camera looks at, so the center of the working
+                    // image is the origin to convert against.
+                    Mat workingImage = pipeline.getWorkingImage();
+                    double imageWidth = workingImage == null ? camera.getWidth() : workingImage.cols();
+                    double imageHeight = workingImage == null ? camera.getHeight() : workingImage.rows();
+                    org.openpnp.model.Point p = VisionUtils.getLocationPixels(camera, null,
+                            imageWidth, imageHeight, (Location) pipelineProperty);
                     if (parameter instanceof org.opencv.core.Point) {
                         return (T) new org.opencv.core.Point(p.x, p.y);
                     }

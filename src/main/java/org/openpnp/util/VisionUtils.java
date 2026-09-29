@@ -62,9 +62,26 @@ public class VisionUtils {
      * @return
      */
     public static Location getPixelCenterOffsets(Camera camera, double x, double y) {
-        double imageWidth = camera.getWidth();
-        double imageHeight = camera.getHeight();
+        return getPixelCenterOffsets(camera, camera.getWidth(), camera.getHeight(), x, y);
+    }
 
+    /**
+     * Same as {@link #getPixelCenterOffsets(Camera, double, double)} but for pixel coordinates that
+     * belong to a smaller image than the whole camera frame, e.g. the centred crop of a
+     * {@link org.openpnp.vision.pipeline.stages.CropCentered} stage. The center of such an image is
+     * still the point the camera is looking at, so it is the center of that image and not the center
+     * of the camera frame that has to be subtracted; using the wrong one reports a part found dead
+     * center as being half an image away.
+     * 
+     * @param camera
+     * @param imageWidth width of the image the coordinates were measured in
+     * @param imageHeight height of the image the coordinates were measured in
+     * @param x
+     * @param y
+     * @return
+     */
+    public static Location getPixelCenterOffsets(Camera camera, double imageWidth, double imageHeight,
+            double x, double y) {
         // Calculate the difference between the center of the image to the
         // center of the match.
         double offsetX = x - (imageWidth / 2);
@@ -241,8 +258,27 @@ public class VisionUtils {
      * @return
      */
     public static Point getLocationPixels(Camera camera, HeadMountable tool, Location location) {
+        return getLocationPixels(camera, tool, camera.getWidth(), camera.getHeight(), location);
+    }
+
+    /**
+     * Same as {@link #getLocationPixels(Camera, HeadMountable, Location)} but for a location that has
+     * to end up in a smaller image than the whole camera frame, i.e. in the centred crop a
+     * {@link org.openpnp.vision.pipeline.stages.CropCentered} stage analyses. As the crop is centred,
+     * its center is the point the camera looks at just as much as the center of the full frame is, so
+     * only the origin of the pixel coordinates changes.
+     * 
+     * @param camera
+     * @param tool
+     * @param imageWidth width of the image the point is meant for
+     * @param imageHeight height of the image the point is meant for
+     * @param location
+     * @return
+     */
+    public static Point getLocationPixels(Camera camera, HeadMountable tool, double imageWidth,
+            double imageHeight, Location location) {
         Point center = getLocationPixelCenterOffsets(camera, tool, location);
-        return new Point(center.getX()+camera.getWidth()/2, center.getY()+camera.getHeight()/2);
+        return new Point(center.getX()+imageWidth/2, center.getY()+imageHeight/2);
     }
 
     /**
