@@ -63,3 +63,10 @@ anything:
   cycles. Loose enough that CI variance cannot fail it, tight enough that a retained list of images per
   cycle cannot pass it. Mark it as such in the name or a comment, so nobody reads a green run as "no leaks
   in the camera driver", which it does not mean.
+
+## Considered and not wanted
+
+A max rotation for bottom vision, so that a part turned far enough on the nozzle stops the job instead
+of being corrected, was on the table after `log_d.txt` (a part measured at 45° and placed square). It is
+not wanted: correcting a turned part is what bottom vision is for, and a tolerance would only turn a
+working correction into a stop. Recorded so the next person does not write it.

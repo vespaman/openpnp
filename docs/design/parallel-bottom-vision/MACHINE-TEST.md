@@ -525,8 +525,9 @@ back to back and a grep for `Offsets accepted` pairs the wrong rect with the wro
   accepted `11.034°`, `13.143°` and `17.252°`. Nothing in the accept path looks at the rotation at all:
   `Offsets accepted` guards the centre offset, the `size ok` line guards width and length, and the
   rotation is handed to the placement as a correction so the part lands square on the pad. There is no
-  rotation tolerance to tick and no number of degrees that makes bottom vision complain. If a turned
-  part is supposed to be refused, that is a new setting, not a misbehaving measurement.
+  rotation tolerance to tick and no number of degrees that makes bottom vision complain. **Decided:** that
+  stays as it is - a turned part being corrected is the feature, not a fault, and no max rotation setting
+  is wanted.
 - **The run did fail once, but not because of the rotation.** At 13:53:07 N2 had nothing in front of
   Upp2: four captures in a row with `findCountours=0.0` and `contours=0.0`, then
   `ReferenceBottomVision (C0402-22p/50V): No result found`, machine idle, job error dialog at
