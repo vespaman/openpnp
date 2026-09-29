@@ -52,6 +52,11 @@ JAVA_HOME=/opt/android-studio/jbr ~/tools/apache-maven-3.9.6/bin/mvn -B -o \
 | `JobAbortTest` | aborting a job ends the camera batch and the light with it, discards the part that was picked, leaves the batch bookkeeping usable, and the same job started again places what is left | 5 (abort half), 6 (the aborted half, as far as a simulation can see it) |
 | `check_run.py` | the log greps and timings of sections 1, 2 and 3 for a pair of runs, in one command | 1, 2, 3 |
 
+Three more tests are worth writing and are not written; see `LATER-TESTS.md`: the crop over a size matrix
+(the vision setting on this machine is shared by 27 parts and only one of them was ever looked at), the
+outside-the-crop failure of `log_b.txt` as a regression test, and leak proxies over a few thousand cycles,
+which is what §4 should have been.
+
 What stays on the machine is what a simulated machine cannot see: that the offsets are the size they
 should be for these parts and this camera, that the lamps actually come on at the right moment, that
 the machine does not knock anything over, and anything involving a real part being lost.
@@ -199,12 +204,30 @@ machine work:
 
 1. Start the job, abort it in the middle of the alignment phase, then resume / restart it. It must
    align again properly - no placement skipped, no image of the previous run used.
+
+   Neither control lands inside a capture, and that is not a defect to chase. `Pause` is checked between
+   steps of the job processor, and if a motion is under way the loop keeps stepping until that motion is
+   complete (`JobPanel.jobRun()` and its `isSteppingToNextMotion()` test); `Abort` calls
+   `ReferencePnpJobProcessor.abort()`, which is `synchronized` on the job processor, so it waits for the
+   current step to return before it ends the camera batch and cleans up. The alignment phase is about
+   150 ms, so aiming at the shutter is not a thing a hand can do. What is reachable, and what is worth
+   reaching for: drop the feed rate to about 10 % so the moves are long, and abort while the head is on
+   its way to or from the vision position.
 2. Repeat three times, at different moments (during capture, during a move, while a part is being
    placed).
-3. Then: put a nozzle to a feeder it will not pick from, or lift the part off the nozzle by hand
-   after the pick, and start the job. The machine must stop on the missing part - this is the
-   part-still-on-nozzle check the parallel path had lost and `92c971eb18` put back. If it calmly
-   tries to place air, that is a failure of this branch and a pass of the old behaviour.
+3. Then: put a nozzle to a feeder it will not pick from and start the job. The machine must stop on the
+   missing part - this is the part-still-on-nozzle check the parallel path had lost and `92c971eb18` put
+   back. If it calmly tries to place air, that is a failure of this branch and a pass of the old behaviour.
+
+   Note what the machine is configured to do before concluding anything from this: on `pn52` on
+   2026-09-29 every nozzle tip has `part-on-check-after-pick` true except `502`, but
+   `part-on-check-align` and `part-on-check-before-place` are **false on all of them**, with
+   `method-part-on` `Absolute` and the sense actuators `AVACS1`/`AVACS2` wired to the nozzles. So a part
+   lost *after* the pick is not detected, on any tip, by configuration and not by this branch: lifting the
+   part off the nozzle will end with the machine placing air and nothing logged wrong. If the lost in
+   transit case is the one to verify, tick *Check Part On* at *Align* (or *Before Place*) on the tip the
+   test job's `C0402` uses, restart, and only then lift the part - and say in the run notes that the
+   setting was changed for the test.
 
 ## 6. Lights
 
