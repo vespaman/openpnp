@@ -15,20 +15,21 @@ import org.openpnp.vision.pipeline.CvPipeline;
  * library on the classpath.
  */
 public class StockLoop {
+    // The stages of a bottom vision pipeline, in the order they appear in one, without a camera in any of
+    // them. StockLoop 1 is the smallest thing CvPipeline can process; the whole list is what a real check
+    // costs. The attribute names are as the real pipelines write them: hyphenated, and every required
+    // attribute named, because simple-xml refuses a missing one.
     static final String[] STAGES = {
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.ImageRead\" name=\"0\""
-                + " enabled=\"true\" file=\"FRAME\" grayscale=\"false\"/>",
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.ConvertColor\" name=\"1\""
-                + " enabled=\"true\" conversion=\"Bgr2Gray\"/>",
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.BlurGaussian\" name=\"2\""
-                + " enabled=\"true\" kernelSize=\"9\"/>",
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.Threshold\" name=\"3\""
-                + " enabled=\"true\" threshold=\"128\" invert=\"false\"/>",
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.FindContours\" name=\"4\""
-                + " enabled=\"true\" retrieval=\"External\" approximation=\"Simple\"/>",
-        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.DrawContours\" name=\"5\""
-                + " enabled=\"true\" contours=\"4\" image=\"0\" mode=\"External\""
-                + " thickness=\"1\" lineType=\"8\" shift=\"0\" color=\"0,255,0,0\"/>",
+        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.ImageRead\" name=\"0\" enabled=\"true\""
+                + " file=\"FRAME\"/>",
+        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.ConvertColor\" name=\"1\" enabled=\"true\""
+                + " conversion=\"Bgr2Gray\"/>",
+        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.BlurGaussian\" name=\"2\" enabled=\"true\""
+                + " kernel-size=\"9\"/>",
+        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.Threshold\" name=\"3\" enabled=\"true\""
+                + " auto=\"false\" threshold=\"128\" invert=\"false\"/>",
+        "<cv-stage class=\"org.openpnp.vision.pipeline.stages.FindContours\" name=\"4\" enabled=\"true\""
+                + " retrieval-mode=\"External\" approximation-method=\"Simple\"/>",
     };
 
     public static void main(String[] argv) throws Exception {
@@ -44,11 +45,11 @@ public class StockLoop {
             Imgcodecs.imwrite(frame.getAbsolutePath(), mat);
             mat.release();
         }
-        StringBuilder xml = new StringBuilder("<cv-pipeline>");
+        StringBuilder xml = new StringBuilder("<cv-pipeline><stages>");
         for(int i = 0; i < count; i++) {
             xml.append(STAGES[i].replace("FRAME", frame.getAbsolutePath()));
         }
-        xml.append("</cv-pipeline>");
+        xml.append("</stages></cv-pipeline>");
         CvPipeline reused = new CvPipeline();
         reused.fromXmlString(xml.toString());
         double[] samples = new double[reps];
@@ -64,8 +65,17 @@ public class StockLoop {
                 pipeline = reused;
             }
             long t0 = System.nanoTime();
-            pipeline.resetReusedPipeline();
-            pipeline.process();
+            try {
+                pipeline.resetReusedPipeline();
+                pipeline.process();
+            }
+            catch(Exception e) {
+                // An exception is not a crash, and the two must never be counted as one: an earlier
+                // version of this harness counted the exit status and called a malformed pipeline a
+                // segfault.
+                System.out.println("FAILED on run " + i + ": " + e);
+                System.exit(2);
+            }
             samples[i] = (System.nanoTime() - t0) / 1e6;
             if(fresh) {
                 pipeline.close();

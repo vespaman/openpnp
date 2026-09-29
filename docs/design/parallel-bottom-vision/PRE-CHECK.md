@@ -227,130 +227,82 @@ be presented by hand for the camera to see anything. A run there showing a comfo
 therefore *not* a claim that it fits the window; that claim needs one real run, and it is why §3 refuses
 to judge the offset until then.
 
-### Repeating the pipeline corrupts the native heap: upstream code, any JVM, and the machine runs it
+### The native heap is corrupted, and only Temurin 21 notices: confirmed on the machine
 
-`PreCheckBench` found something that was not what it was looking for and that matters more than the
-pre-check: running the same pipeline many times corrupts the native heap, and the crash lands in the
-allocator rather than anywhere the Java code can be blamed for it.
+`PreCheckBench` on the OpenPnP PC, `check` phase, `p_200.xml`, 200 reps, one thread at a time, run five times
+on each of the three JDKs that PC has:
 
-    free(): chunks in smallbin corrupted
-    malloc(): unaligned tcache chunk detected
-    # A fatal error ... Problematic frame: # V [libjvm.so+0x7a453c]
-
-The base rate on this PC. A batch is *n* runs of the pipeline of `R0402`; "concurrent" is two pipelines on
-two threads, which is what the parallel alignment does today and what a pre-check would do twice as often:
-
-| path | Temurin 21.0.12.1 | OpenJDK 11.0.32.1 | OpenJDK 25.0.3 |
+| the OpenPnP PC, `PreCheckBench check`, 200 reps, 5 attempts | 21.0.12.1 | 11.0.32.1 | 25.0.3 |
 |---|---|---|---|
-| handed a pre-captured shot, one at a time, 600 runs | **died, 4 of 4** | not run | survived, 4 of 4 |
-| the same, then 600 pairs two at a time | died, 4 of 4 | not run | survived, 4 of 4 |
-| capture from disk (no `CapturedShot` at all), 600 runs | **died, 4 of 4** | survived, 4 of 4 | not run |
-| the same, then 600 pairs two at a time | died, 4 of 4 | survived, 4 of 4 | not run |
-| batches of 40 pairs | died, 10 of 10 | survived, 10 of 10 | survived, 10 of 10 |
-| batches of 150 pairs | - | **died, 1 of 6** | survived, 6 of 6 |
+| result | **aborted, 5 of 5** | survived, 5 of 5 | survived, 5 of 5 |
+| median pre-check | never printed, it dies first | 2.21 ms | 2.20 ms |
 
-Five things follow from that table, and the first guess it kills is the comfortable one: it is not the
-fork's doing.
+The abort is in the allocator and not in Java, and it is not the same message twice:
 
-- **Concurrency is not required for it.** Temurin 21 dies in the loop that runs one pipeline at a time, on
-  the same thread, with nothing else in the process.
-- **The fork's pre-captured shot is not required either.** The disk path, which never touches
-  `CapturedShot`, dies the same way on the same JVM. Neither is it the crop: with `CropCentered` disabled it
-  still dies.
-- **Upstream OpenPnP dies on it too.** `bench/StockLoop.java` is one file with no fork code in it: it builds
-  a pipeline of camera-free stages, calls `resetReusedPipeline()` and `process()` in a loop, and says whether
-  it got to the end. Compiled once against `upstream/main` (`5bd404cfc7`) and once against this branch, with
-  the same source, the same frame and the same JVM, both die. With **one stage**, a plain `ImageRead`, 300
-  runs kill 3 of 3 attempts on Temurin 21.
-- **OpenCV by itself does not die.** `bench/RawLoop.java` performs the same work - decode, colour convert,
-  blur, threshold, find contours, draw contours, release - called directly, no `CvPipeline`, no XStream, no
-  stages: clean 4 of 4 on Temurin 21 and 4 of 4 on OpenJDK 25 here. On OpenJDK 17 it died 4 of 4, so the
-  JNI boundary is somewhere in the story, but the pipeline machinery decides whether you meet it.
-- **The product's own tests reproduce it, and no single test does.** Six vision test classes in one Surefire
-  fork abort 4 of 4 runs on Temurin 21 *and* 4 of 4 on OpenJDK 25, always with the same glibc line in the
-  dumpstream; run one class at a time, all twelve combinations pass. It is cumulative, which is why a machine
-  that runs eight pipelines per job can live with it and a test suite that runs them by the hundred cannot.
+    free(): chunks in smallbin corrupted        corrupted double-linked list
+    malloc(): invalid next size (unsorted)      corrupted size vs. prev_size while consolidating
+    free(): corrupted unsorted chunks
 
-| here (workstation) | Temurin 21.0.12.1 | OpenJDK 25.0.3 | OpenJDK 17 |
-|---|---|---|---|
-| `StockLoop`, upstream classes, 6 stages, 600 runs | died, 4 of 4 | died, 4 of 4 | died, 4 of 4 |
-| `StockLoop`, upstream classes, 1 stage (`ImageRead`), 300 runs | died, 3 of 3 | - | - |
-| `StockLoop`, fork classes, 6 stages, 600 runs | died, 4 of 4 | - | - |
-| `RawLoop`, no OpenPnP at all, 600 runs | survived, 4 of 4 | survived, 4 of 4 | **died, 4 of 4** |
-| six vision test classes, one Surefire fork | died, 4 of 4 | died, 4 of 4 | - |
-| any one of those classes alone | survived, 2 of 2 | - | - |
+Here on think3 the same thing happens to the product's own tests: the six vision test classes in one Surefire
+fork abort 2 runs out of 2 with that first glibc line in the dumpstream, while each class on its own passes
+(6 of 6) and either half of three passes (3 of 3). It is cumulative work in one process, not one test.
 
-Two more mechanisms went the way of the first guesses. `bench/ImgLoop.java` is the decode plus the clone
-that `process()` makes, with the release done five different ways - the decode alone, both, either one left
-to the finalizer, neither - and all five modes survive 600 runs on 21 and on 25, on both boxes; `imread`,
-`clone` and `release` are clean in every combination until `CvPipeline` puts them inside a stage. And
-`StockLoop 300 1 fresh`, which builds a pipeline per run so that `process()` has nothing of a previous run
-left to release, dies as often as the reused one, which clears the bookkeeping across runs and leaves the
-stage machinery - `processPrepare()`, `process()`, the `Result` plumbing - as the only thing that is in the
-dying program and not in the surviving one.
+**It is Temurin 21, and the machine runs Temurin 21.** `eselect java-vm list` on the OpenPnP PC selects
+`openjdk-bin-21` as both system and user vm, `openpnp.sh` starts a bare `java`, and the jar it starts is
+`/home/micke/openpnp/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`. No `hs_err_pid*.log` exists in the home directory,
+in `/tmp` or beside the jar, so nothing says yet that it has happened during real work.
 
-What has been excluded as the mechanism, each by an experiment that failed to stop the death: the JIT
-(`-Xint`); JEP 374 critical arrays (`-XX:-CriticalJNINatives`); memory pressure and `Mat` finalizer timing
-(`-Xmx10g -XX:+DisableExplicitGC`); and a double `release()` of the same `Mat` wrapper, which is the first
-thing an inspection of `CvPipeline` suggests - `process()` calls `release()` at its top
-(`CvPipeline.java:262` upstream) and thereby releases result `Mat`s whose wrappers the finalizer will
-release again - but `bench/DoubleRelease.java` does exactly that, 300 times, churning up to 512 other `Mat`s
-between the two releases, on two JVMs, and nothing happens.
+So: **changing the JVM on the machine is a measured mitigation, not a cure.** `openpnp.sh` passes only
+`--add-opens` flags, all of which 25 still accepts, and 25 would want `--enable-native-access=ALL-UNNAMED` for
+the `System.load` of the OpenCV native (a warning today, blocked in some future release). Two things to know
+before switching a machine that works: the fork's tests cannot run on 25 at all, because the Surefire `argLine`
+in `pom.xml` passes `-XX:GCLockerRetryAllocationCount`, which 25 no longer recognises, so the build stays on
+21 while the runtime moves; and one real job has to be run on the new JVM before it is trusted, because the
+camera and vision timing there has never been measured.
 
-The JVM and the machine change the odds and not the verdict, and on the machine's own box the odds are no
-better than here. The two loops were run there as well, on each of the three JDKs it has installed, three
-attempts each:
+Retracted, twice over, in fairness to the record:
 
-| the OpenPnP PC, which boots Temurin 21 | Temurin 21.0.12.1 | OpenJDK 11.0.32.1 | OpenJDK 25.0.3 |
-|---|---|---|---|
-| `StockLoop`, one `ImageRead` stage, 300 runs | died, 3 of 3 | died, 3 of 3 | died, 3 of 3 |
-| `StockLoop`, six stages, 300 runs | died, 3 of 3 | died, 3 of 3 | died, 3 of 3 |
-| `ImgLoop`, the same work by hand, 600 runs | survived, 3 of 3 | survived, 3 of 3 | survived, 3 of 3 |
+- **`StockLoop`, "upstream dies too".** `StockLoop` was the intended minimal repro and it "died" on every JVM
+  on both boxes. It was never running a pipeline: the XML was wrong (`<cv-stage>` must sit inside a `<stages>`
+  element, the attributes are hyphenated, `Threshold` requires `auto`), simple-xml threw, the JVM exited 1 and
+  the harness counted exit statuses, so a `ValueRequiredException` was logged as a segfault. With the XML fixed
+  and the harness distinguishing an exception (exit 2, message printed) from a signal, the same loop is the
+  cleanest thing here: 600 runs of one `ImageRead` stage and 300 of five stages survived 3 of 3 attempts on
+  Temurin 21, on 25, on think3 and on the OpenPnP PC. Repeating a `CvPipeline` is not the problem.
+- **"OpenJDK 25 crashes the tests too."** The 25 fork never started: `Unrecognized VM option
+  'GCLockerRetryAllocationCount=100'`, exit 1, which was read as a crash. The first valgrind log is void for
+  the same kind of reason (wrong class name, nothing ran).
 
-OpenPnP compiles to Java 11 bytecode, so 25 does run it and the pipeline path has been exercised on 25
-here, but it is not the JVM the machine is validated on, the dependency set is 2011-2020 vintage (batik 1.7,
-simple-xml 2.9, bridj, jython) and 25 additionally warns about the `System.load` of the OpenCV native, which
-wants `--enable-native-access=ALL-UNNAMED` in `openpnp.sh`. None of that is worth trading while the crash
-follows every JVM.
+What the tools say now. Valgrind 3.27.1, twice on the machine against the `PreCheckBench` repro, once with the
+JIT and once with `-Xint`: 1801-2319 errors, every one of them the JVM's own startup writes below its stack
+pointer inside `libjvm`, none in `libopencv_java455.so`, and **the run under valgrind does not abort**. So
+memcheck, which replaces the allocator, cannot see it, while the glibc allocator aborts on the same work. That
+points away from a wild write in OpenCV and towards something in the 21 runtime's use of the allocator, and it
+is why ASAN - which would need OpenCV rebuilt from source, since the jar ships a 2022 prebuilt native - is not
+yet worth the day it costs.
 
-**Changing the JVM on the machine buys nothing.** The earlier survivals of 11 and 25 there were the `R0402`
-pipeline, which is a different workload and a different number of runs; that is luck, not immunity, and this
-table is the one to plan on. Everything else in this section reads the same for all three.
+Context that may or may not matter: both boxes moved to glibc 2.43 recently (think3 2.43-r2, the OpenPnP PC
+2.43-r4, whose system update was shortly before this was first seen), while `libopencv_java455.so` in the
+`org.openpnp:opencv:4.5.5-1` jar was built against glibc 2.27 and bundles its own libjpeg and libpng. The JVM
+correlation is much stronger than this one, since 11 and 25 are clean on the same glibc, but an older-glibc run
+is still worth doing now that a real repro exists (docker on think3, `eclipse-temurin:11-jdk-jammy`, glibc
+2.35, against `PreCheckBench`).
 
-**The machine is exposed to it.** `eselect java-vm list` on the OpenPnP PC selects `openjdk-bin-21` as both
-system and user vm, `openpnp.sh` starts a bare `java`, and the jar it starts is
-`/home/micke/openpnp/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`. At the bench's rate an 8 part job is about one
-draw per 75 jobs' worth of exposure, which is rare enough to have been put down to something else and not
-rare enough to ignore; no `hs_err_pid*.log` exists in the home directory, in `/tmp` or beside the jar, so
-there is no evidence either way yet.
-
-To reproduce it in a minute, which is enough to file it upstream:
-
-    git worktree add /tmp/upstream upstream/main
-    cd /tmp/upstream && mvn -o -q -DskipTests package
-    mvn -o -q dependency:build-classpath -Dmdep.outputFile=/tmp/cp.txt
-    javac -cp "target/classes:$(cat /tmp/cp.txt)" -d out /path/to/bench/StockLoop.java
-    java  -cp "out:target/classes:$(cat /tmp/cp.txt)" StockLoop 300 1     # one ImageRead stage, dies
-    javac -cp "$(cat /tmp/cp.txt)" -d out /path/to/bench/ImgLoop.java     # no OpenPnP at all
-    java  -cp "out:$(cat /tmp/cp.txt)" ImgLoop 600 0                      # survives, same box, same java
-
-What would settle it properly is a sanitizer - `valgrind`, or an ASAN build of the OpenCV natives, running
-that loop - which is its own piece of work, and beyond anything the pre-check needs.
-
-Until it is settled the design consequence is narrow but real: a pre-check doubles the number of pipeline
-runs per cycle, so whatever this is, the check makes it twice as likely. That is why §8 puts it before the
-check.
+The controls that were clean before and are clean now, so none of them is the mechanism: `ImgLoop`, `imread`
+plus `clone` with the release done five different ways, 600 runs on 21 and 25 on both boxes; `RawLoop`, the
+whole contour chain called directly without `CvPipeline`; `DoubleRelease`, releasing the same `Mat` wrapper
+twice with up to 512 other `Mat`s churned in between; and `-Xint`, `-XX:-CriticalJNINatives`,
+`-Xmx10g -XX:+DisableExplicitGC` and `MALLOC_CHECK_=0`, none of which stopped the abort on 21.
 
 ## 8. Order of work
 
 1. ~~Bench the pre-check's cost~~ done, §7. The verdict is not the one the April attempt expected and not
    the one §2 hoped for either: cheap enough not to disturb the settling, too slow to be counted on inside
    it. The design consequence is in §4: never block on the check.
-2. The repeated-pipeline crash of §7, because the pre-check doubles the runs it is made of. Done as far as
-   the questions "is it ours?" and "can we dodge it?" go - it is not ours, and no JVM dodges it, so the
-   machine's JVM stays where it is. `bench/StockLoop.java` reproduces it against `upstream/main` with a
-   pipeline of one stage and `bench/ImgLoop.java` survives the same work without OpenPnP; both belong in the
-   upstream report. What is left is the part that needs a sanitizer.
+2. The heap corruption of §7, because the pre-check doubles the vision work it is made of. It is real and it
+   is Temurin 21: `PreCheckBench` on the OpenPnP PC aborts 5 of 5 there and 0 of 5 on 11 and on 25. Decision
+   to take and to validate with one real job: move the machine's runtime JVM off 21. The hunt for the cause
+   continues beside that - older glibc, a Temurin 21.0.12 report, ASAN-built OpenCV if both fail.
 3. The callback and the check, `report` mode only, the three numbers in the log. Verified on the simulated
    machine with the real cameras.
 4. One real run of the 8 part job reading the first-frame displacement, which is the number §3 needs
