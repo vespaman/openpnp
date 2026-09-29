@@ -322,9 +322,9 @@ The run happened the same evening, and the three bullets come out one good, one 
 - **The cost was as predicted.** `process 20.1 ms` against the 48-55 ms of `log_a.txt`, with the capture and
   the recall unchanged, i.e. the analysis did most of what the off-machine measurement said it would.
 - **The part was found**, and found where it should be: `MinAreaRect` in the 200 px crop at
-  `(97.5, 98.5)`, which is `-0.077, +0.034 mm` off the center of that crop.
-- **The offsets moved by 15 mm.** The same find was reported to the job as `-11.775, +10.038 mm`, so
-  `center offset 15.06 > 1.0` rejected it, the parallel attempt fell back to sequential, and the retries
+  `(97.5, 101.5)`, which is `-0.096, -0.051 mm` off the center of that crop.
+- **The offsets moved by 15 mm.** The same find was reported to the job as `-11.640, +9.544 mm`, so
+  `center offset 15.05 > 1.0` rejected it, the parallel attempt fell back to sequential, and the retries
   then presented the part somewhere the crop was not looking and the job ended with no result.
 
 The settings were therefore reverted with the command above and the machine is back on the 19 stage
@@ -348,8 +348,56 @@ micron after the fix, and reading the crop against the frame is off by the 15 mm
            0.03859462904927454 0.03412551850076619 0.1 2.83
     done
 
-Re-run the machine job against the same `log_a.txt` offsets once the jar is rebuilt from this branch, and
-look at the offsets in the log rather than only at whether the job passes.
+### 2026-09-29, the crop again, with the fix (`tests_2026-09-28/log_c.txt`)
+
+The jar was rebuilt from this branch at 08:59, which is the jar the machine runs, and the `crop` stage was
+put back into `R0402` the same way as before - OpenPnP closed first, `vision-settings.xml` backed up to
+`~/.openpnp2/vision-settings.xml.bak-before-cropcentered-run2` so that this run is reversible too. The
+offline millimetre check of the previous entry was run first, and passed.
+
+The job then ran clean, and this time all three questions came out the right way:
+
+- **The part was found, every time.** `Offsets accepted` 8 of 8, no `Parallel alignment failed`, no retry,
+  no no-result. The only WARN-shaped lines in the file are the two known benign ones: the push-pull feeder
+  reporting a 0.206 mm vision offset against a previous 0, and `GcodeDriver$ReaderThread` "Read error while
+  disconnecting (expected)".
+- **The crop is in the path, and it is centred.** The rects come back at `(100.5, 92.0)`, `(100.5, 96.5)`,
+  `(95.6, 102.1)` and `(104.5, 94.5)` - within 5 px of the middle of the 200 px crop - on a part measured at
+  37x18 and 37x19, i.e. the 37x19 and 36x19 of `log_a.txt`. That is the half pixel test of the bullet above,
+  passed by a margin of ten, and it is also the proof of the frame size: a crop centred on the analysed image
+  puts the part in its middle, and the same part is found at `{537, 465}` in the uncropped run, so the
+  analysed frame is about 1080x926.
+- **The offsets are the size they were.** The eight accepted offsets of `log_c.txt` top out at 0.26 mm
+  linear and 4.3° rotation; those of `log_a.txt` top out at 0.25 mm and 4.5°. They cannot be compared
+  placement by placement, because they are measured against the pick and the pick scatter of this feeder is
+  of the same order as the difference, but 15 mm is not on offer any more and neither is anything else of
+  that class.
+- **The cost.** `process` per shot is 8.1-13.2 ms against the 48-55 ms of `log_a.txt`; the first two shots of
+  the first alignment, 19.0 and 22.7 ms, still carry the pipeline warm-up. Over the eight shots of the job
+  that is about 200 ms become about 110 ms.
+
+What that buys is smaller than it sounds, and it is worth writing down before someone quotes the 4x at the
+job: an alignment step runs from `Moving head to alignment position` to the last `Vision.PartAlignment.After`
+at 311-357 ms here against 314-373 ms in `log_a.txt`, because the step is mostly the ~260 ms move to the
+alignment position and a 36-55 ms capture window, and the pipeline is only the tail of it. That tail, measured
+from `Camera batch operation ended` to the last `After`, is where the crop lands: 49-57 ms in `log_a.txt`,
+19-35 ms here. The steady state is correspondingly a shade quicker - alignment to alignment 1.96/1.90/1.83 s
+against 1.97/1.92/1.87 s, and first alignment to job end 7.04 s against 7.15 s.
+
+The headline of the run is the other way round and it is not vision: the job is reported as 11.6 s against
+11.0 s. `log_c.txt` opens with a push-pull feeder calibration that `log_a.txt` did not pay -
+`09:22:38.850 calibrating sprocket holes pass 0` to `09:22:39.802 new vision offset (0.204, 0.028) vs.
+previous (0.000...)`, about a second of feeder vision, and the tail of the job and every steady state cycle
+of it are as fast or faster than the baseline. The feed count says why: 947 in `log_a.txt`, 957 in this one,
+i.e. the feeder had been calibrated in between and had to do it again. Job totals on this machine move by
+half a second on their own; only the per shot numbers of `[ALIGN-TIMING]` should be quoted between runs.
+Governor: `performance` for this run, `powersave` for `log_a.txt`, so the two are *not* comparable on
+absolute milliseconds - which is another reason to read the per stage lines and not the wall clock.
+
+State at the time of writing: the stage is still installed in `R0402`, the jar is the one built from this
+branch, and the run C checks of the previous entries are still outstanding. Undo is
+
+    cp ~/.openpnp2/vision-settings.xml.bak-before-cropcentered-run2 ~/.openpnp2/vision-settings.xml
 
 If the run is good, this stops being an experiment in one package and becomes a default: the other bottom
 vision settings on the machine, the stock settings in `src/main/resources`, and the pipeline templates the

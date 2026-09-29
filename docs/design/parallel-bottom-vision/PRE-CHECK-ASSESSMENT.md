@@ -311,21 +311,26 @@ full frame back, either for `ImageWriteDebug` or for a second pass at full size 
 nothing.
 
 **The first machine run of the crop failed, and not because the crop was wrong** (`tests_2026-09-28/log_b.txt`,
-2026-09-28 23:20). The crop did exactly what it was measured to do: `process 20.1 ms` instead of the
-48-55 ms of `log_a.txt`, and `MinAreaRect` reported the part at `(97.5, 98.5)` inside the 200 px crop,
-which for a `Upp1` of 0.038595 x 0.034126 mm is `-0.077, +0.034 mm` - a good find of a part sitting
-essentially where the nozzle expected it. What the machine then steered to was `-11.775, +10.038 mm`, the
-center offset check failed at `15.06 > 1.0 mm`, the parallel attempt fell back to sequential, and the
-retries presented the part somewhere else than where the crop was looking, so the job ended with no result.
+2026-09-28 23:14). The crop did exactly what it was measured to do: `process 20.1 ms` instead of the
+48-55 ms of `log_a.txt`, and `MinAreaRect` reported the part at `(97.5, 101.5)` inside the 200 px crop,
+which for a `Upp1` of 0.038595 x 0.034126 mm is `-0.096, -0.051 mm` - a good find of a part sitting
+essentially where the nozzle expected it, and the same find that the benchmark below makes of the same part.
+What the machine then steered to was `-11.640, +9.544 mm`, the center offset check failed at
+`15.05 > 1.0 mm`, the parallel attempt fell back to sequential, and the retries presented the part
+somewhere else than where the crop was looking, so the job ended with no result.
 
 Those two numbers are the bug in one line: the pixels of the crop were read against the center of the
 **frame**. `ReferenceBottomVision` converted the rect centre with
 `VisionUtils.getPixelCenterOffsets(camera, rect.center.x, rect.center.y)`, and the two-argument form takes
-the center from `camera.getWidth()/getHeight()`. The frame that camera produces after calibration is
-805x785, and indeed `(97.5 - 805/2) * 0.038595 = -11.771` and `(98.5 - 785/2) * 0.034126 = +10.034`, to
-three decimals of what was logged. Nothing about the detection was off by 11 mm; nothing about the crop was
-involved either - the same call was simply wrong for any image smaller than the frame, which is why a crop
-was the thing that finally walked into it.
+the center from `camera.getWidth()/getHeight()` - which is not the image the pipeline looked at. In
+`ReferenceCamera` those two are a cached result of the last *transformed capture* (`ReferenceCamera.java:297`
+and `:312`, and a plain 640x480 when the camera happens to be closed, `:319`), whatever transform and
+whatever image last passed through the camera. The offsets that were logged imply a frame of about 798x762,
+while the image the pipeline analysed is about 1080x926; the crop is what proves it, because the part is found
+at the middle of a crop that is itself centred on the analysed image, and in `log_a.txt` the same part of the
+same nozzles is found at about `{537, 465}`. Nothing about the detection was off by 11 mm, and nothing about the
+crop was involved either: the call was wrong for any image that is not the one the camera last happened to
+hand out, which is why a crop was the thing that finally walked into it.
 
 The rule the fix is built on: **a geometry belongs to the image it was computed in**, and that image is
 neither necessarily the camera frame nor recoverable from the camera. Three places now respect it:
@@ -359,16 +364,28 @@ the check is made on the real one and not only on a synthetic mark:
 | offsets, camera frame | -0.096, -0.051 mm | -17.078, +12.336 mm |
 
 The bolded cell is the whole point: after the fix the crop reports the same millimetres the full frame
-does, on the same frame of the same part, and the last row is what the machine did on the first trial. The
-magnitudes differ from the log because this frame is 1080x926 and the machine's is 805x785; the sign
-pattern and the order of magnitude are the same failure.
+does, on the same frame of the same part, and the last row is the class of failure the machine produced on
+the first trial - the numbers are not the same because the size the camera reported on the machine that
+evening was not 1080x926 either, which is exactly the point of the fix: the pipeline must not care.
 
-Two things this also settled. The processed bottom vision frame is 805x785 and not the 1080x926 PNG the
-benchmark used, so the **absolute** stage times of §3 are high by about 1.35x in area terms; the ratios, and
-therefore the case for the crop, stand, and the machine's own 48-55 ms full frame against 20.1 ms cropped
-agrees with them. And `ImageRecall` of the capture stage remains available as the full frame fallback, but
-only *after* the geometry stages: recalling the frame in front of them puts them back in an image whose
-center they are not.
+Two things this also settled. The analysed bottom vision frame is about 1080x926, the same size as the PNG
+the benchmark uses - the part sits at its middle in `log_a.txt` and the advanced calibration of both up
+cameras stores image points out to x ≈ 1002 - so the **absolute** stage times of §3 are representative of the
+machine and not an artefact of an over-sized test frame; the machine's own 48-55 ms full frame against the
+8-13 ms cropped of `log_c.txt` agrees with them. And `ImageRecall` of the capture stage remains available as
+the full frame fallback, but only *after* the geometry stages: recalling the frame in front of them puts them
+back in an image whose center they are not.
+
+**Confirmed on the machine** (`tests_2026-09-28/log_c.txt`, 2026-09-29 09:22, jar rebuilt from this branch,
+the same 8 placement job): 8 of 8 `Offsets accepted`, no fallback, no retry, job finished. The crop is
+provably in the path and provably centred - the rects come back at `(100.5, 92.0)`, `(100.5, 96.5)`,
+`(95.6, 102.1)` and `(104.5, 94.5)`, all within 5 px of the middle of the 200 px crop, on a part measured at
+37x18/37x19 against the 37x19/36x19 of the uncropped run - and the millimetres are the size they were: the
+largest of the eight accepted offsets is 0.26 mm against 0.25 mm in `log_a.txt`. `process` per shot fell from
+48-55 ms to 8.1-13.2 ms, the first two shots of the first alignment (19.0 and 22.7 ms) still carrying the
+pipeline warm-up, so the analysis of the job went from about 200 ms to about 110 ms. What that does and does
+not buy at job level, including why the reported job time went the other way, is in the run record in
+`MACHINE-TEST.md`.
 
 One effect the first machine comparison will have to live with: the crop side length is rounded to a whole
 pixel, and a crop of odd side and a crop of even side put the image centre half a pixel apart, i.e. 19 µm
