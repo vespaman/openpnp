@@ -247,12 +247,21 @@ Here on think3 the same thing happens to the product's own tests: the six vision
 fork abort 2 runs out of 2 with that first glibc line in the dumpstream, while each class on its own passes
 (6 of 6) and either half of three passes (3 of 3). It is cumulative work in one process, not one test.
 
-**It is Temurin 21, and the machine runs Temurin 21.** `eselect java-vm list` on the OpenPnP PC selects
-`openjdk-bin-21` as both system and user vm, `openpnp.sh` starts a bare `java`, and the jar it starts is
-`/home/micke/openpnp/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`. No `hs_err_pid*.log` exists in the home directory,
-in `/tmp` or beside the jar, so nothing says yet that it has happened during real work.
+**It is Temurin 21; no other JVM tested aborts it reliably.** Which JVM the machine itself uses turned out to
+be a different question, and the answer is not the one first written here. The OpenPnP PC is started from
+`/home/micke/openpnp/OpenPnP`, an Install4j launcher, and Install4j never asks `eselect`: it walks
+`common_jvm_locations` (which includes `/usr/lib/jvm/*`) and takes the first entry inside a hard-coded window -
+`ver_major >= 11` and `ver_major <= 23`. Traced with `sh -x`, that resolves to `openjdk-bin-11`, and the jar is
+the 2025-03-07 `/home/micke/openpnp/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`. So the machine has been running
+OpenJDK 11 - which survived 5 of 5 here at 200 reps and died 1 of 6 in the 150-pair batches - not Temurin 21.
+`eselect` only decides what a bare `java` gets: every bench run in this document, and the fork's `openpnp.sh`.
+No `hs_err_pid*.log` exists in the home directory, in `/tmp` or beside the jar, so nothing says the corruption
+has happened during real work on any JVM.
 
-So: **changing the JVM on the machine is a measured mitigation, not a cure.** `openpnp.sh` passes only
+So: **changing the JVM is a measured mitigation, not a cure.** The obstacle to doing it is not the flags -
+both the Install4j launcher and `openpnp.sh` pass the same three `--add-opens`, all of which 25 accepts - it is
+the launcher's `ver_major <= 23` ceiling, which silently declines 25 and falls back to 11;
+`INSTALL4J_JAVA_HOME_OVERRIDE` is ignored until the ceiling moves. `openpnp.sh` passes only
 `--add-opens` flags, all of which 25 still accepts, and 25 would want `--enable-native-access=ALL-UNNAMED` for
 the `System.load` of the OpenCV native (a warning today, blocked in some future release). Two things to know
 before switching a machine that works: the fork's tests cannot run on 25 at all, because the Surefire `argLine`
@@ -296,9 +305,13 @@ twice with up to 512 other `Mat`s churned in between; and `-Xint`, `-XX:-Critica
 
 ### The machine is on Temurin 25 now, and what that costs
 
-`eselect java-vm list` on the OpenPnP PC selects `openjdk-bin-25` (Temurin 25.0.3) as both system and user vm,
-switched 2026-09-29. Confirmed on the machine, the workload that killed Temurin 21 five times out of five
-inside 200 reps:
+Switched 2026-09-29, in the only place that reaches the machine: the Install4j launcher now sets
+`INSTALL4J_JAVA_HOME_OVERRIDE=/opt/openjdk-bin-25` and its ceiling reads 26, so `sh -x` ends in
+`exec /opt/openjdk-bin-25/bin/java ... install4j.org.openpnp.Main` (before the ceiling moved it still exec'd
+`openjdk-bin-11`), and `OpenPnP.vmoptions` gained `--enable-native-access=ALL-UNNAMED`. Both files have
+`.bak-2026-09-29` copies beside them and `SMOKE-JVM25.md` says what to watch when it is next started.
+`eselect` is set to 25 as well, which matters for benches and `openpnp.sh` but not for the launcher. Confirmed
+on the machine, the workload that killed Temurin 21 five times out of five inside 200 reps:
 
 | Temurin 25.0.3 on the OpenPnP PC, `PreCheckBench check` | result |
 |---|---|
