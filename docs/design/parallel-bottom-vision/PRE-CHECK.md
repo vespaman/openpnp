@@ -447,3 +447,35 @@ think3 keeps 21: everything that runs here is a build or a test, and 21 is what 
 - If the verdict is late more often than not - which §2 says is likely - is a check that only sometimes
   knows early worth a new stage in the settling loop at all, or should the same verdict simply come from
   the alignment of the settled frame, which knows everything except the time it takes?
+
+### The fix: CvPipeline must not release Mats from a finalizer
+
+`finalize()` is gone from `CvPipeline` (CvPipeline.java:383). `release()` and `close()` are unchanged, and every
+vision operation already closes its pipeline - commit 16ab399fcc, which added the finalizer, describes it as "a
+final bid to release Mats", i.e. a belt added on top of try-with-resources. The belt is what kills us: Mats own
+themselves (`Mat.finalize()` deletes the native object) and `Mat.release()` never clears the pointer it was
+handed, so whichever of the two finalizers loses the race calls into memory that the other one has already
+given back to the allocator.
+
+Measured, always on the real `p_run2.xml` pipeline:
+
+| workload | with the finalizer | without it |
+|---|---|---|
+| `fresh`, pipeline built and run, 60 reps, Temurin 21 | aborted 6 of 6 | clean 10 of 10 |
+| `fresh`, same, Temurin 25 | aborted 2 of 3 | clean 3 of 3 |
+| `check` phase, 200 reps, Temurin 21 (the shape that started this) | aborted 5 of 5 | clean 5 of 5 |
+| `reuse`, one pipeline, 200 reps | clean | clean |
+| `CvPipeline` finaliser runs at all | yes, 20000 of 20000 | no, and Mats still do: RSS flat |
+
+And the repository's own tests, forked JVM `openjdk-bin-21`, same command before and after:
+
+- before: the eight vision classes start, six finish, then `The forked VM terminated without properly saying
+  goodbye. VM crash or System.exit called?`
+- after: 40 of 40 pass, and the **whole suite is green - 298 tests, 0 failures, `BUILD SUCCESS`**, which it has
+  not been once during this investigation.
+
+One caveat worth stating: a pipeline that is neither closed nor finalized now holds its Mats until GC collects
+the pipeline and the Mats with it. `FinalCheck` shows the Mats do get reclaimed by their own finalizers (RSS
+flat over 1000 frames released by nothing), but the reclaim lags: abandoning a pipeline per shot instead of
+reusing one cost 6.5 GiB over 400 reps. Production reuses pipelines per part and closes them, and so must the
+pre-check - which was already a requirement for a different reason (see above).

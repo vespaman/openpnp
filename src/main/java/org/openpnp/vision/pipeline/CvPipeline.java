@@ -385,11 +385,14 @@ public class CvPipeline implements AutoCloseable {
         release();
     }
     
-    @Override
-    protected void finalize() throws Throwable {
-        release();
-        super.finalize();
-    }
+    // No finalize() here on purpose. Every Mat in this pipeline owns itself: org.opencv.core.Mat
+    // deletes its native object in its own finalize(), and org.opencv.core.Mat.release() does not
+    // clear the native pointer it was given. The order in which two finalizers run is not
+    // specified, so a finalizer that calls release() on Mats can easily be handed a Mat that has
+    // already been deleted, which is a use-after-free in native code and takes the whole JVM with
+    // it (SIGSEGV / "free(): invalid next size"). Vision operations are AutoCloseable and are
+    // closed by their callers; a pipeline that is never closed is not leaked either, because its
+    // Mats are reclaimed by their own finalizers.
 
     /**
      * Convert the pipeline to an XML string that can be read back in with #fromXmlString.
