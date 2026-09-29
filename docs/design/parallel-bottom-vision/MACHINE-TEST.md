@@ -49,6 +49,7 @@ JAVA_HOME=/opt/android-studio/jbr ~/tools/apache-maven-3.9.6/bin/mvn -B -o \
 | `BottomVisionSettingsRoundTripTest` | `parallel-alignment-enabled`, the four displacement settings and the `CropCentered` stage surviving save/restart of `machine.xml` and `vision-settings.xml` | 8 |
 | `CropCenteredTest` | the crop is centred and its output is in millimetres like the pipeline it sits in | 7 of `PRE-CHECK-ASSESSMENT.md` |
 | `ReferenceJobProcessorRetryTests` | feeder, pick and place retries and failover | 5 (retry half) |
+| `JobAbortTest` | aborting a job ends the camera batch and the light with it, discards the part that was picked, leaves the batch bookkeeping usable, and the same job started again places what is left | 5 (abort half), 6 (the aborted half, as far as a simulation can see it) |
 | `check_run.py` | the log greps and timings of sections 1, 2 and 3 for a pair of runs, in one command | 1, 2, 3 |
 
 What stays on the machine is what a simulated machine cannot see: that the offsets are the size they
@@ -189,7 +190,12 @@ the RSS file.
 
 ## 5. Abort, resume, retry (R6)
 
-With the setting on (run C):
+`JobAbortTest` covers the abort of a job between two steps: the camera batch and the light with it are
+given back, the picked part is discarded, the batch bookkeeping still works afterwards, and the same job
+run again places the rest. It cannot abort *during* a step, which is the interesting moment, because the
+aligner only owns a batch inside one step of the job processor; nor can a simulated machine notice a part
+that is not there (`TestActuator` answers the vacuum sense with a constant). So the following is still
+machine work:
 
 1. Start the job, abort it in the middle of the alignment phase, then resume / restart it. It must
    align again properly - no placement skipped, no image of the previous run used.
