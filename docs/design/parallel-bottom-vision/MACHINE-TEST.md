@@ -335,8 +335,21 @@ The cause was not the crop but the code that reads a crop, and §7 option 1 of
 `PRE-CHECK-ASSESSMENT.md` has the arithmetic: the pixels of the crop were converted to millimetres against
 the center of the whole camera frame. Fixed in this branch by carrying the analysed image size with the
 detected rect and by converting `Location` pipeline properties against the working image, with a
-`CropCenteredTest` that runs the real `VisionUtils` conversion both ways. Re-run the same job against the
-same `log_a.txt` offsets once the jar is rebuilt from this branch.
+`CropCenteredTest` that runs the real `VisionUtils` conversion both ways.
+
+Checked off the machine before re-running on it, because the offsets are the thing that broke: the same
+captured frame through the live `R0402` pipeline, with and without the crop stage, and the millimetres
+printed both ways (§7 option 1 of `PRE-CHECK-ASSESSMENT.md`). The crop and the full frame agree to the
+micron after the fix, and reading the crop against the frame is off by the 15 mm class. On the OpenPnP PC:
+
+    javac -cp "classes:lib/*" -d out Benchmark.java Crop.java
+    for p in p_full.xml p_cropstage.xml; do
+      java -cp "out:classes:lib/*" org.openpnp.vision.pipeline.Benchmark $p 5 \
+           0.03859462904927454 0.03412551850076619 0.1 2.83
+    done
+
+Re-run the machine job against the same `log_a.txt` offsets once the jar is rebuilt from this branch, and
+look at the offsets in the log rather than only at whether the job passes.
 
 If the run is good, this stops being an experiment in one package and becomes a default: the other bottom
 vision settings on the machine, the stock settings in `src/main/resources`, and the pipeline templates the

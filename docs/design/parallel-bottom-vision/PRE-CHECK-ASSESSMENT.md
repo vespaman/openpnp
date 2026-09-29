@@ -348,7 +348,20 @@ rect between the full frame and the crop, inside the pipeline, where everything 
 origin. The failure needed the millimetre conversion, i.e. the consumer, to appear. `CropCenteredTest` now
 runs that conversion for both cases and asserts the millimetres are the same, and asserts that the
 frame-referenced variant of the same pixels is more than 100 px away, so the shape of the old bug is pinned
-as well as the fix.
+as well as the fix. `bench/Benchmark.java` prints the same two numbers for whatever pipeline it is given, so
+the check is made on the real one and not only on a synthetic mark:
+
+| | full frame | with `crop` |
+|---|--:|--:|
+| analysed image | 1080x926 px | 200x200 px |
+| detection | `{537.5, 464.5} 39x21` | `{97.5, 101.5} 39x21` |
+| offsets, analysed image | -0.096, -0.051 mm | **-0.096, -0.051 mm** |
+| offsets, camera frame | -0.096, -0.051 mm | -17.078, +12.336 mm |
+
+The bolded cell is the whole point: after the fix the crop reports the same millimetres the full frame
+does, on the same frame of the same part, and the last row is what the machine did on the first trial. The
+magnitudes differ from the log because this frame is 1080x926 and the machine's is 805x785; the sign
+pattern and the order of magnitude are the same failure.
 
 Two things this also settled. The processed bottom vision frame is 805x785 and not the 1080x926 PNG the
 benchmark used, so the **absolute** stage times of §3 are high by about 1.35x in area terms; the ratios, and

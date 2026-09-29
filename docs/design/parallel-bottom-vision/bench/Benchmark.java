@@ -13,6 +13,7 @@ import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.spi.Camera;
+import org.openpnp.util.VisionUtils;
 
 /**
  * Runs a real CvPipeline (the one the C0402-22p/50V part uses, with the capture replaced by an
@@ -20,13 +21,16 @@ import org.openpnp.spi.Camera;
  * Nothing here talks to hardware.
  */
 public class Benchmark {
-    static Camera mockCamera(final double uppX, final double uppY) {
+    static Camera mockCamera(final double uppX, final double uppY, final double width,
+            final double height) {
         return (Camera)Proxy.newProxyInstance(Camera.class.getClassLoader(), new Class<?>[] {Camera.class},
                 new InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
                         switch(method.getName()) {
                             case "getName": return "Upp1";
+                            case "getWidth": return (int) width;
+                            case "getHeight": return (int) height;
                             case "getUnitsPerPixel":
                             case "getUnitsPerPixelAtZ":
                             case "getUnitsPerPixelXY":
@@ -67,6 +71,10 @@ public class Benchmark {
         double uppY = argv.length > 3 ? Double.parseDouble(argv[3]) : 0.0341;
         double kernelMm = argv.length > 4 ? Double.parseDouble(argv[4]) : 0.1;
         double footprintMm = argv.length > 5 ? Double.parseDouble(argv[5]) : 0.0;
+        // The frame the Camera would report, i.e. the whole captured image. 0 means take it from the
+        // capture stage of this very pipeline, which is what it is on the machine.
+        double cameraWidth = argv.length > 6 ? Double.parseDouble(argv[6]) : 0;
+        double cameraHeight = argv.length > 7 ? Double.parseDouble(argv[7]) : 0;
 
         String xml = new String(Files.readAllBytes(Paths.get(xmlPath)), "UTF-8");
         CvPipeline pipeline = new CvPipeline();
@@ -80,12 +88,26 @@ public class Benchmark {
         double[][] samples = new double[stages.size()][reps];
         long[] totals = new long[reps];
 
+        if(cameraWidth <= 0 || cameraHeight <= 0) {
+            // One pass to learn the frame the capture stage produces, which is the size the Camera
+            // would report on the machine, and which the crop makes smaller than what is analysed.
+            apply(pipeline, uppX, uppY, kernelMm, footprintMm, 0, 0);
+            pipeline.process();
+            for(CvStage stage : stages) {
+                CvStage.Result result = pipeline.getResult(stage);
+                if(result != null && result.image != null) {
+                    cameraWidth = Math.max(cameraWidth, result.image.cols());
+                    cameraHeight = Math.max(cameraHeight, result.image.rows());
+                }
+            }
+        }
+
         for(int i = 0; i < reps; i++) {
             pipeline.resetReusedPipeline();
             // The reset puts the stage parameters back to their XML values, exactly as it does on the
             // machine between two shots, where preparePipeline() then applies these very properties
             // again. So they have to be applied per rep, not once.
-            apply(pipeline, uppX, uppY, kernelMm, footprintMm);
+            apply(pipeline, uppX, uppY, kernelMm, footprintMm, cameraWidth, cameraHeight);
             long t0 = System.nanoTime();
             pipeline.process();
             totals[i] = System.nanoTime() - t0;
@@ -130,13 +152,38 @@ public class Benchmark {
         java.util.Arrays.sort(totals);
         System.out.printf("  %7.2f ms  %s%n", sum, "(sum of stages)");
         System.out.printf("  %7.2f ms  %s%n", totals[totals.length / 2] / 1e6, "(whole process())");
+        // The millimetres, which is what the machine steers by and what the timings above cannot say
+        // anything about. The first machine trial of the crop measured 20 ms and found the part, and
+        // still steered 15 mm away from it, because the pixels of the crop were read against the center
+        // of the whole frame. Compare this line between the cropped and the uncropped run: they have to
+        // agree, and the second of the two lines is only interesting when they do not.
+        for(CvStage stage : stages) {
+            if(!"results".equals(stage.getName()) && !"result".equals(stage.getName())) {
+                continue;
+            }
+            CvStage.Result result = pipeline.getResult(stage);
+            if(result == null || !(result.model instanceof org.opencv.core.RotatedRect)) {
+                continue;
+            }
+            org.opencv.core.RotatedRect rect = (org.opencv.core.RotatedRect) result.model;
+            Camera camera = mockCamera(uppX, uppY, cameraWidth, cameraHeight);
+            org.openpnp.model.Location analysed = VisionUtils.getPixelCenterOffsets(camera,
+                    result.image.cols(), result.image.rows(), rect.center.x, rect.center.y);
+            org.openpnp.model.Location frame = VisionUtils.getPixelCenterOffsets(camera,
+                    rect.center.x, rect.center.y);
+            System.out.printf("  geometry %s in %dx%d px%n", abbreviate(rect), result.image.cols(),
+                    result.image.rows());
+            System.out.printf("  offsets, analysed image: %+.3f, %+.3f mm%n", analysed.getX(),
+                    analysed.getY());
+            System.out.printf("  offsets, camera frame  : %+.3f, %+.3f mm%n", frame.getX(), frame.getY());
+        }
         System.out.println("  java.version=" + System.getProperty("java.version")
                 + " cores=" + Runtime.getRuntime().availableProcessors());
     }
 
     static void apply(CvPipeline pipeline, double uppX, double uppY, double kernelMm,
-            double footprintMm) {
-        pipeline.setProperty("camera", mockCamera(uppX, uppY));
+            double footprintMm, double cameraWidth, double cameraHeight) {
+        pipeline.setProperty("camera", mockCamera(uppX, uppY, cameraWidth, cameraHeight));
         pipeline.setProperty("MinAreaRect.center", new Location(LengthUnit.Millimeters));
         pipeline.setProperty("MinAreaRect.expectedAngle", 0.0);
         pipeline.setProperty("MaskCircle.diameter", new Length(4.0, LengthUnit.Millimeters));
