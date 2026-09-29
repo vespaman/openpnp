@@ -273,4 +273,104 @@ public class CropCenteredTest {
         assertEquals(240, fullPoint.y, 0.01);
         assertEquals(50, croppedPoint.y, 0.01);
     }
+
+    /**
+     * A rectangular mark at a given millimetre offset from the point the camera looks at, of a given
+     * size, in the grayscale form the geometry stages want. The test camera is 1 mm per pixel.
+     */
+    static class MarkStage extends CvStage {
+        private final double offsetX;
+        private final double offsetY;
+        private final double markWidth;
+        private final double markHeight;
+
+        MarkStage(double offsetX, double offsetY, double markWidth, double markHeight) {
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+            this.markWidth = markWidth;
+            this.markHeight = markHeight;
+        }
+
+        @Override
+        public Result process(CvPipeline pipeline) {
+            Camera camera = (Camera) pipeline.getProperty("camera");
+            Mat mat = new Mat((int) camera.getHeight(), (int) camera.getWidth(), CvType.CV_8UC1);
+            mat.setTo(new org.opencv.core.Scalar(0));
+            double centerX = camera.getWidth()/2. + offsetX;
+            double centerY = camera.getHeight()/2. + offsetY;
+            for(int y = (int) (centerY - markHeight/2.); y < (int) (centerY + markHeight/2.); y++) {
+                for(int x = (int) (centerX - markWidth/2.); x < (int) (centerX + markWidth/2.); x++) {
+                    mat.put(y, x, 255);
+                }
+            }
+            return new Result(mat, FluentCv.ColorSpace.Gray);
+        }
+    }
+
+    private CvStage.Result detectMarkAt(MarkStage source, double cropWidth, double cropHeight)
+            throws Exception {
+        CvPipeline pipeline = new CvPipeline();
+        pipeline.setProperty("camera", new VisionUtilsTest.TestCamera());
+        pipeline.add(source);
+        if(cropWidth > 0) {
+            CropCentered crop = new CropCentered();
+            crop.setWidth(cropWidth);
+            crop.setHeight(cropHeight);
+            crop.setMinimum(0);
+            pipeline.add(crop);
+        }
+        MinAreaRect minAreaRect = new MinAreaRect();
+        minAreaRect.setName("results");
+        minAreaRect.setThresholdMin(1);
+        minAreaRect.setThresholdMax(255);
+        pipeline.add(minAreaRect);
+        pipeline.process();
+        return pipeline.getResult("results");
+    }
+
+    @Test
+    public void testAPartOutsideTheCropIsNotMeasuredAtAll() throws Exception {
+        // What a crop that is too small or misplaced does is not crash, it answers confidently: the
+        // machine trial of tests_2026-09-28/log_b.txt reported a part inside the crop and then steered
+        // 15 mm away from it. A part that is not in the crop at all must produce nothing, so that the
+        // job stops with "No result found", which is what the machine did on 2026-09-29 when there was
+        // genuinely no part on the nozzle.
+        initializeConfiguration();
+        Camera camera = new VisionUtilsTest.TestCamera();
+        CvStage.Result cropped = detectMarkAt(new MarkStage(200, 0, 12, 6), 40, 40);
+        assertTrue(cropped == null || cropped.model == null,
+                "a part outside the crop must not be measured");
+        // The same mark without the crop is found where it is, so the answer above is the crop talking
+        // and not the mark having gone missing.
+        CvStage.Result whole = detectMarkAt(new MarkStage(200, 0, 12, 6), 0, 0);
+        RotatedRect wholeRect = (RotatedRect) whole.model;
+        Location offsets = VisionUtils.getPixelCenterOffsets(camera, whole.image.cols(),
+                whole.image.rows(), wholeRect.center.x, wholeRect.center.y);
+        assertEquals(200, Math.abs(offsets.getX()), 1.);
+    }
+
+    @Test
+    public void testAPartStraddlingTheCropEdgeIsNotThePart() throws Exception {
+        // The dangerous half of the same failure: the part is half in the crop, so something is found
+        // and reported as if it were the whole part. Whatever comes out of a truncated contour must
+        // therefore be recognisable as not-the-part, either nothing at all, or something smaller and
+        // off centre - the two things the width/length tolerance and the centre offset tolerance of
+        // bottom vision look at. A truncated contour that reports the true centre and the true size
+        // would place the part blind.
+        initializeConfiguration();
+        Camera camera = new VisionUtilsTest.TestCamera();
+        RotatedRect whole = (RotatedRect) detectMarkAt(new MarkStage(0, 0, 12, 6), 0, 0).model;
+        CvStage.Result clipped = detectMarkAt(new MarkStage(15, 0, 12, 6), 20, 20);
+        if(clipped == null || clipped.model == null) {
+            // Nothing found, which is the good case.
+            return;
+        }
+        RotatedRect rect = (RotatedRect) clipped.model;
+        assertTrue(Math.max(rect.size.width, rect.size.height) < Math.max(whole.size.width, whole.size.height),
+                "a truncated part must measure smaller than the whole part, or the size check has nothing to catch it");
+        Location offsets = VisionUtils.getPixelCenterOffsets(camera, clipped.image.cols(),
+                clipped.image.rows(), rect.center.x, rect.center.y);
+        assertTrue(Math.abs(Math.abs(offsets.getX()) - 15.) > 1.,
+                "the centre of a truncated part must not be reported as the centre of the part");
+    }
 }

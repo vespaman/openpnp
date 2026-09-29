@@ -29,7 +29,12 @@ at `C0402-22p/50V`. So:
   stale size, and still gets the same crop, is a test that cannot regress that way again. See
   `PRE-CHECK-ASSESSMENT.md`.
 
-## 2. Outside the crop must fail loudly - new test, same file
+## 2. Outside the crop must fail loudly - `CropCenteredTest`, extended
+
+Partly written on 2026-09-29: `testAPartOutsideTheCropIsNotMeasuredAtAll` asserts the part outside the
+crop yields nothing, and `testAPartStraddlingTheCropEdgeIsNotThePart` asserts a truncated contour
+measures smaller than the whole part and does not report the true centre, which is what the width/length
+tolerance of bottom vision has to catch. The third bullet below, a part tiny in the crop, is not written.
 
 The failure of `tests_2026-09-28/log_b.txt` was not a crash: `MinAreaRect` found something inside the crop,
 the pipeline reported a confident part, and the mm conversion turned it into `(-11.640, +9.544 mm)`, which
