@@ -294,6 +294,44 @@ whole contour chain called directly without `CvPipeline`; `DoubleRelease`, relea
 twice with up to 512 other `Mat`s churned in between; and `-Xint`, `-XX:-CriticalJNINatives`,
 `-Xmx10g -XX:+DisableExplicitGC` and `MALLOC_CHECK_=0`, none of which stopped the abort on 21.
 
+### The machine is on Temurin 25 now, and what that costs
+
+`eselect java-vm list` on the OpenPnP PC selects `openjdk-bin-25` (Temurin 25.0.3) as both system and user vm,
+switched 2026-09-29. Confirmed on the machine, the workload that killed Temurin 21 five times out of five
+inside 200 reps:
+
+| Temurin 25.0.3 on the OpenPnP PC, `PreCheckBench check` | result |
+|---|---|
+| `p_200.xml`, 600 reps | survived, 2 of 2, median 2.18 ms |
+| `p_200.xml`, 2000 reps | survived, median 2.07 ms |
+| `p_run2.xml` (the real `R0402` pipeline), 300 reps | survived, 2 of 2, median 16.25 ms |
+
+`bench/ConfigSmoke.java` reads the machine's own `vision-settings.xml` with the XStream setup OpenPnP uses and
+writes it back: 40 settings, 188080 characters, byte for byte the same on 21 and on 25, which is the reflection
+layer that a new JVM breaks first. `machine.xml`, `packages.xml` and `parts.xml` cannot be read headless at all
+(`java.lang.Error: Configuration instance not yet initialized`), so the remaining proof is the plain one: start
+OpenPnP on 25, load the configuration, run one job.
+
+What switching to 25 costs:
+
+1. The tests cannot run on it. `pom.xml` hands Surefire `-XX:GCLockerRetryAllocationCount`, which 25 no longer
+   recognises, so the fork dies on the command line before any test runs. The build and the test suite stay on
+   21 (or 11) until that flag is made conditional - a small change, and one that would also stop the suite
+   aborting here, since 21 is the JVM that aborts.
+2. `openpnp.sh` should gain `--enable-native-access=ALL-UNNAMED`: `nu.pattern.OpenCV$LocalLoader` calls
+   `System.load` from an unnamed module, which warns on 25 and will be blocked in a future release. Its three
+   `--add-opens` are all still valid.
+3. The rest of the stack is not validated on 25 by anyone: `jSerialComm` 2.10.2, `webcam-capture` 0.3.10 with
+   `bridj`, `jython` 2.7.1, `nashorn-core` 15.4, `batik` 1.7. The vision settings round trip says the XStream
+   layer is fine; the serial port, the scripting console and the GUI are only proven by running it.
+4. It treats the symptom. The corruption is still there - 11 and 25 just do not hand glibc something it
+   notices, and valgrind cannot see it either - so a future 25.0.x could start aborting, and the report to
+   Temurin and upstream is still owed.
+5. The timing on the machine has never been measured on 25. The pre-check is slightly *faster* there (16.25 ms
+   against 20.3 ms on 21, §2), but the camera path, the settle loop and the GUI run in this same JVM.
+
+think3 keeps 21: everything that runs here is a build or a test, and 21 is what the pom's flags still start.
+
 ## 8. Order of work
 
 1. ~~Bench the pre-check's cost~~ done, §7. The verdict is not the one the April attempt expected and not
