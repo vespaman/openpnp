@@ -166,6 +166,65 @@ public class PreCheckBench {
             report("capture-from-disk, two at once", readBoth);
         }
 
+        if(phases.contains("reuse") || phases.contains("fresh") || phases.contains("noreset")
+                || phases.contains("nocfg") || phases.contains("freshkeep")
+                || phases.contains("freshrel") || phases.contains("freshnocfg")
+                || phases.contains("freshbuild")) {
+            // All five crash logs on this box are from the phase above, which never hands a pipeline a
+            // pre-captured shot: it reuses one pipeline, resets it and re-configures its stages, over
+            // and over. So which of those three does the bundled OpenCV not survive? One variant per
+            // process, so an abort names the variant that caused it.
+            boolean reuse = !phases.contains("fresh");
+            boolean reset = !phases.contains("noreset");
+            boolean apply = !phases.contains("nocfg") && !phases.contains("freshnocfg");
+            boolean buildOnly = phases.contains("freshbuild");
+            String label = "disk pipeline, reuse=" + reuse + " reset=" + reset + " reconfigure=" + apply;
+            CvPipeline kept = reuse ? newPipeline(xmlPath, false) : null;
+            for(int i = 0; i < 3; i++) {
+                CvPipeline warm = reuse ? kept : newPipeline(xmlPath, false);
+                if(reset) {
+                    warm.resetReusedPipeline();
+                }
+                if(apply) {
+                    Benchmark.apply(warm, uppX, uppY, 0.1, footprintMm, frame.cols(), frame.rows());
+                }
+                if(!buildOnly) {
+                    diskCheck(warm, uppX, uppY);
+                }
+            }
+            // A pipeline holds its working image and one Mat per stage result, so keeping them alive
+            // is expensive; 60 of them is enough, because the fresh variant dies long before that.
+            boolean keep = phases.contains("freshkeep") || phases.contains("freshrel");
+            boolean rel = phases.contains("freshrel");
+            if(keep) {
+                reps = Math.min(reps, 60);
+            }
+            List<CvPipeline> keptAlive = new ArrayList<>();
+            double[] variant = new double[reps];
+            for(int i = 0; i < reps; i++) {
+                CvPipeline pipeline = reuse ? kept : newPipeline(xmlPath, false);
+                if(reset) {
+                    pipeline.resetReusedPipeline();
+                }
+                if(apply) {
+                    Benchmark.apply(pipeline, uppX, uppY, 0.1, footprintMm, frame.cols(), frame.rows());
+                }
+                variant[i] = buildOnly ? 0.0 : diskCheck(pipeline, uppX, uppY);
+                if(rel) {
+                    pipeline.release();
+                }
+                if(keep) {
+                    keptAlive.add(pipeline);
+                }
+                if(i % 25 == 24) {
+                    System.out.println("    rep " + (i + 1) + " of " + reps + " done");
+                    System.out.flush();
+                }
+            }
+            report(label + (rel ? ", released each time, kept alive" : "")
+                    + (keep && !rel ? ", kept alive" : ""), variant);
+        }
+
         if(doSettle) {
             double[] iteration = new double[reps * frames];
             double[] interval = new double[reps * frames];
@@ -254,6 +313,22 @@ public class PreCheckBench {
         CvPipeline pipeline = new CvPipeline();
         pipeline.fromXmlString(useShot ? pipelineXml(xmlPath) : rawXml(xmlPath));
         return pipeline;
+    }
+
+    /**
+     * Run a pipeline that reads its frame from disk, as the pipeline of the variant above does, and
+     * nothing else: no reset, no re-configuration, no results read back. Whatever the caller has
+     * already done to the pipeline is what is measured.
+     */
+    static double diskCheck(CvPipeline pipeline, double uppX, double uppY) throws Exception {
+        pipeline.setProperty("camera", Benchmark.mockCamera(uppX, uppY, 1080, 926));
+        long t0 = System.nanoTime();
+        pipeline.process();
+        double ms = (System.nanoTime() - t0) / 1e6;
+        if(pipeline.getTerminalException() != null) {
+            throw pipeline.getTerminalException();
+        }
+        return ms;
     }
 
     static double[] preCheck(CvPipeline pipeline, Mat frame, double uppX, double uppY,

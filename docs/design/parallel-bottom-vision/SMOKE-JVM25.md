@@ -80,3 +80,29 @@ cp ~/openpnp/OpenPnP.vmoptions.bak-2026-09-29 ~/openpnp/OpenPnP.vmoptions
 ```
 
 That returns the machine to exactly what it ran before: `openjdk-bin-11`, no native-access flag.
+
+## Result of the first run, 2026-09-29 evening
+
+`tests_2026-09-28/log_e.txt`, the same build (`2.7_2026-09-29_06-59-23.1090cd9`), the same configuration and the
+same job as the morning's `log_c.txt`, which ran on the previous JVM:
+
+- job finished, 8 parts, 11.8 s, **2446.7 CPH** against 2483.8 on the old JVM: **-1.5%**.
+- one line in the whole log matches `exception|error|warn`, and it is a `ReferencePushPullFeeder` "results in
+  error 0.288mm at the (farthest) pick location" message, which is a normal measurement.
+- 8 alignments on pre-captured images, no fallback to sequential, no `hs_err_pid*.log`.
+- which JVM: `openpnp.sh` was by then passing `--enable-native-access=ALL-UNNAMED`, which Java 11 rejects
+  outright ("Unrecognized option"), and the log has no such line - with `eselect` at 25 and the script starting
+  a bare `java`, that is 25. The `ps` check below is still worth doing on the next start, because it is direct.
+
+Where the 1.5% is, per cycle (rank marker to rank marker), cycles 0-3:
+
+| | cycle 0 | 1 | 2 | 3 | mean pick phase | mean align step | of which move to position | mean settle | worst vision op |
+|---|---|---|---|---|---|---|---|---|---|
+| old JVM (`log_c`) | 1992 | 1901 | 1872 | 1880 | 1051 ms | 320 ms | 246 ms | 43.5 ms | 22.7 / 13.2 / 12.1 / 12.3 ms |
+| Temurin 25 (`log_e`) | 1997 | 1894 | 1928 | 1914 | 1052 ms | 338 ms | 262 ms | 48.5 ms | 15.7 / 13.4 / 7.6 / 11.8 ms |
+
+The vision code is not what got slower - on 25 it is the same or better in every cycle, including the first,
+where the old JVM paid 22.7 ms of warm-up against 15.7 ms. The pick phase is identical to the millisecond. The
+difference sits in moving to the alignment position (+16 ms per cycle) and in the settle (+5 ms), i.e. in motion
+and mechanics, which the JVM does not own. 1.1% of cycle time is therefore the honest reading of "is Temurin 25
+slower on this machine": not measurably, in the parts we control.

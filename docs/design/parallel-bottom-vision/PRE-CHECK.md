@@ -255,6 +255,8 @@ be a different question, and the answer is not the one first written here. The O
 the 2025-03-07 `/home/micke/openpnp/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`. So the machine has been running
 OpenJDK 11 - which survived 5 of 5 here at 200 reps and died 1 of 6 in the 150-pair batches - not Temurin 21.
 `eselect` only decides what a bare `java` gets: every bench run in this document, and the fork's `openpnp.sh`.
+(Read "only Temurin 21" below as *how often*, not *which JVM* - see "It is not the JVM" further down.)
+
 No `hs_err_pid*.log` exists in the home directory, in `/tmp` or beside the jar, so nothing says the corruption
 has happened during real work on any JVM.
 
@@ -302,6 +304,73 @@ plus `clone` with the release done five different ways, 600 runs on 21 and 25 on
 whole contour chain called directly without `CvPipeline`; `DoubleRelease`, releasing the same `Mat` wrapper
 twice with up to 512 other `Mat`s churned in between; and `-Xint`, `-XX:-CriticalJNINatives`,
 `-Xmx10g -XX:+DisableExplicitGC` and `MALLOC_CHECK_=0`, none of which stopped the abort on 21.
+
+### It is not the JVM: a pipeline built per run corrupts the heap on 21 *and* on 25
+
+Six `hs_err_pid*.log` files sat in `~/opencode_tests` the whole time, all Temurin 21.0.12.1, all SIGSEGV - the
+artefact §7 said was missing. Only one is complete (`hs_err_pid53506.log`); it names the faulting frame:
+
+```
+C  [libopencv_java455.so+0x406c20]  cv::Mat::release()+0x50
+j  org.opencv.core.Mat.release()V+4
+j  org.openpnp.vision.pipeline.CvPipeline.release()V+64
+j  org.openpnp.vision.pipeline.CvPipeline.finalize()V+1
+j  java.lang.ref.Finalizer$FinalizerThread.run()V+29
+Current thread: JavaThread "Finalizer" daemon
+```
+
+Every readable command line in those logs is the `read` phase, which never hands a pipeline a pre-captured
+shot. So the pre-check is not the cause, and to find out what is, the bench now varies how pipelines are made
+and run (`p_run2.xml`, the machine's own `R0402` pipeline, `in/frame.png` 1080x926, 3 attempts of each):
+
+| what the process does | 60 reps on Temurin 21 | 60 reps on Temurin 25 |
+|---|---|---|
+| one pipeline, reset + reconfigure + `process()`, 200 reps (`reuse`) | survived 3 of 3 | - |
+| one pipeline, no reset (`noreset`) / configured once (`nocfg`) | survived 3 of 3 | - |
+| build 60 pipelines, process only the warm-ups (`freshbuild`) | survived 3 of 3 | survived 3 of 3 |
+| build a pipeline and process it, over and over (`fresh`) | **aborted 6 of 6** | **aborted 2 of 3**, at about rep 50 |
+| the same, stages configured once (`freshnocfg`) | **aborted 3 of 3** | **aborted 3 of 3** |
+| `fresh`, each pipeline `release()`d explicitly (`freshrel`) | **aborted 3 of 3** | - |
+| `fresh`, every pipeline kept alive so nothing is finalised (`freshkeep`) | **aborted 3 of 3** | - |
+
+Building a pipeline is innocent; running one that was just built is not, and keeping them alive, releasing them
+by hand, or configuring them once does not help. 25 does the same thing about twice as slowly - which is the
+answer to the question this document has been circling: **the JVM switch changes how long it takes glibc to
+notice, not whether the heap is being corrupted.** What has kept the machine alive is that the production path
+reuses one pipeline per part instead of building one per operation, and the first row above is that path: 200
+reps, clean.
+
+The mechanism is visible in the wrapper the fork ships (`javap` on `org.openpnp:opencv:4.5.5-1`):
+
+```
+protected void finalize() { n_delete(nativeObj); }     // org.opencv.core.Mat
+public      void release() { n_release(nativeObj); }   // and nativeObj is never cleared
+```
+
+and in ours, `CvPipeline.release()` (CvPipeline.java:367) releasing `workingImage` plus every `result.image`
+**without nulling `result.image`**, called again from `CvPipeline.finalize()` (CvPipeline.java:389). A `Mat`
+that is released, deleted, and then reached a second time produces exactly the observed frame and exactly these
+glibc messages. The newest logs, from the `fresh` runs, are 0 to 20 lines long: the crash handler itself dies,
+and the recorded `pc` is nonsense (`0x0000001500000011`), so the heap is long wrecked by the time anything
+notices.
+
+Things ruled out along the way, so nobody repeats them: `-Xcheck:jni` reports nothing (only the native-access
+warning); `MALLOC_CHECK_=3` changes nothing; and `-XX:-RegisterFinalizersAtInit` does **not** disable
+finalisation - `bench/FinalCheck.java` still sees 20000 of 20000 finalisers run - which also shows that 21 and
+25 finalise equally and reclaim the native frames equally (RSS flat over 1000 undropped 2929 KiB frames on
+both), so 25 is not leaking the Mats the way it would if finalisation had gone away. JDK 11 cannot run these
+variants at all (the bench is now compiled as class file v65); its earlier numbers belong to the reuse-based
+phases only.
+
+Consequences, in order of importance:
+
+1. The pre-check must reuse a pipeline per part, as the alignment path does. Building one per shot would put
+   the machine on the row that aborts on both JVMs.
+2. `CvPipeline.release()` should null `result.image` (and `workingImage` is already nulled) and `CvPipeline`
+   should stop relying on `finalize()`; the smallest experiment worth running after that is `fresh` ten times
+   on Temurin 21, which is currently 6 of 6.
+3. "Temurin 21 is the problem" is now a statement about frequency, not about which JVM. §7 above should be read
+   that way.
 
 ### The machine is on Temurin 25 now, and what that costs
 
