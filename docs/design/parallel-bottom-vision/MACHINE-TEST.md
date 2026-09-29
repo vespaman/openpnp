@@ -254,6 +254,29 @@ check the value is still `false` and that `machine.xml` contains
 
 Same for the displacement settings. Watch the log at startup for XML/unknown element complaints.
 
+## 9. What stresses the crop, and what does not
+
+The crop is a stage in the *bottom vision* pipeline: it cuts a window around where the part is expected on
+the **nozzle**, in front of the up-looking camera. The board location, fiducials and the placement
+coordinates have nothing to do with it - bottom vision runs before any of that and reports an offset
+relative to the pick. Moving the board tests the placement, not the crop.
+
+What the crop has to tolerate is the part sitting off-centre on the nozzle, and the size of that is already
+measured: the eight accepted offsets of `log_c.txt` top out at 0.26 mm, and at the ~37 px/mm of this camera
+(`1080x926` over about 29 x 25 mm) the 200 px window leaves about 2 mm of margin around an 0402. So the
+realistic case is proven by the successful run and the margin over it is roughly eight to one.
+
+If the margin is to be stressed deliberately, stress it where it lives:
+
+1. Pick the part (Feeders or Parts panel, *Pick*), and repeat it ten times. The scatter of the reported
+   offsets is the quantity the crop is sized against; it should stay in the tenths of a millimetre.
+2. Put a part on the nozzle by hand, visibly off-centre, and run the alignment anyway - the part must still
+   be found, and the reported offset must be about the displacement you made, not nonsense. That is the
+   `log_b.txt` failure mode in slow motion, and it is a hand test because nothing on the machine produces
+   it on purpose.
+3. Beyond the crop edge it must fail with no result, not with a confident wrong number - which is a test to
+   write, not a test to run by hand; see `LATER-TESTS.md`.
+
 ## Recording
 
 Put the logs of each run in a directory per run (`~/pbv-test/A/`, `A2`, `B`, `C`, ...) together with
