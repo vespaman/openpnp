@@ -414,6 +414,62 @@ What switching to 25 costs:
 
 think3 keeps 21: everything that runs here is a build or a test, and 21 is what the pom's flags still start.
 
+### The fix: CvPipeline must not release Mats from a finalizer
+
+`finalize()` is gone from `CvPipeline` (CvPipeline.java:383). `release()` and `close()` are unchanged, and every
+vision operation already closes its pipeline - commit 16ab399fcc, which added the finalizer, describes it as "a
+final bid to release Mats", i.e. a belt added on top of try-with-resources. The belt is what kills us: Mats own
+themselves (`Mat.finalize()` deletes the native object) and `Mat.release()` never clears the pointer it was
+handed, so whichever of the two finalizers loses the race calls into memory that the other one has already
+given back to the allocator.
+
+Measured, always on the real `p_run2.xml` pipeline:
+
+| workload | with the finalizer | without it |
+|---|---|---|
+| `fresh`, pipeline built and run, 60 reps, Temurin 21 | aborted 6 of 6 | clean 10 of 10 |
+| `fresh`, same, Temurin 25 | aborted 2 of 3 | clean 3 of 3 |
+| `check` phase, 200 reps, Temurin 21 (the shape that started this) | aborted 5 of 5 | clean 5 of 5 |
+| `reuse`, one pipeline, 200 reps | clean | clean |
+| `CvPipeline` finaliser runs at all | yes, 20000 of 20000 | no, and Mats still do: RSS flat |
+
+And the repository's own tests, forked JVM `openjdk-bin-21`, same command before and after:
+
+- before: the eight vision classes start, six finish, then `The forked VM terminated without properly saying
+  goodbye. VM crash or System.exit called?`
+- after: 40 of 40 pass, and the **whole suite is green - 298 tests, 0 failures, `BUILD SUCCESS`**, which it has
+  not been once during this investigation.
+
+One caveat worth stating: a pipeline that is neither closed nor finalized now holds its Mats until GC collects
+the pipeline and the Mats with it. `FinalCheck` shows the Mats do get reclaimed by their own finalizers (RSS
+flat over 1000 frames released by nothing), but the reclaim lags: abandoning a pipeline per shot instead of
+reusing one cost 6.5 GiB over 400 reps. Production reuses pipelines per part and closes them, and so must the
+pre-check - which was already a requirement for a different reason (see above).
+
+### log_f: three jobs on the fixed build, and a warm job is a different animal
+
+`tests_2026-09-28/log_f.txt`, build `2.7_2026-09-30_05-47-35.1b02100`, three back-to-back jobs on the machine:
+
+| run | job time | CPH | alignments | vision sum | median per alignment | p90 | max |
+|---|---|---|---|---|---|---|---|
+| 1 (cold) | 11.6 s | 2476.6 | 8 | 97.4 ms | 12.40 ms | 15.80 | 17.10 |
+| 2 | 10.6 s | 2707.5 | 8 | 29.9 ms | 3.60 ms | 4.10 | 5.10 |
+| 3 | 10.6 s | 2704.5 | 8 | 37.7 ms | 3.50 ms | 8.60 | 9.30 |
+
+No exception, no warning, no `hs_err_pid*.log` anywhere on the machine after these runs (newest is still 22:24
+the previous evening). Run 1 is the fair comparison with the two earlier single-run logs: 11.6 s against 11.8 s
+on the same JVM before the fix, so the fix costs nothing.
+
+The number that matters for this design is the median: **3.5 ms per alignment once the JVM and the allocator are
+warm, against 12.4 ms cold.** Everything before this document was written measured only cold, single jobs, so
+the pre-check budget (PRE-CHECK section 2) has been sized against a cost three to four times what a running
+machine actually pays. Two things follow. One, the pre-check has more headroom than we thought, which strengthens
+the case for doing it during the settle rather than after it. Two, and less comfortably: we do not know yet
+whether warm vision has *always* been this fast or whether the finalizer removal contributed, because no log
+before this one contains a second job. A pre-fix build run twice on the machine would answer it; it is not
+worth reverting the fix to find out, but it should be kept in mind the next time a cold-start number is quoted
+as a steady-state one.
+
 ## 8. Order of work
 
 1. ~~Bench the pre-check's cost~~ done, §7. The verdict is not the one the April attempt expected and not
@@ -447,35 +503,3 @@ think3 keeps 21: everything that runs here is a build or a test, and 21 is what 
 - If the verdict is late more often than not - which §2 says is likely - is a check that only sometimes
   knows early worth a new stage in the settling loop at all, or should the same verdict simply come from
   the alignment of the settled frame, which knows everything except the time it takes?
-
-### The fix: CvPipeline must not release Mats from a finalizer
-
-`finalize()` is gone from `CvPipeline` (CvPipeline.java:383). `release()` and `close()` are unchanged, and every
-vision operation already closes its pipeline - commit 16ab399fcc, which added the finalizer, describes it as "a
-final bid to release Mats", i.e. a belt added on top of try-with-resources. The belt is what kills us: Mats own
-themselves (`Mat.finalize()` deletes the native object) and `Mat.release()` never clears the pointer it was
-handed, so whichever of the two finalizers loses the race calls into memory that the other one has already
-given back to the allocator.
-
-Measured, always on the real `p_run2.xml` pipeline:
-
-| workload | with the finalizer | without it |
-|---|---|---|
-| `fresh`, pipeline built and run, 60 reps, Temurin 21 | aborted 6 of 6 | clean 10 of 10 |
-| `fresh`, same, Temurin 25 | aborted 2 of 3 | clean 3 of 3 |
-| `check` phase, 200 reps, Temurin 21 (the shape that started this) | aborted 5 of 5 | clean 5 of 5 |
-| `reuse`, one pipeline, 200 reps | clean | clean |
-| `CvPipeline` finaliser runs at all | yes, 20000 of 20000 | no, and Mats still do: RSS flat |
-
-And the repository's own tests, forked JVM `openjdk-bin-21`, same command before and after:
-
-- before: the eight vision classes start, six finish, then `The forked VM terminated without properly saying
-  goodbye. VM crash or System.exit called?`
-- after: 40 of 40 pass, and the **whole suite is green - 298 tests, 0 failures, `BUILD SUCCESS`**, which it has
-  not been once during this investigation.
-
-One caveat worth stating: a pipeline that is neither closed nor finalized now holds its Mats until GC collects
-the pipeline and the Mats with it. `FinalCheck` shows the Mats do get reclaimed by their own finalizers (RSS
-flat over 1000 frames released by nothing), but the reclaim lags: abandoning a pipeline per shot instead of
-reusing one cost 6.5 GiB over 400 reps. Production reuses pipelines per part and closes them, and so must the
-pre-check - which was already a requirement for a different reason (see above).
