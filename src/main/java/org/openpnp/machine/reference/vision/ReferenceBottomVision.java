@@ -33,6 +33,8 @@ import org.openpnp.model.CapturedShot;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.camera.AbstractSettlingCamera;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.FrameNotStillException;
+import org.openpnp.model.FrameProvenance;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
@@ -58,6 +60,7 @@ import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
+import org.openpnp.vision.FrameDump;
 import org.openpnp.vision.pipeline.CvPipeline;
 import org.openpnp.vision.pipeline.CvPipeline.PipelineShot;
 import org.openpnp.vision.pipeline.CvStage;
@@ -146,6 +149,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
 
         Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
+        // A frame is only worth aligning upon if it can show that the head stood still while the
+        // camera integrated it. Ask the frame, not whoever captured it.
+        requireStillFrame(preCapturedShot, camera, part, nozzle);
         PartAlignmentOffset offsets;
         if ((bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
                 || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn)) {
@@ -163,6 +169,35 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             offsets = new PartAlignmentOffset(newOffsets, offsets.getPreRotated()); 
         }
         return offsets;
+    }
+
+    /**
+     * Refuse to measure a part on a frame that cannot show the head was still.
+     *
+     * This belongs here, at the entrance of the alignment, rather than with whoever captured the
+     * frame, because the two are far apart in time and in mind: the capture is trying to be quick and
+     * the measurement is trying to be true, and the one must not have to trust the other. A frame
+     * arrives with a {@link FrameProvenance} and either it says the head was still or the alignment
+     * does not look at it.
+     *
+     * No frame at all is not a failure: it simply means the alignment is the ordinary kind, which
+     * settles and then captures its own.
+     *
+     * @throws FrameNotStillException so that the caller can tell a frame that was not qualified apart
+     *             from a part that could not be found, and count them separately.
+     */
+    protected static void requireStillFrame(CapturedShot preCapturedShot, Camera camera, Part part,
+            Nozzle nozzle) throws FrameNotStillException {
+        if (preCapturedShot == null) {
+            return;
+        }
+        FrameProvenance provenance = preCapturedShot.getProvenance();
+        if (provenance.isStill()) {
+            return;
+        }
+        throw new FrameNotStillException("refusing to align part "+part.getId()+" on nozzle "
+                +nozzle.getId()+" from camera "+camera.getName()+": the frame is not a still frame ("
+                +provenance+")", provenance);
     }
 
     @Override
@@ -1440,8 +1475,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Use the wantedLocation parameter passed to this method
             Location shotLocation = wantedLocation;
             
-            // Return the pre-captured shot (no hardware references)
-            return new CapturedShot(camera, nozzle, preCapturedImage, shotLocation);
+            // Return the pre-captured shot (no hardware references). The capture itself happened
+            // inside the pipeline, whose image stage settles the camera it captures from - so the
+            // camera is the one that knows whether anything was demonstrated about the motion, and it
+            // is asked rather than assumed. A camera that does not settle, or a shot that skipped the
+            // settling, has nothing to say and the frame will be refused by the alignment.
+            FrameProvenance provenance = camera instanceof AbstractSettlingCamera
+                    ? settleProvenance((AbstractSettlingCamera) camera, FrameProvenance.UNKNOWN)
+                    : FrameProvenance.unknown();
+            FrameDump.writeIfNeeded(bottomVisionSettings, preCapturedImage, provenance, camera,
+                    nozzle, part, wantedLocation.getRotation());
+            return new CapturedShot(camera, nozzle, preCapturedImage, shotLocation, provenance);
         }
         finally {
             // Always close the pipeline to release resources
@@ -1467,11 +1511,33 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      */
     public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation) throws Exception {
-        return captureImageOnly(part, camera, nozzle, wantedLocation, false);
+        return captureImageOnly(part, camera, nozzle, wantedLocation, false,
+                FrameProvenance.UNKNOWN);
     }
 
     public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
+        return captureImageOnly(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                FrameProvenance.UNKNOWN);
+    }
+
+    /**
+     * Capture one frame without settling, for a camera that is not the one driving the settling.
+     *
+     * The frame this produces is not a still frame and is never going to be one: nothing measured the
+     * motion, the head had merely stopped being commanded to move. It is captured anyway because the
+     * pre-check wants a frame and because the alternative is not waiting, and it is stamped
+     * {@link FrameProvenance.Origin#QuickCapture} so that the alignment can say so and refuse it. The
+     * frame that this camera ought to hand to the alignment is one taken inside the still window of
+     * the settling camera, which is a different capture and a later step.
+     *
+     * @param arrivalAtMs when the head was reported at stillstand after moving to the cameras, so that
+     *            the age of this frame can be stated; {@link FrameProvenance#UNKNOWN} if nobody
+     *            recorded it.
+     */
+    public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs)
+            throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
         
         if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
@@ -1532,11 +1598,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             Logger.debug("captureImageOnly: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={}, displacementDelta={}", 
                 isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
             
-            // Capture the image (no settling needed - head is already stationary)
+            // Capture the image. Nothing settles here, so nothing is demonstrated about the motion.
             long tCapture = NanosecondTime.getRuntimeMilliseconds();
             BufferedImage capturedBufferedImage = camera.capture();
+            long capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
             Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
-            double captureMs = NanosecondTime.getRuntimeMilliseconds() - tCapture;
+            double captureMs = capturedAtMs - tCapture;
+            // Stamped as what it is: a frame nobody proved anything about. The alignment will refuse
+            // it, which is the point - see the requirements.
+            FrameProvenance provenance = FrameProvenance.quickCapture(arrivalAtMs, capturedAtMs);
+            FrameDump.writeIfNeeded(bottomVisionSettings, capturedImage, provenance, camera, nozzle,
+                    part, wantedLocation.getRotation());
 
             // The pre-check for a camera that does not settle. Its single frame is the frame the
             // alignment analyses, so this check cannot buy an earlier frame; what it buys is that a
@@ -1561,7 +1633,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             
             // Create a PreCapturedPlacement with the captured image and displacement delta
             PreCapturedPlacement capturedShot = new PreCapturedPlacement(
-                    camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+                    camera, nozzle, capturedImage, wantedLocation, displacementDelta, provenance);
             capturedShot.setPreCheckResult(preCheckResult);
             return capturedShot;
         }
@@ -1589,11 +1661,27 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      */
     public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation) throws Exception {
-        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, false);
+        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, false,
+                FrameProvenance.UNKNOWN);
     }
 
     public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
+        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                FrameProvenance.UNKNOWN);
+    }
+
+    /**
+     * Settle, then take the frame that ended the settling. The frame is not captured again after the
+     * settling has finished: the last frame of a settling is by definition the frame on which the
+     * settling agreed, so capturing once more would only cost the time this whole design is trying to
+     * save.
+     *
+     * @param arrivalAtMs when the head was reported at stillstand after moving to the cameras.
+     */
+    public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
+            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs)
+            throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
         
         if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
@@ -1681,6 +1769,12 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     AbstractSettlingCamera.SettleOption.Settle,
                     firstFrameConsumer);
                 Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+                // What the settling has just demonstrated about this frame. If it demonstrated nothing
+                // - a settling that ran out of time - then this frame is no better than a snapshot
+                // taken at full speed, and it says so.
+                FrameProvenance provenance = settleProvenance(settlingCamera, arrivalAtMs);
+                FrameDump.writeIfNeeded(bottomVisionSettings, capturedImage, provenance, camera,
+                        nozzle, part, wantedLocation.getRotation());
                 if (preCheckResult != null) {
                     // These two numbers only exist now that the settling is over. The check is not
                     // waited for: if it has not reported by now then it has not reported at all, and
@@ -1708,7 +1802,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 
                 // Create a PreCapturedPlacement with the captured image and displacement delta
                 PreCapturedPlacement capturedShot = new PreCapturedPlacement(
-                        camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+                        camera, nozzle, capturedImage, wantedLocation, displacementDelta, provenance);
                 capturedShot.setPreCheckResult(preCheckResult);
                 return capturedShot;
             }
@@ -1727,12 +1821,42 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 }
                 
                 return new PreCapturedPlacement(
-                        camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+                        camera, nozzle, capturedImage, wantedLocation, displacementDelta,
+                        FrameProvenance.quickCapture(arrivalAtMs,
+                                NanosecondTime.getRuntimeMilliseconds()));
             }
         }
         finally {
             // Always close the pipeline to release resources
             pipeline.close();
+        }
+    }
+
+    /**
+     * What the settling has just demonstrated about the frame it handed back.
+     *
+     * A settling that agreed is a measurement: two frames taken at different moments came out the
+     * same, so between them the mechanics were still, and that moment is the still window every other
+     * camera's frame has to fall inside. A settling that ran out of time is the same measurement
+     * answering "no", which is why its frame is not still however long it waited. A settling that was
+     * only ever a configured wait claims less: the frame is the one the settings asked for, but there
+     * is no window to place anything in, so no other camera can borrow its stillness.
+     */
+    protected static FrameProvenance settleProvenance(AbstractSettlingCamera settlingCamera,
+            long arrivalAtMs) {
+        switch (settlingCamera.getRecordedSettleResult()) {
+            case Agreed:
+            case FixedTime:
+                return FrameProvenance.settled(arrivalAtMs,
+                        settlingCamera.getRecordedSettledFrameAtMs(),
+                        settlingCamera.getRecordedStillWindowStartAtMs(),
+                        settlingCamera.getRecordedFrameCount());
+            case TimedOut:
+                return FrameProvenance.settleTimedOut(arrivalAtMs,
+                        settlingCamera.getRecordedSettledFrameAtMs(),
+                        settlingCamera.getRecordedFrameCount());
+            default:
+                return FrameProvenance.unknown();
         }
     }
 

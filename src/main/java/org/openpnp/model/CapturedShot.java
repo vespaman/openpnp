@@ -16,14 +16,21 @@ public class CapturedShot {
     private final Mat image;               // Pre-captured image (OpenCV native memory)
     private final Location shotLocation;   // Where image was captured
     private final long captureTimestamp;
+    private volatile FrameProvenance provenance; // What may be claimed about the moment of capture
     private volatile boolean released;
     
     public CapturedShot(Camera camera, Nozzle nozzle, Mat image, Location shotLocation) {
+        this(camera, nozzle, image, shotLocation, FrameProvenance.unknown());
+    }
+
+    public CapturedShot(Camera camera, Nozzle nozzle, Mat image, Location shotLocation,
+            FrameProvenance provenance) {
         this.camera = camera;
         this.nozzle = nozzle;
         this.image = image;
         this.shotLocation = shotLocation;
         this.captureTimestamp = System.currentTimeMillis();
+        this.provenance = provenance == null ? FrameProvenance.unknown() : provenance;
         this.released = false;
     }
     
@@ -48,6 +55,27 @@ public class CapturedShot {
     
     public long getCaptureTimestamp() {
         return captureTimestamp;
+    }
+
+    /**
+     * What may be claimed about the moment this frame was captured. Never null; a frame that carries
+     * no statement is treated as not still, see {@link FrameProvenance#isStill()}.
+     */
+    public FrameProvenance getProvenance() {
+        return provenance;
+    }
+
+    public void setProvenance(FrameProvenance provenance) {
+        this.provenance = provenance == null ? FrameProvenance.unknown() : provenance;
+    }
+
+    /**
+     * Whether this frame may be aligned upon. Kept on the shot rather than asked of the camera that
+     * produced it, because by the time the analysis runs the camera has moved on to the next
+     * settling and no longer knows anything about this frame.
+     */
+    public boolean isStill() {
+        return provenance.isStill();
     }
     
     /**

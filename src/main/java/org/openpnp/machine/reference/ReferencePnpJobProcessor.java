@@ -36,6 +36,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.Map;
 
@@ -53,6 +54,7 @@ import org.openpnp.machine.reference.wizards.ReferencePnpJobProcessorConfigurati
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.CapturedShot;
+import org.openpnp.model.FrameNotStillException;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.ImageBuffer;
 import org.openpnp.model.Job;
@@ -188,6 +190,72 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      */
     static volatile ExecutorService visionExecutor;
     private static final Object executorLock = new Object();
+
+    /**
+     * What the parallel bottom vision did during the job that is running.
+     *
+     * Counted because a fallback that nobody counts is how a wrong shortcut becomes normal service.
+     * Falling back is correct behaviour - the sequential path does the job properly - but it is also
+     * invisible from outside: the parts are placed either way, so the only symptom of a parallel path
+     * that never works is a machine that is quietly slow. These three numbers are printed at the end
+     * of every job, whatever they are, so that "it works" cannot be confused with "it works the way it
+     * was designed to".
+     */
+    private static final AtomicLong parallelAttempts = new AtomicLong();
+    private static final AtomicLong parallelFallbacks = new AtomicLong();
+    private static final AtomicLong parallelFramesRefused = new AtomicLong();
+
+    /**
+     * How many times the parallel alignment was attempted in the current job.
+     */
+    public static long getParallelAttempts() {
+        return parallelAttempts.get();
+    }
+
+    /**
+     * How many of those attempts ended up aligning sequentially after all.
+     */
+    public static long getParallelFallbacks() {
+        return parallelFallbacks.get();
+    }
+
+    /**
+     * How many of those fallbacks were caused by a frame that could not show the head was still. A
+     * number above zero here means the capture is not producing frames fit to align upon, which is a
+     * different problem from a part that is simply hard to see.
+     */
+    public static long getParallelFramesRefused() {
+        return parallelFramesRefused.get();
+    }
+
+    protected static void resetParallelVisionTally() {
+        parallelAttempts.set(0);
+        parallelFallbacks.set(0);
+        parallelFramesRefused.set(0);
+    }
+
+    /**
+     * Record one fallback of the parallel alignment and say so loudly, with the running tally in the
+     * message. Warning rather than info: an operator watching the machine sees the head go back to the
+     * cameras, so the log has to name the same event, and it has to be findable afterwards.
+     */
+    protected static void parallelVisionFellBack(Throwable cause) {
+        boolean refused = false;
+        for (Throwable t = cause; t != null; t = t.getCause()) {
+            if (t instanceof FrameNotStillException) {
+                refused = true;
+                break;
+            }
+        }
+        long fallbacks = parallelFallbacks.incrementAndGet();
+        if (refused) {
+            parallelFramesRefused.incrementAndGet();
+        }
+        Logger.warn("Parallel alignment fell back to sequential for all nozzles ({} of {} in this job)"
+                + (refused ? ", because a frame was not a still frame" : "") + " : {}",
+                fallbacks, parallelAttempts.get(),
+                cause == null ? "no cause" : String.valueOf(cause.getMessage()));
+    }
 
     /**
      * @return the shared pool on which the vision pipelines of pre-captured images are processed.
@@ -338,6 +406,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
         public Step step() throws JobProcessorException {
             startTime = System.currentTimeMillis();
             totalPartsPlaced = 0;
+            resetParallelVisionTally();
             
             jobPlacements.clear();
 
@@ -1848,6 +1917,10 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 return;
             }
             
+            // From here on this is a genuine attempt at parallel alignment, so it is counted: the
+            // two ways out above were not attempts, they were parts that cannot be pre-captured.
+            parallelAttempts.incrementAndGet();
+
             ImageBuffer imageBuffer = null;
             // The pipelines of the pre-captured images are processed on our own worker threads
             // below. Left to itself, every one of those threads would spin up OpenCV's own thread
@@ -1865,8 +1938,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 for (PlannedPlacement placement : plannedPlacements) {
                     CapturedShot shot = imageBuffer.getShot(placement.nozzle);
                     if (shot == null) {
-                        Logger.info("No pre-captured shot for nozzle {}, falling back to sequential alignment for all", 
-                            placement.nozzle.getId());
+                        parallelVisionFellBack(new Exception("no pre-captured shot for nozzle "
+                                +placement.nozzle.getId()+", that part cannot be pre-captured"));
                         // Fall back to sequential for ALL placements
                         for (PlannedPlacement p : plannedPlacements) {
                             super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
@@ -1900,11 +1973,11 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 }
                 catch (Exception e) {
                     // One or more background threads failed - fall back to sequential for ALL.
-                    // Say why: the sequential retry below can fail (or succeed) for a different
-                    // reason than the parallel attempt, and without this the operator only ever
-                    // sees the second one.
-                    Logger.info("Parallel alignment failed {}, falling back to sequential alignment for all",
-                            e.getCause() == null ? e : e.getCause());
+                    // Say why, and count it: the sequential retry below can fail (or succeed) for a
+                    // different reason than the parallel attempt, and without this the operator only
+                    // ever sees the second one. A frame that was not still is the one cause that says
+                    // the capture is at fault rather than the part, so it is called out by name.
+                    parallelVisionFellBack(e.getCause() == null ? e : e.getCause());
                     for (PlannedPlacement p : plannedPlacements) {
                         super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
                     }
@@ -2717,6 +2790,27 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
 
             Logger.info("Job finished {} parts in {} sec. This is {} CPH", totalPartsPlaced,
                     df.format(dtSec), df.format(totalPartsPlaced / (dtSec / 3600.0)));
+
+            // The parallel vision tally, whatever it says. A job that placed every part is not the
+            // same statement as a job that placed every part by the new route: if the route gave up
+            // on every alignment then the machine ran the old way and the timings of this job mean
+            // nothing to the new one. Said once per job because it is said too quietly per
+            // alignment to be noticed among the thousands of lines of a real job.
+            long parallelAttemptsCount = parallelAttempts.get();
+            if (parallelAttemptsCount > 0) {
+                long fellBack = parallelFallbacks.get();
+                String tally = String.format(
+                        "[PARALLEL-VISION] attempts=%d fell back=%d frames refused=%d",
+                        parallelAttemptsCount, fellBack, parallelFramesRefused.get());
+                if (fellBack > 0) {
+                    Logger.warn(tally+" : the parallel path did not carry this job"
+                            +(parallelFramesRefused.get() > 0
+                                    ? " because frames were not proven still" : ""));
+                }
+                else {
+                    Logger.info(tally);
+                }
+            }
 
             try {
                 HashMap<String, Object> params = new HashMap<>();

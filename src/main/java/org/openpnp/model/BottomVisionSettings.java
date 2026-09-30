@@ -33,6 +33,21 @@ public class BottomVisionSettings extends AbstractVisionSettings {
     @Attribute(required = false)
     protected PreCheckAction preCheckAction = PreCheckAction.Report;
 
+    /**
+     * Write the captured frames, and the provenance they carry, to disk. Off by default: encoding a
+     * frame costs tens of milliseconds, which is the same order as the settling it is there to
+     * observe, so it is a way of collecting evidence for analysis afterwards and not something to
+     * leave on while timings are being taken. See org.openpnp.vision.FrameDump.
+     */
+    @Attribute(required = false)
+    protected boolean frameDumpEnabled = false;
+
+    /**
+     * Where the frames go. Empty means a directory of the configuration.
+     */
+    @Attribute(required = false)
+    protected String frameDumpDirectory = "";
+
     @Attribute(required = false)
     protected boolean asymmetric = false;
 
@@ -116,6 +131,26 @@ public class BottomVisionSettings extends AbstractVisionSettings {
         Object oldValue = this.preCheckAction;
         this.preCheckAction = preCheckAction;
         firePropertyChange("preCheckAction", oldValue, preCheckAction);
+    }
+
+    public boolean isFrameDumpEnabled() {
+        return frameDumpEnabled;
+    }
+
+    public void setFrameDumpEnabled(boolean frameDumpEnabled) {
+        Object oldValue = this.frameDumpEnabled;
+        this.frameDumpEnabled = frameDumpEnabled;
+        firePropertyChange("frameDumpEnabled", oldValue, this.frameDumpEnabled);
+    }
+
+    public String getFrameDumpDirectory() {
+        return frameDumpDirectory;
+    }
+
+    public void setFrameDumpDirectory(String frameDumpDirectory) {
+        Object oldValue = this.frameDumpDirectory;
+        this.frameDumpDirectory = frameDumpDirectory == null ? "" : frameDumpDirectory;
+        firePropertyChange("frameDumpDirectory", oldValue, this.frameDumpDirectory);
     }
 
     public boolean isAsymmetric() {

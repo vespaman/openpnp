@@ -29,9 +29,15 @@ public class PreCapturedPlacement extends CapturedShot {
      */
     private volatile PreCheckResult preCheckResult;
     
+    /**
+     * A shot taken for the parallel path has to say where it came from, so the provenance is not
+     * optional: a frame that cannot show that the head was still is not a pre-captured placement, it
+     * is a photograph. Callers that genuinely have nothing to say must say so with
+     * {@link FrameProvenance#unknown()}, which the alignment will then refuse.
+     */
     public PreCapturedPlacement(Camera camera, Nozzle nozzle, Mat image, Location shotLocation,
-                                Location intendedDisplacementDelta) {
-        super(camera, nozzle, image, shotLocation);
+                                Location intendedDisplacementDelta, FrameProvenance provenance) {
+        super(camera, nozzle, image, shotLocation, provenance);
         this.intendedDisplacementDelta = intendedDisplacementDelta;
     }
     

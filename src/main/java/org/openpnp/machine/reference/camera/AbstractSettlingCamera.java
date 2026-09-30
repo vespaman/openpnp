@@ -42,6 +42,7 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.openpnp.gui.MainFrame;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.FrameProvenance;
 import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.spi.base.AbstractCamera;
 import org.openpnp.util.NanosecondTime;
@@ -238,6 +239,37 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
     private volatile double recordedFirstCaptureMilliseconds;
     private volatile double recordedFirstFrameMilliseconds;
     private volatile int recordedFrameCount;
+    /**
+     * How the last settling ended, and when its frames were taken. What a settling decided is worth
+     * more than the picture it ended with: a frame that came out of two frames which agreed is proof
+     * the mechanics had stopped, a frame that came out of a timeout is the opposite. The pre-check and
+     * the parallel alignment ask these questions of the camera while it is still settling, hence
+     * volatile. See org.openpnp.model.FrameProvenance.
+     */
+    public enum SettleResult {
+        /**
+         * Nothing settled, e.g. the settling was skipped. The frame says nothing about stillness.
+         */
+        NotSettled,
+        /**
+         * The settling was a configured wait, not a measurement. The frame is as still as the
+         * configured wait says it is; there is no window to place anything inside.
+         */
+        FixedTime,
+        /**
+         * Two frames in a row were alike, so the mechanics had stopped by the earlier of them.
+         */
+        Agreed,
+        /**
+         * The settling gave up. Nothing was demonstrated, least of all that the head stood still.
+         */
+        TimedOut
+    }
+
+    private volatile SettleResult recordedSettleResult = SettleResult.NotSettled;
+    private volatile long recordedSettledFrameAtMs = FrameProvenance.UNKNOWN;
+    private volatile long recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+    private volatile long recordedPreviousFrameAtMs = FrameProvenance.UNKNOWN;
 
     private SimpleGraph startDiagnostics() {
         if (settleDiagnostics) {
@@ -299,6 +331,12 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 long t1 = NanosecondTime.getRuntimeMilliseconds();
                 recordedFrameCount++;
                 final boolean firstFrame = (lastSettleMat == null);
+                // The frame this one will be compared against, i.e. the one taken just before it. When
+                // the two turn out to agree, this is the moment from which the head can be said to have
+                // been still, and it is the moment any other camera's frame has to be later than to be
+                // inside the same stillness.
+                final long previousFrameAtMs = recordedPreviousFrameAtMs;
+                recordedPreviousFrameAtMs = t1;
                 if (firstFrame) {
                     // What the pre-check is judged against, so what it costs has to be known too.
                     recordedFirstCaptureMilliseconds = t1 - tCapture0;
@@ -440,6 +478,14 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 }
                 if (t > timeout || debounceCount > settleDebounce) {
                     // Timeout or debounced settleThreshold reached.
+                    // Say which it was, and from when the head can be called still: the frame handed
+                    // back means two different things depending on how we got here, and the difference
+                    // is the difference between a measurement and a shrug.
+                    boolean agreed = debounceCount > settleDebounce;
+                    recordedSettleResult = agreed ? SettleResult.Agreed : SettleResult.TimedOut;
+                    recordedSettledFrameAtMs = t1;
+                    recordedStillWindowStartAtMs = agreed ? previousFrameAtMs
+                            : FrameProvenance.UNKNOWN;
                     // Cleanup.
                     lastSettleMat.release();
                     lastSettleMat = null;
@@ -707,6 +753,10 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         recordedFirstFrameMilliseconds = 0.0;
         recordedSettleMilliseconds = 0;
         recordedFrameCount = 0;
+        recordedSettleResult = SettleResult.NotSettled;
+        recordedSettledFrameAtMs = FrameProvenance.UNKNOWN;
+        recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+        recordedPreviousFrameAtMs = FrameProvenance.UNKNOWN;
         long tStart = NanosecondTime.getRuntimeMilliseconds();
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
@@ -746,6 +796,12 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
                 recordedFrameCount = 1;
                 recordedSettleMilliseconds = (long) recordedFirstCaptureMilliseconds;
+                // A configured wait, not a measurement. Nothing was demonstrated about the mechanics,
+                // so there is no still window that another camera's frame could be placed inside; the
+                // frame is nevertheless the frame this machine's settings asked for.
+                recordedSettleResult = SettleResult.FixedTime;
+                recordedSettledFrameAtMs = NanosecondTime.getRuntimeMilliseconds();
+                recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
                 if (firstFrameConsumer != null) {
                     // There is only this one frame, so it is also the first one.
                     Mat mat = OpenCvUtils.toMat(image);
@@ -891,6 +947,33 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
     public long getRecordedSettleMilliseconds() {
         return recordedSettleMilliseconds;
+    }
+
+    /**
+     * How the settling that produced the last frame ended. A frame from a settling that timed out is
+     * not a settled frame, however many milliseconds it waited.
+     */
+    public SettleResult getRecordedSettleResult() {
+        return recordedSettleResult;
+    }
+
+    /**
+     * When the frame that ended the last settling was captured, on the
+     * {@link org.openpnp.util.NanosecondTime} millisecond scale, or
+     * {@link FrameProvenance#UNKNOWN} if nothing has settled yet.
+     */
+    public long getRecordedSettledFrameAtMs() {
+        return recordedSettledFrameAtMs;
+    }
+
+    /**
+     * From when the head may be called still, i.e. the capture time of the earlier of the two frames
+     * that the settling found alike. Another camera's frame is inside the same stillness when it was
+     * captured at or after this time. {@link FrameProvenance#UNKNOWN} when nothing was demonstrated,
+     * which is every settling that timed out and every settling that was a configured wait.
+     */
+    public long getRecordedStillWindowStartAtMs() {
+        return recordedStillWindowStartAtMs;
     }
 
     public SimpleGraph getSettleGraph() {
