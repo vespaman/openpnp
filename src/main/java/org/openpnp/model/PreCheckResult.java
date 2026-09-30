@@ -66,6 +66,22 @@ public class PreCheckResult {
     private volatile double checkMs = -1.0;
 
     /**
+     * What the check itself is made of. A check that is too slow is only fixable if one knows which
+     * of its parts is: waiting for a thread of the vision executor to become free, preparing the
+     * pipeline, and running it, are three different problems.
+     */
+    private volatile double cloneMs = -1.0;
+    private volatile double queueMs = -1.0;
+    private volatile double prepMs = -1.0;
+    private volatile double processMs = -1.0;
+
+    /**
+     * How many frames the settling took, so that a log line can be read without the camera's
+     * configuration: a verdict that arrives inside a two frame settling has nothing left to race.
+     */
+    private volatile int frameCount = -1;
+
+    /**
      * Whether the one log line of this check has been written. Whoever wins this writes it, which
      * is how one line per shot is guaranteed without anybody waiting: if the check has finished by
      * the time the settling has, the capture thread writes the line with all the numbers in it, and
@@ -73,10 +89,6 @@ public class PreCheckResult {
      */
     private final AtomicBoolean lineWritten = new AtomicBoolean(false);
 
-    /**
-     * The time from the start of the settling to the first frame being in hand. Set by the capture
-     * thread, which is the only one that can know it.
-     */
     /**
      * @return true if the caller has the right to write the log line, i.e. nobody else has.
      */
@@ -88,6 +100,10 @@ public class PreCheckResult {
         return lineWritten.get();
     }
 
+    /**
+     * The time from the start of the settling to the first frame being in hand. Set by the capture
+     * thread, which is the only one that can know it.
+     */
     public void setCaptureMs(double captureMs) {
         this.captureMs = captureMs;
     }
@@ -99,8 +115,36 @@ public class PreCheckResult {
         this.settleMs = settleMs;
     }
 
+    /**
+     * The whole latency of the check, from the frame arriving to the verdict being in, i.e. the sum
+     * of clone, queue, prep, process and judge. This is the number the settling is racing against.
+     */
     public void setCheckMs(double checkMs) {
         this.checkMs = checkMs;
+    }
+
+    /**
+     * What keeping the frame cost the settling thread, i.e. the one part of the pre-check that is not
+     * concurrent with the settling at all but happens on the settling thread itself.
+     */
+    public void setCloneMs(double cloneMs) {
+        this.cloneMs = cloneMs;
+    }
+
+    public void setQueueMs(double queueMs) {
+        this.queueMs = queueMs;
+    }
+
+    public void setPrepMs(double prepMs) {
+        this.prepMs = prepMs;
+    }
+
+    public void setProcessMs(double processMs) {
+        this.processMs = processMs;
+    }
+
+    public void setFrameCount(int frameCount) {
+        this.frameCount = frameCount;
     }
 
     public void setMeasuredSize(double width, double height) {
@@ -173,6 +217,35 @@ public class PreCheckResult {
         return checkMs;
     }
 
+    public double getCloneMs() {
+        return cloneMs;
+    }
+
+    public double getQueueMs() {
+        return queueMs;
+    }
+
+    public double getPrepMs() {
+        return prepMs;
+    }
+
+    public double getProcessMs() {
+        return processMs;
+    }
+
+    /**
+     * @return what the check spent on reading the result and reaching a verdict, i.e. everything the
+     *         three measured parts are not.
+     */
+    public double getJudgeMs() {
+        return checkMs < 0.0 || cloneMs < 0.0 || queueMs < 0.0 || prepMs < 0.0 || processMs < 0.0 
+                ? -1.0 : checkMs - cloneMs - queueMs - prepMs - processMs;
+    }
+
+    public int getFrameCount() {
+        return frameCount;
+    }
+
     @Override
     public String toString() {
         return "PreCheckResult{" +
@@ -184,6 +257,9 @@ public class PreCheckResult {
                 ", capture=" + captureMs + " ms" +
                 ", settle=" + settleMs + " ms" +
                 ", check=" + checkMs + " ms" +
+                " (clone " + cloneMs + ", queue " + queueMs + ", prep " + prepMs
+                + ", process " + processMs + ")" +
+                ", frames=" + frameCount +
                 (message.isEmpty() ? "" : ", message=" + message) +
                 '}';
     }

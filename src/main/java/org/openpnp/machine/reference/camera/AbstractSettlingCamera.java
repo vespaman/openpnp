@@ -231,9 +231,13 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
     private SimpleGraph settleGraph = null;
     private int recordedMaskDiameter;
     private double recordedComputeMilliseconds;
-    private long recordedSettleMilliseconds;
-    private double recordedFirstCaptureMilliseconds;
-    private double recordedFirstFrameMilliseconds;
+    // Read by the pre-check, which runs on another thread while the settling is still going on, so
+    // these are volatile: they are written once per frame and read once per check, and the answer is
+    // either a millisecond stale or the one the settling ended with.
+    private volatile long recordedSettleMilliseconds;
+    private volatile double recordedFirstCaptureMilliseconds;
+    private volatile double recordedFirstFrameMilliseconds;
+    private volatile int recordedFrameCount;
 
     private SimpleGraph startDiagnostics() {
         if (settleDiagnostics) {
@@ -293,6 +297,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 BufferedImage image = capture();
 
                 long t1 = NanosecondTime.getRuntimeMilliseconds();
+                recordedFrameCount++;
                 final boolean firstFrame = (lastSettleMat == null);
                 if (firstFrame) {
                     // What the pre-check is judged against, so what it costs has to be known too.
@@ -701,12 +706,14 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         recordedFirstCaptureMilliseconds = 0.0;
         recordedFirstFrameMilliseconds = 0.0;
         recordedSettleMilliseconds = 0;
+        recordedFrameCount = 0;
         long tStart = NanosecondTime.getRuntimeMilliseconds();
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
             BufferedImage image = capture();
             recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
             recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
+            recordedFrameCount = 1;
             if (firstFrameConsumer != null) {
                 Mat mat = OpenCvUtils.toMat(image);
                 acceptFirstFrame(firstFrameConsumer, mat);
@@ -737,6 +744,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 BufferedImage image = capture();
                 recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
                 recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
+                recordedFrameCount = 1;
                 recordedSettleMilliseconds = (long) recordedFirstCaptureMilliseconds;
                 if (firstFrameConsumer != null) {
                     // There is only this one frame, so it is also the first one.
@@ -868,6 +876,15 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      * The time from the start of the last settling to that first frame being in hand, in ms, i.e.
      * including the wait for stillstand.
      */
+    /**
+     * @return how many frames the last settling took, 0 when nothing was captured. The pre-check
+     *         logs it, because a check that races the settling wants to know over how many frames
+     *         the race is.
+     */
+    public int getRecordedFrameCount() {
+        return recordedFrameCount;
+    }
+
     public double getRecordedFirstFrameMilliseconds() {
         return recordedFirstFrameMilliseconds;
     }

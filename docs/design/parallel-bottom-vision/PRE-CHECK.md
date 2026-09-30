@@ -177,8 +177,22 @@ The rule the April attempt broke: **capture, settle and pipeline are three numbe
 (`PRE-CHECK-ASSESSMENT.md` §4). One line per shot, debug gated like the rest of the diagnostics, next
 to the existing `[ALIGN-TIMING]` line:
 
-    [PRE-CHECK] nozzle=N1 camera=Upp1 part=C0402-22p/50V frame=1 capture=4.1 settle=38.2 check=3.0
-      size=0.41x0.20 expected=0.40x0.20 rot=11.4 offset=0.32 verdict=ok action=report
+    [PRE-CHECK] nozzle=N1 camera=Upp1 part=C0402-22p/50V frame=1/2 capture=16.0 settle=28.0
+      check=23.0 clone=0.5 queue=1.2 prep=4.0 pipe=16.0 judge=1.3 size=0.41x0.20 expected=0.40x0.20
+      rot=11.4 offset=0.32 verdict=Ok action=Report
+
+`frame=1/2` is the first of the two frames the settling took. `check` is the whole latency of the
+check, from the frame arriving to the verdict being in, and it is therefore the number that races
+`settle`; the five behind it are what it is made of, and they are separate because they are fixed
+separately:
+
+| part | on which thread | what it is |
+|---|---|---|
+| `clone` | the settling thread | keeping the frame. The **only** part of the pre-check the settling pays for directly: everything else runs beside it. |
+| `queue` | waiting | the time until a thread of the vision executor picked the task up. Non-zero means the pool is busy, which on a two nozzle head means the other nozzle's alignment. |
+| `prep` | the vision thread | cloning the pipeline of the vision settings and assigning its parameters, which `getThreadLocalPipeline()` and `preparePipeline()` do for the alignment too. |
+| `pipe` | the vision thread | OpenCV. |
+| `judge` | the vision thread | reading the result out and reaching the verdict. |
 
 `align_table.py` grows a pre-check column so that a run can be read as one line per shot as it already
 is for the alignment.
@@ -494,6 +508,60 @@ whether warm vision has *always* been this fast or whether the finalizer removal
 before this one contains a second job. A pre-fix build run twice on the machine would answer it; it is not
 worth reverting the fix to find out, but it should be kept in mind the next time a cold-start number is quoted
 as a steady-state one.
+
+### log_g: the first run on the machine, and the window is much smaller than §2 assumed
+
+One cold job of the 8 part test job, build `2.7_2026-09-30_09-38-57.b4c70a4`, reported at 1720.8 CPH
+against log_f's 2476.6. That headline is not the pre-check:
+
+    11:41:59.253 AbstractHead TRACE: H1 dwell for pump on, keep running 5000ms
+    11:42:04.253 ReferenceActuator DEBUG: AVAC2.actuate(true)
+
+five seconds of vacuum pump spin-up at the first pick, which log_f does not contain because its pump
+was already running. Take it out and the job is 11.7 s against log_f's cold 11.6 s, and the cadence of
+the alignment steps is unchanged: 2.034/1.957/1.898 s against log_f's cold 2.019/1.931/1.887 s.
+
+**Only one nozzle per step is pre-checked, and that is the whole design.** The machine has two bottom
+cameras and `ParallelAlign` settles one of them and quick-captures the other
+(`ReferencePnpJobProcessor.java:2163` calls `captureImageOnly()`, which never enters the settling
+code). Eight parts, four steps, four pre-checks, all on N1/Upp1. There is nothing missing from N2: a
+camera that does not settle has no early frame, so a pre-check on it would start exactly as late as the
+alignment does and buy nothing.
+
+The four lines:
+
+    capture=16.0 settle=28.0 check=23.0 size=0.99x0.53 expected=1.00x0.50 rot=-0.0  offset=0.16 verdict=Ok
+    capture=13.0 settle=29.0 check=28.0 size=0.96x0.51 expected=1.00x0.50 rot=-0.0  offset=0.09 verdict=Ok
+    capture= 8.0 settle=44.0 check=41.0 size=1.01x0.50 expected=1.00x0.50 rot=-4.4  offset=0.08 verdict=Ok
+    capture=10.0 settle=40.0 check=20.0 size=0.99x0.51 expected=1.00x0.50 rot=-2.2  offset=0.21 verdict=Ok
+
+Two things follow, one good and one not.
+
+**Good: the measurement is trustworthy on a moving frame.** An 0402 read as 0.96-1.01 x 0.50-0.53 mm
+against a nominal 1.00 x 0.50 mm is inside a pixel, so presence and size can be judged from the first
+frame. The offsets of 0.08-0.21 mm are the thing §3 needed and had no data for: how far the part
+actually sits from where the settling will leave it. Any future tolerance on position has to start
+around 0.25 mm, and it is the *first* frame that is displaced, not the check that is wrong.
+
+**Not: the race is far closer than §2 supposed.** The bottom vision settling is two frames, and the
+time between the first frame arriving and the settling ending is 28-44 ms (the camera's own
+`autoSettleAndCapture in N ms` agrees: 44, 42, 52, 50, of which the first capture is 16, 13, 8, 10).
+The check needs 20-41 ms. All four verdicts were in before the settling ended - there is no
+`[PRE-CHECK-LATE]` line in the log - but with margins of 5, 1, 3 and 20 ms. §2 worked from a 40 ms
+window and the bench's 3 ms check; the machine has a 30 ms window and a check the size of the
+alignment itself (`[ALIGN-TIMING] process` on the same pipeline: 3.1-6.4 ms once warm, 32.8 ms on the
+first step).
+
+Whether the settling itself is being slowed by the check is the question the run cannot answer:
+log_g has one cold job and log_f's cold job is not a clean control for it. Comparing the bottom vision
+settles of the two logs, 31/35/35/36/37/37/39/40/42/55/56/62 ms in log_f against 42/44/50/52 ms in
+log_g, suggests a few milliseconds, and the settling's own per-frame `compute time` is 12, 12, 6, 5, 6,
+5 in log_g against 6, 6, 5, 4, 5, 5 in log_f, which suggests the same - but both are cold-versus-warm
+comparisons and could easily be nothing. So the log line was instrumented into its five parts (§6)
+before anything is optimised, because a check that is too slow is only fixable once it is known which
+part of it is: on the simulated machine the split is `clone 1, queue 0, prep 5, pipe 25`, i.e. OpenCV
+and nothing else, which if it holds on the machine rules out the queue and the clone as suspects and
+leaves only a cheaper pipeline or a wider window.
 
 ## 8. Order of work
 

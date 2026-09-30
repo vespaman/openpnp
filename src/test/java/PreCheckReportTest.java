@@ -114,6 +114,14 @@ public class PreCheckReportTest {
         assert result.getCheckMs() > 0.0 : "the check itself was not timed: "+result;
         assert result.getCaptureMs() >= 0.0 : "the capture was not timed: "+result;
         assert result.getSettleMs() >= 0.0 : "the settling was not timed: "+result;
+        assert result.getFrameCount() >= 1 : "the number of settling frames was not recorded: "+result;
+        // Where the check spent its time. A check that is too slow is only fixable if one knows
+        // which of its four parts is, so all four have to survive to the log.
+        assert result.getCloneMs() >= 0.0 : "keeping the frame was not timed: "+result;
+        assert result.getQueueMs() >= 0.0 : "the wait for the vision executor was not timed: "+result;
+        assert result.getPrepMs() >= 0.0 : "preparing the pipeline was not timed: "+result;
+        assert result.getProcessMs() > 0.0 : "running the pipeline was not timed: "+result;
+        assert result.getJudgeMs() >= 0.0 : "the check does not add up: "+result;
         System.out.println("[TEST] pre-check on a part that is there: "+result);
     }
 
