@@ -264,3 +264,45 @@ camera handing back the same frame twice — and it ends by timeout. So the test
 uses a fixed-time settling, and the one that expects refusal uses the measuring settling. On the real
 machine the sensor noise makes the agreement happen; the `log_j` settle times of 37–85 ms against a
 500 ms timeout are the evidence for that.
+
+## 9. Measured after step 1 (`log_l.txt`, `log_m.txt`)
+
+`pn52`, the same 8-placement job, build `a863918` (step 1) against `log_j.txt` (before step 1).
+
+| quantity | before (`log_j`) | `log_l` | `log_m` |
+|---|---|---|---|
+| first job of the session | 16.3 s | 17.9 s | 16.1 s |
+| later jobs | 10.4 / 10.9 s | — | 11.1 s |
+| attempts / fell back / frames refused | 12 / 3 / not counted | 4 / 4 / 4 | 4 / 4 / 4 per job |
+| alignment step per batch | 274-373 ms when it worked | 581-650 ms | 355-456 ms |
+| pipeline tail per batch | 8-20 ms when it worked, 218-403 ms when it fell back | 262-308 ms | 81-112 ms |
+
+The refused frames are now dated, which is what the run was for. Their age after the head is
+demonstrably at rest, eight refusals over two jobs: **12, 12, 13, 13, 13, 14, 19, 20 ms**.
+
+The settling they were refused against: agreement after **3 to 5 frames**, i.e. **25-53 ms** after
+the rest, at one frame per **8-17 ms**. The still window opens roughly **16-45 ms** after the rest,
+so the refused frame was some 0 to 30 ms too early. The head stands over the cameras for about
+330 ms, so there are several frames inside the window to choose from; nothing about the timing argues
+against R3.
+
+Three things this settled:
+
+- **The guard is cheap.** A batch that falls back costs about 80-140 ms more than one that does not,
+  and the warm job is 11.1 s against 10.4-10.9 s before. The spread between sessions (16.1, 16.3 and
+  17.9 s for a first job) is larger than the cost of this change, so the first job of a session is not
+  a measurement.
+- **The camera that settles is not a fixed one.** `log_l` refused Upp2/N2, `log_m` refused Upp1/N1:
+  `settleCamera` is taken from the first placement of the batch, so the camera doing the
+  capture-without-settling alternates. R3 has to hold for both, and there is no "the slow camera" to
+  optimise once.
+- **The two `SizeOut` verdicts are not about size.** Measured `0.47 x 0.97` and `0.48 x 0.99` against a
+  nominal `1.00 x 0.50`, at `rot=-0.0`, is the right part with its axes transposed: the symmetry
+  detection took the other pair of axes. Add it to §4 as a second candidate, checkable on the replay
+  rig, and it says something R5 should say explicitly: the size has to be judged on the axes of the
+  part's footprint, not on whatever order the rectangle comes back in.
+
+The arrival instant itself needed a fix to be measurable at all: `preCaptureAllImages()` never passed
+it, so every frame in `log_l` reads `quickcapture f1` with no age. It is now recorded in
+`moveNozzlesToAlignmentPosition()` after `WaitForStillstand` and passed to all three pre-captures,
+which is what produced the ages above.

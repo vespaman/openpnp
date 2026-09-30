@@ -55,6 +55,7 @@ import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.CapturedShot;
 import org.openpnp.model.FrameNotStillException;
+import org.openpnp.model.FrameProvenance;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.ImageBuffer;
 import org.openpnp.model.Job;
@@ -86,6 +87,7 @@ import org.openpnp.spi.base.AbstractJobProcessor;
 import org.openpnp.spi.base.AbstractPnpJobProcessor;
 import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.util.MovableUtils;
+import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.TravelCost;
 import org.openpnp.util.TravellingSalesman;
 import org.openpnp.util.UiUtils;
@@ -1882,6 +1884,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      * Nozzle 2 is automatically over Camera 2.
      */
     protected class ParallelAlign extends Align {
+        /**
+         * The instant the head came to rest over the cameras for this batch. Every frame captured for
+         * the batch is dated against it: how old a frame is after this instant is the only thing that
+         * can say whether the motion had finished ringing while the camera integrated it. Without it a
+         * frame cannot be placed in time at all, which the pre-check already wants and step 2 selects
+         * the streamed frames by.
+         */
+        private long arrivedAtMs = FrameProvenance.UNKNOWN;
+
         public ParallelAlign(List<PlannedPlacement> plannedPlacements) {
             super(plannedPlacements);
         }
@@ -2042,9 +2053,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
 
                 // Wait for the head to physically arrive at the camera position before capturing images
                 nozzle.waitForCompletion(org.openpnp.spi.MotionPlanner.CompletionType.WaitForStillstand);
-                
-                Logger.debug("Head moved to alignment position for nozzle {}, camera {}", 
-                    nozzle.getId(), camera.getId());
+
+                // Everything captured from here on belongs to this batch and is dated from here. This
+                // is the instant the motion planner says nothing moves any more, not the instant the
+                // last move command was sent: an age measured from the sending would be a few hundred
+                // milliseconds of optimistic lying about the one quantity the whole design rests on.
+                arrivedAtMs = NanosecondTime.getRuntimeMilliseconds();
+
+                Logger.debug("Head moved to alignment position for nozzle {}, camera {}, at rest {} ms",
+                    nozzle.getId(), camera.getId(), arrivedAtMs);
             }
             catch (Exception e) {
                 throw new JobProcessorException(placements.get(0).jobPlacement.getPlacement(), 
@@ -2234,7 +2251,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                     Logger.trace("Async capture started for camera {}, part {}", 
                                         cam.getName(), prt.getId());
                                     PreCapturedPlacement shot = 
-                                        bv.captureImageOnly(prt, cam, noz, loc, firstTip);
+                                        bv.captureImageOnly(prt, cam, noz, loc, firstTip, arrivedAtMs);
                                     Logger.trace("Async capture completed for camera {}, part {}", 
                                         cam.getName(), prt.getId());
                                     return shot;
@@ -2272,7 +2289,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                 boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
                                 PreCapturedPlacement shot = 
                                     ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                    .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip);
+                                    .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                                            arrivedAtMs);
                                 imageBuffer.addShot(nozzle, shot);
                                 
                                 // Capture remaining placements on the settle camera (single-shot only)
@@ -2290,7 +2308,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                         boolean isFirstNozzleTip2 = nozzle.equals(firstNozzleTip);
                                         PreCapturedPlacement shot2 = 
                                             ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                            .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip2);
+                                            .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip2,
+                                            arrivedAtMs);
                                         imageBuffer.addShot(nozzle, shot2);
                                     }
                                 }

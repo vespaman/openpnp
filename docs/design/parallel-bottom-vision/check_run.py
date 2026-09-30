@@ -29,7 +29,11 @@ FINISHED = re.compile(r'Job finished. (?:It took )?([\d.]+) seconds?|Processed \
 PATTERNS = [
     ("parallel alignment used", "Using parallel alignment", "one per aligned batch"),
     ("sequential alignment used", "Using sequential alignment", "0 with 2 cameras and the switch on"),
-    ("parallel fell back", "Parallel alignment failed", "0"),
+    ("parallel fell back", "Parallel alignment fell back", "0, but step 1 expects one per placement"),
+    ("frame refused as not still", "the frame is not a still frame", "0, but step 1 expects every "
+     "quick-captured frame of the second camera"),
+    ("parallel vision tally", "[PARALLEL-VISION]", "one line per job, printed at Finish"),
+    ("frame dump written", "[FRAME-DUMP]", "0 unless frameDumpEnabled is on"),
     ("displacement (parallel)", "displacement (parallel)", "displacement runs only"),
     ("displacement (sequential)", "displacement (sequential)", "displacement runs only"),
     ("nozzle not at shot location", "nozzle not moved to the shot location", "displacement runs"),
