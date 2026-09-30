@@ -1533,8 +1533,23 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
             
             // Capture the image (no settling needed - head is already stationary)
+            long tCapture = NanosecondTime.getRuntimeMilliseconds();
             BufferedImage capturedBufferedImage = camera.capture();
             Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+            double captureMs = NanosecondTime.getRuntimeMilliseconds() - tCapture;
+
+            // The pre-check for a camera that does not settle. Its single frame is the frame the
+            // alignment analyses, so this check cannot buy an earlier frame; what it buys is that a
+            // verdict exists at all. Without it the second nozzle would have no verdict when the head
+            // departs, and a safety net with a hole in it is not a safety net.
+            PreCheckResult preCheckResult = null;
+            if (bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
+                    && shots.size() == 1) {
+                preCheckResult = new PreCheckResult();
+                preCheckResult.setFrameCount(1);
+                startPreCheck(capturedImage, preCheckResult, part, camera, nozzle, wantedLocation,
+                        bottomVisionSettings, captureMs);
+            }
             
             // Turn off light or register with batch operation (if active)
             try {
@@ -1545,8 +1560,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             }
             
             // Create a PreCapturedPlacement with the captured image and displacement delta
-            return new PreCapturedPlacement(
+            PreCapturedPlacement capturedShot = new PreCapturedPlacement(
                     camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+            capturedShot.setPreCheckResult(preCheckResult);
+            return capturedShot;
         }
         finally {
             // Always close the pipeline to release resources
@@ -1651,9 +1668,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 if (bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
                         && shots.size() == 1) {
                     preCheckResult = new PreCheckResult();
+                    // Until the settling is over, the line this check belongs to will be written by
+                    // the thread that is settling, with the settling numbers in it.
+                    preCheckResult.setSettleWindowOpen(true);
                     final PreCheckResult result = preCheckResult;
                     firstFrameConsumer = mat -> startPreCheck(mat, result, part, camera, nozzle,
-                            wantedLocation, bottomVisionSettings, settlingCamera);
+                            wantedLocation, bottomVisionSettings,
+                            settlingCamera.getRecordedFirstCaptureMilliseconds());
                 }
 
                 BufferedImage capturedBufferedImage = settlingCamera.settleAndCapture(
@@ -1669,6 +1690,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     // line when it gets round to it.
                     preCheckResult.setSettleMs(settlingCamera.getRecordedSettleMilliseconds()
                             - settlingCamera.getRecordedFirstFrameMilliseconds());
+                    preCheckResult.setFrameCount(settlingCamera.getRecordedFrameCount());
+                    preCheckResult.setSettleWindowOpen(false);
                     if (preCheckResult.claimLogLine()) {
                         logPreCheck(preCheckResult, part, camera, nozzle,
                                 bottomVisionSettings.getPreCheckAction(), false);
@@ -1724,10 +1747,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      */
     protected void startPreCheck(Mat firstFrame, PreCheckResult preCheckResult, Part part,
             Camera camera, Nozzle nozzle, Location wantedLocation,
-            BottomVisionSettings bottomVisionSettings, AbstractSettlingCamera settlingCamera) {
-        // What the frame cost, while it is still known only to the camera and the settling has not
-        // finished: the camera recorded it just before handing the frame over.
-        preCheckResult.setCaptureMs(settlingCamera.getRecordedFirstCaptureMilliseconds());
+            BottomVisionSettings bottomVisionSettings, double captureMs) {
+        preCheckResult.setCaptureMs(captureMs);
         final Mat frame;
         long tClone = NanosecondTime.getRuntimeMilliseconds();
         try {
@@ -1788,7 +1809,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         long t0 = NanosecondTime.getRuntimeMilliseconds();
         result.setQueueMs(t0 - handedOverAt);
         try {
+            long tPipeline = NanosecondTime.getRuntimeMilliseconds();
             CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
+            result.setPipelineMs(NanosecondTime.getRuntimeMilliseconds() - tPipeline);
             try {
                 preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(),
                         camera, part.getPackage(), nozzle, nozzle.getNozzleTip(),
@@ -1801,7 +1824,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 }
                 shots.get(0).apply();
                 long tPrepare = NanosecondTime.getRuntimeMilliseconds();
-                result.setPrepMs(tPrepare - t0);
+                result.setPrepMs(tPrepare - t0 - result.getPipelineMs());
                 pipeline.process();
                 result.setProcessMs(NanosecondTime.getRuntimeMilliseconds() - tPrepare);
                 Result visionResult = pipeline.getResult(VisionUtils.PIPELINE_RESULTS_NAME);
@@ -1854,16 +1877,20 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
         finally {
             result.setCheckMs(NanosecondTime.getRuntimeMilliseconds() - startedAt);
-            if (camera instanceof AbstractSettlingCamera) {
+            if (result.getFrameCount() <= 0 && camera instanceof AbstractSettlingCamera) {
                 // However many frames the settling has got through by now. If it is still settling
                 // then this is the count so far and the capture thread replaces it with the final
                 // one when it writes the line; if it has finished then they are the same number.
+                // A camera that does not settle has already been told to have produced the one frame
+                // it captured, and that number is not to be overwritten by the count of a settling
+                // that never ran.
                 result.setFrameCount(((AbstractSettlingCamera) camera).getRecordedFrameCount());
             }
-            if (result.getSettleMs() >= 0.0) {
-                // The settling is over, so the capture thread has written or is about to write the
-                // one line: claim it if it can still be had, otherwise add the verdict as a late
-                // line of its own, because the line that went out could not contain it.
+            if (!result.isSettleWindowOpen()) {
+                // Either there was no settling at all, so nobody else will write this line, or the
+                // settling is over and the capture thread has written or is about to write it: claim
+                // it if it can still be had, otherwise add the verdict as a late line of its own,
+                // because the line that went out could not contain it.
                 logPreCheck(result, part, camera, nozzle, bottomVisionSettings.getPreCheckAction(),
                         !result.claimLogLine());
             }
@@ -1878,12 +1905,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             PreCheckAction action, boolean late) {
         String line = String.format(
                 "[PRE-CHECK%s] nozzle=%s camera=%s part=%s frame=1/%s capture=%.1f settle=%.1f check=%.1f"
-                        + " clone=%.1f queue=%.1f prep=%.1f pipe=%.1f judge=%.1f"
+                        + " clone=%.1f queue=%.1f pipeline=%.1f prep=%.1f pipe=%.1f judge=%.1f"
                         + " size=%.2fx%.2f expected=%.2fx%.2f rot=%.1f offset=%.2f verdict=%s action=%s",
                 late ? "-LATE" : "", nozzle.getId(), camera.getName(), part.getId(),
                 result.getFrameCount() < 0 ? "?" : String.valueOf(result.getFrameCount()),
                 result.getCaptureMs(), result.getSettleMs(), result.getCheckMs(),
-                result.getCloneMs(), result.getQueueMs(), result.getPrepMs(),
+                result.getCloneMs(), result.getQueueMs(), result.getPipelineMs(),
+                result.getPrepMs(),
                 result.getProcessMs(), result.getJudgeMs(),
                 result.getMeasuredWidth(), result.getMeasuredHeight(),
                 result.getNominalWidth(), result.getNominalHeight(),

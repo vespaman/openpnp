@@ -86,6 +86,18 @@ public class PreCheckReportTest {
         return captured[0];
     }
 
+    private PreCapturedPlacement captureWithoutSettle() throws Exception {
+        final PreCapturedPlacement[] captured = new PreCapturedPlacement[1];
+        machine.execute(() -> {
+            nozzle.pick(part, null);
+            Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
+            MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
+            captured[0] = bottomVision.captureImageOnly(part, camera, nozzle, wantedLocation, true);
+            return true;
+        });
+        return captured[0];
+    }
+
     private PreCheckResult awaitVerdict(PreCapturedPlacement shot) throws Exception {
         PreCheckResult result = shot.getPreCheckResult();
         long deadline = System.currentTimeMillis()+20000;
@@ -119,10 +131,41 @@ public class PreCheckReportTest {
         // which of its four parts is, so all four have to survive to the log.
         assert result.getCloneMs() >= 0.0 : "keeping the frame was not timed: "+result;
         assert result.getQueueMs() >= 0.0 : "the wait for the vision executor was not timed: "+result;
+        assert result.getPipelineMs() >= 0.0 : "cloning the pipeline was not timed: "+result;
         assert result.getPrepMs() >= 0.0 : "preparing the pipeline was not timed: "+result;
         assert result.getProcessMs() > 0.0 : "running the pipeline was not timed: "+result;
         assert result.getJudgeMs() >= 0.0 : "the check does not add up: "+result;
         System.out.println("[TEST] pre-check on a part that is there: "+result);
+    }
+
+    /**
+     * The camera that does not settle has one frame and no early one, so the pre-check on it cannot
+     * win a race. It is there so that every nozzle in the alignment has a verdict when the head
+     * departs, and so that the log line of the second nozzle is not silently missing.
+     */
+    @Test
+    public void testTheCameraThatDoesNotSettleIsCheckedToo() throws Exception {
+        setUp();
+
+        visionSettings.setPreCheckAction(PreCheckAction.Report);
+        visionSettings.setCheckPartSizeMethod(PartSizeCheckMethod.BodySize);
+        part.getPackage().getFootprint().setBodyWidth(2.0);
+        part.getPackage().getFootprint().setBodyHeight(1.25);
+        visionSettings.setCheckSizeTolerancePercent(50);
+
+        PreCapturedPlacement shot = captureWithoutSettle();
+
+        assert shot != null && shot.getImage() != null : "nothing was captured";
+        PreCheckResult result = awaitVerdict(shot);
+        assert result != null : "the camera that does not settle got no pre-check at all";
+        assert result.getVerdict() == Verdict.Ok
+                : "verdict should be Ok, was "+result+" ("+result.getMessage()+")";
+        assert result.getSettleMs() < 0.0 : "a camera that does not settle claims a settling: "+result;
+        assert !result.isSettleWindowOpen() : "the settling of a camera that does not settle is still open: "+result;
+        assert result.getFrameCount() == 1 : "one frame was captured, the log says "+result.getFrameCount();
+        assert result.getCaptureMs() > 0.0 : "the capture was not timed: "+result;
+        assert result.getPipelineMs() >= 0.0 : "cloning the pipeline was not timed: "+result;
+        System.out.println("[TEST] pre-check on the only frame of a camera that does not settle: "+result);
     }
 
     @Test
@@ -169,6 +212,19 @@ public class PreCheckReportTest {
         visionSettings.setPreCheckAction(PreCheckAction.Disabled);
 
         PreCapturedPlacement shot = captureWithSettle(null);
+
+        assert shot != null : "nothing was captured";
+        assert shot.getImage() != null : "the shot has no image, and the pre-check is supposed to be unrelated";
+        assert shot.getPreCheckResult() == null : "a disabled pre-check still produced "+shot.getPreCheckResult();
+    }
+
+    @Test
+    public void testDisabledPreCheckLeavesTheQuickCaptureAlone() throws Exception {
+        setUp();
+
+        visionSettings.setPreCheckAction(PreCheckAction.Disabled);
+
+        PreCapturedPlacement shot = captureWithoutSettle();
 
         assert shot != null : "nothing was captured";
         assert shot.getImage() != null : "the shot has no image, and the pre-check is supposed to be unrelated";

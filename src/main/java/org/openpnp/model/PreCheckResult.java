@@ -70,10 +70,18 @@ public class PreCheckResult {
      * of its parts is: waiting for a thread of the vision executor to become free, preparing the
      * pipeline, and running it, are three different problems.
      */
+    private volatile double pipelineMs = -1.0;
     private volatile double cloneMs = -1.0;
     private volatile double queueMs = -1.0;
     private volatile double prepMs = -1.0;
     private volatile double processMs = -1.0;
+
+    /**
+     * Whether a settling is still running whose capture thread will write the log line. True only
+     * for a camera that settles: a quick-capturing camera has no settling, so nobody is going to
+     * write a line with settling numbers in it, and the check writes its own.
+     */
+    private volatile boolean settleWindowOpen = false;
 
     /**
      * How many frames the settling took, so that a log line can be read without the camera's
@@ -131,6 +139,14 @@ public class PreCheckResult {
         this.cloneMs = cloneMs;
     }
 
+    /**
+     * The cost of having no pipeline of one's own: {@code getThreadLocalPipeline()} clones the
+     * pipeline of the vision settings, which is an XML round trip.
+     */
+    public void setPipelineMs(double pipelineMs) {
+        this.pipelineMs = pipelineMs;
+    }
+
     public void setQueueMs(double queueMs) {
         this.queueMs = queueMs;
     }
@@ -141,6 +157,19 @@ public class PreCheckResult {
 
     public void setProcessMs(double processMs) {
         this.processMs = processMs;
+    }
+
+    public void setSettleWindowOpen(boolean settleWindowOpen) {
+        this.settleWindowOpen = settleWindowOpen;
+    }
+
+    /**
+     * @return true while a settling is still running whose capture thread intends to write this
+     *         check's log line. The check keeps silent while it is true, because the line written
+     *         after the settling contains numbers the check cannot know.
+     */
+    public boolean isSettleWindowOpen() {
+        return settleWindowOpen;
     }
 
     public void setFrameCount(int frameCount) {
@@ -221,6 +250,10 @@ public class PreCheckResult {
         return cloneMs;
     }
 
+    public double getPipelineMs() {
+        return pipelineMs;
+    }
+
     public double getQueueMs() {
         return queueMs;
     }
@@ -238,8 +271,8 @@ public class PreCheckResult {
      *         three measured parts are not.
      */
     public double getJudgeMs() {
-        return checkMs < 0.0 || cloneMs < 0.0 || queueMs < 0.0 || prepMs < 0.0 || processMs < 0.0 
-                ? -1.0 : checkMs - cloneMs - queueMs - prepMs - processMs;
+        return checkMs < 0.0 || cloneMs < 0.0 || queueMs < 0.0 || pipelineMs < 0.0 || prepMs < 0.0
+                || processMs < 0.0 ? -1.0 : checkMs - cloneMs - queueMs - pipelineMs - prepMs - processMs;
     }
 
     public int getFrameCount() {
@@ -257,8 +290,8 @@ public class PreCheckResult {
                 ", capture=" + captureMs + " ms" +
                 ", settle=" + settleMs + " ms" +
                 ", check=" + checkMs + " ms" +
-                " (clone " + cloneMs + ", queue " + queueMs + ", prep " + prepMs
-                + ", process " + processMs + ")" +
+                " (clone " + cloneMs + ", queue " + queueMs + ", pipeline " + pipelineMs
+                + ", prep " + prepMs + ", process " + processMs + ")" +
                 ", frames=" + frameCount +
                 (message.isEmpty() ? "" : ", message=" + message) +
                 '}';

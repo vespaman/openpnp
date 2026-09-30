@@ -563,6 +563,63 @@ part of it is: on the simulated machine the split is `clone 1, queue 0, prep 5, 
 and nothing else, which if it holds on the machine rules out the queue and the clone as suspects and
 leaves only a cheaper pipeline or a wider window.
 
+### log_i: the check is not OpenCV, and only one nozzle was never good enough
+
+The instrumented build (§6) on the machine, `tests_2026-09-28/log_i.txt`, two and a half jobs (the
+third ran out of components). Cold 16.6 s including the pump dwell again, warm 10.5 s at 2733 CPH,
+which is log_f's warm figure: the check costs the job nothing measurable.
+
+The five parts, warm, in ms:
+
+    clone 0-1   queue 0-2   prep 6-20   pipe 3-9   judge 0-6
+
+**OpenCV is not the cost.** `pipe` is 3-9 ms, the same as `[ALIGN-TIMING] process` on the same
+pipeline, so the maths is as cheap as the alignment's. What is not cheap is `prep`, at 6-20 ms, which
+on the simulated machine had been 0-1 ms once warm. `prep` as then measured was
+`getThreadLocalPipeline() + preparePipeline() + setPreCapturedShot() + apply()`, and the alignment's
+own `[ALIGN-TIMING] prepare` covers only `preparePipeline()` - 0.2-0.3 ms warm - so the difference was
+invisible. The line is now split again and reports `pipeline=` separately from `prep=`.
+
+The suspect is `CvPipeline.cloneWithoutReset()`, which clones by
+`new CvPipeline(toXmlStringWithoutReset())`: a serialise and parse round trip of the whole pipeline
+every time a thread needs one. The measurement on the simulated machine is 3-7 ms for the default
+pipeline, and the alignment pays the same price - it just pays it in `align()`, outside its own
+`prepare` measurement, which is why an alignment that reports 4 ms of process takes 7-11 ms of wall
+clock after the settling. Whether the machine's 6-20 ms is clone plus contention or clone plus
+something else, log_j will say.
+
+**The claim in the previous section that only one nozzle is pre-checked "and that is the whole design"
+was wrong.** It was right about time - a camera that does not settle has no early frame, so a check on
+it starts as late as its alignment does - and wrong as a design, because the point of the verdict is
+not only to win a race:
+
+- With one nozzle per step there is no verdict for the second nozzle at any moment, so the safety net
+  that the later levels of §5 depend on has a hole in it as big as half the head.
+- Early departure (§8 step 6) can only be considered when *every* nozzle in the step has been looked
+  at. One verdict per step is not a third of the way there, it is nowhere there.
+- The quick-captured frame is the frame that the alignment will analyse anyway, so checking it early
+  is not a second opinion on a worse frame; it is the same analysis, started during a window in which
+  the head is standing over the cameras and the vision executor is otherwise idle.
+
+`captureImageOnly()` now starts the same check on the frame it has just taken, on the pool thread that
+took it (`CompletableFuture.supplyAsync`, deliberately not the vision executor), and attaches the
+result to the `PreCapturedPlacement`. Its line says `frame=1/1` and `settle=-`, because there is no
+settling to compare it with; the check writes that line itself, which it may now do because a
+`PreCheckResult` knows whether a settling is still open (`settleWindowOpen`) and therefore whether some
+other thread is going to write the line. Six tests, three hundred and four green.
+
+What log_j has to answer, in this order:
+
+1. Are there eight pre-check lines per job rather than four, one per nozzle per step, and are both
+   verdicts in before the head leaves the cameras?
+2. Does `queue` grow? The vision executor is one thread, so the two checks of a step run one after the
+   other, and the second one's verdict is at best the sum of both. If `queue` becomes the big number
+   then the executor has to become two threads, or the quick nozzle's check has to become the
+   alignment of the quick nozzle (§8 step 5) instead of an extra pass over the same frame.
+3. Is `pipeline` the whole of `prep`? If it is, a per-thread pipeline that is reused instead of
+   re-cloned is the fix, and the thing to be careful about is the Mats a reused pipeline holds between
+   checks - which is exactly the class of bug that `bbb2cfdf59` closed.
+
 ## 8. Order of work
 
 1. ~~Bench the pre-check's cost~~ done, §7. The verdict is not the one the April attempt expected and not
