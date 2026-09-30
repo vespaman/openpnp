@@ -183,6 +183,31 @@ to the existing `[ALIGN-TIMING]` line:
 `align_table.py` grows a pre-check column so that a run can be read as one line per shot as it already
 is for the alignment.
 
+**As built.** One line per shot is guaranteed without anybody waiting, by whoever has the numbers:
+
+- The check itself never writes a line while the settling is still running. It finishes, records its
+  verdict and its own duration, and leaves; the capture thread writes the line when the settling ends
+  and by then usually has the verdict to put in it. This is the common case, and it is the reason the
+  line carries all three numbers instead of two.
+- If the check only finishes after the settling has, the line above has already gone out with
+  `verdict=Pending`, and the check adds a second line prefixed `[PRE-CHECK-LATE]` carrying the verdict
+  it could not put in the first one. `Pending` on the first line and a `-LATE` line are normal traffic,
+  not errors, which is the whole point of §2.
+
+Verdicts are `Ok`, `PartMissing`, `SizeOut`, `Inconclusive`, `Failed`, `Pending`; anything that is not a
+confident no is fail-open (§5). `Ok` is logged at debug, every other verdict at warn.
+
+Verified on the simulated machine by `PreCheckReportTest`: a part that is there (`Ok`, measured
+2.00x1.25 mm against a 2.00x1.25 mm footprint, so the millimetres are real millimetres), a part of the
+wrong size (`SizeOut`), an empty field (`PartMissing`), and `Disabled`, which leaves the shot exactly as
+it was. Nothing in the machine's behaviour depends on any of it yet.
+
+The size tolerance question of §9 is settled for now in favour of the same settings the alignment uses:
+the pre-check calls the existing `partSizeCheck()` with the part's inherited `check-size` method and
+tolerance, so there is one number to maintain and the pre-check cannot disagree with the alignment about
+what the right size is. What it does with a no is still report-only, so the risk of it being too strict
+about an unsettled frame is a log line, not a stopped job.
+
 ## 7. Measuring on the OpenPnP PC
 
 The PC that runs the machine (`pn52`, Ryzen 7 5800H, 16 threads, governor `performance`) is where the
@@ -479,8 +504,11 @@ as a steady-state one.
    is Temurin 21: `PreCheckBench` on the OpenPnP PC aborts 5 of 5 there and 0 of 5 on 11 and on 25. Decision
    to take and to validate with one real job: move the machine's runtime JVM off 21. The hunt for the cause
    continues beside that - older glibc, a Temurin 21.0.12 report, ASAN-built OpenCV if both fail.
-3. The callback and the check, `report` mode only, the three numbers in the log. Verified on the simulated
-   machine with the real cameras.
+3. ~~The callback and the check, `report` mode only, the three numbers in the log.~~ Done: the hook is in
+   `AbstractSettlingCamera.settleAndCapture(SettleOption, Consumer<Mat>)`, the check runs on the vision
+   executor against the part's own pipeline, the verdict rides on `PreCapturedPlacement`, and
+   `pre-check-action` (`BottomVisionSettings`) defaults to `Report`. `PreCheckReportTest` covers the four
+   cases of §6; the suite is 302 green. Not yet done from this step: reading it on the machine, which is step 4.
 4. One real run of the 8 part job reading the first-frame displacement, which is the number §3 needs
    before the offset can be judged and before any tolerance on it is invented.
 5. Runs A/B/D and the abort/retry checks of `MACHINE-TEST.md` - the baseline for the state machine.

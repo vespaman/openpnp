@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.function.Consumer;
 
 import org.opencv.core.Core;
 import org.opencv.core.Core.MinMaxLocResult;
@@ -231,6 +232,8 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
     private int recordedMaskDiameter;
     private double recordedComputeMilliseconds;
     private long recordedSettleMilliseconds;
+    private double recordedFirstCaptureMilliseconds;
+    private double recordedFirstFrameMilliseconds;
 
     private SimpleGraph startDiagnostics() {
         if (settleDiagnostics) {
@@ -263,7 +266,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         }
     }
 
-    private BufferedImage autoSettleAndCapture(double settleMaskCircle) throws Exception {
+    private BufferedImage autoSettleAndCapture(double settleMaskCircle, Consumer<Mat> firstFrameConsumer) throws Exception {
         Mat mask = null;
         Mat maskFullsize = null;
         Mat lastSettleMat = null;
@@ -286,9 +289,16 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 }
 
                 // The actual capture.
+                long tCapture0 = NanosecondTime.getRuntimeMilliseconds();
                 BufferedImage image = capture();
 
                 long t1 = NanosecondTime.getRuntimeMilliseconds();
+                final boolean firstFrame = (lastSettleMat == null);
+                if (firstFrame) {
+                    // What the pre-check is judged against, so what it costs has to be known too.
+                    recordedFirstCaptureMilliseconds = t1 - tCapture0;
+                    recordedFirstFrameMilliseconds = t1 - t0;
+                }
                 double tCapture = 0.0; 
                 if (settleGraph != null) {
                     tCapture = settleGraph.getT();
@@ -299,6 +309,13 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
                 // Convert to Mat and if not full color, convert to gray.
                 Mat mat = OpenCvUtils.toMat(image);
+
+                if (firstFrameConsumer != null && firstFrame) {
+                    // The very first frame, as the camera delivered it. Everything below this turns
+                    // it into the small gray thing the settling compares, so this is the only moment
+                    // a pre-check can still judge what the camera actually saw.
+                    acceptFirstFrame(firstFrameConsumer, mat);
+                }
                 if (!settleFullColor) {
                     Imgproc.cvtColor(mat, mat, Imgproc.COLOR_BGR2GRAY);
                 }
@@ -457,8 +474,20 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         }
     }
 
-    protected static Mat createMask(Mat mat, int maskDiameter) {
-        Mat mask;
+    /**
+     * Hand the first frame of a settling to its consumer, without letting the consumer break the
+     * settling.
+     */
+    protected void acceptFirstFrame(Consumer<Mat> firstFrameConsumer, Mat mat) {
+        try {
+            firstFrameConsumer.accept(mat);
+        }
+        catch (Exception e) {
+            Logger.warn(e, "Camera {} first frame consumer failed: {}", getName(), e.getMessage());
+        }
+    }
+
+    protected static Mat createMask(Mat mat, int maskDiameter) {        Mat mask;
         mask = new Mat(mat.rows(), mat.cols(), CvType.CV_8U, Scalar.all(0));
         Imgproc.circle(mask,
                 new Point(mat.cols()/2, mat.rows()/2),
@@ -644,9 +673,46 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
     @Override
     public BufferedImage settleAndCapture(SettleOption settleOption) throws Exception {
+        return settleAndCapture(settleOption, null);
+    }
+
+    /**
+     * Settle and capture, handing the very first captured frame to a consumer on the way.
+     *
+     * The frame is given to the consumer raw, i.e. before the settling has turned it grayscale,
+     * cropped, rescaled, blurred or gradient-transformed, and before it has been compared with
+     * anything. It is therefore the frame a pre-check must judge: the one that was in the camera
+     * while the mechanics were still settling.
+     *
+     * The Mat belongs to the settling loop and is released by it. A consumer that wants to keep
+     * the frame must clone() it. The consumer runs on the thread that settles, at the moment the
+     * frame arrives, so it must hand any work to somebody else and return: everything in the
+     * settling loop is timed, and a slow consumer is a slow settle. Exceptions from it are logged
+     * and otherwise ignored, because a pre-check that cannot run must not spoil the capture.
+     *
+     * @param settleOption
+     * @param firstFrameConsumer may be null
+     * @return
+     * @throws Exception
+     */
+    public BufferedImage settleAndCapture(SettleOption settleOption, Consumer<Mat> firstFrameConsumer) throws Exception {
+        // Whatever happens below, the recorded numbers are about this settling and not about the
+        // previous one.
+        recordedFirstCaptureMilliseconds = 0.0;
+        recordedFirstFrameMilliseconds = 0.0;
+        recordedSettleMilliseconds = 0;
+        long tStart = NanosecondTime.getRuntimeMilliseconds();
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
-            return capture();
+            BufferedImage image = capture();
+            recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
+            recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
+            if (firstFrameConsumer != null) {
+                Mat mat = OpenCvUtils.toMat(image);
+                acceptFirstFrame(firstFrameConsumer, mat);
+                mat.release();
+            }
+            return image;
         }
         Map<String, Object> globals = new HashMap<>();
         globals.put("camera", this);
@@ -668,10 +734,21 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 catch (Exception e) {
 
                 }
-                return capture();
+                BufferedImage image = capture();
+                recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
+                recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
+                recordedSettleMilliseconds = (long) recordedFirstCaptureMilliseconds;
+                if (firstFrameConsumer != null) {
+                    // There is only this one frame, so it is also the first one.
+                    Mat mat = OpenCvUtils.toMat(image);
+                    acceptFirstFrame(firstFrameConsumer, mat);
+                    mat.release();
+                }
+                return image;
             }
             else {
-                return autoSettleAndCapture(settleOption == SettleOption.SettleFullArea ? 0 : settleMaskCircle);
+                return autoSettleAndCapture(settleOption == SettleOption.SettleFullArea ? 0 : settleMaskCircle, 
+                        firstFrameConsumer);
             }
         }
         finally {
@@ -777,6 +854,22 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
     public double getRecordedComputeMilliseconds() {
         return recordedComputeMilliseconds;
+    }
+
+    /**
+     * How long the capture of the very first frame of the last settling took, in ms. This is the
+     * frame a pre-check judges, so this is what a pre-check's "capture" means.
+     */
+    public double getRecordedFirstCaptureMilliseconds() {
+        return recordedFirstCaptureMilliseconds;
+    }
+
+    /**
+     * The time from the start of the last settling to that first frame being in hand, in ms, i.e.
+     * including the wait for stillstand.
+     */
+    public double getRecordedFirstFrameMilliseconds() {
+        return recordedFirstFrameMilliseconds;
     }
 
     public long getRecordedSettleMilliseconds() {

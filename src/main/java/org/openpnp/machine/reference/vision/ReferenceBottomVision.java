@@ -5,6 +5,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Consumer;
 
 import org.apache.commons.io.IOUtils;
 import org.opencv.core.Mat;
@@ -28,6 +30,8 @@ import org.openpnp.model.AbstractVisionSettings;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.BottomVisionSettings;
 import org.openpnp.model.CapturedShot;
+import org.openpnp.machine.reference.ReferencePnpJobProcessor;
+import org.openpnp.machine.reference.camera.AbstractSettlingCamera;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
@@ -36,6 +40,8 @@ import org.openpnp.model.Package;
 import org.openpnp.model.Part;
 import org.openpnp.model.PartSettingsHolder;
 import org.openpnp.model.Placement;
+import org.openpnp.model.PreCheckResult;
+import org.openpnp.model.PreCheckResult.Verdict;
 import org.openpnp.model.PreCapturedPlacement;
 import org.openpnp.model.VisionCompositing;
 import org.openpnp.model.VisionCompositing.Composite;
@@ -48,6 +54,7 @@ import org.openpnp.spi.Camera;
 import org.openpnp.spi.Machine;
 import org.openpnp.util.LogUtils;
 import org.openpnp.util.MovableUtils;
+import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
@@ -1060,6 +1067,19 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         Adjust, Full
     }
 
+    /**
+     * What a failed pre-check does about it. A pre-check never makes the job faster by being
+     * ignored and never makes it slower by being waited for, so the only thing it may do on its own
+     * is to say something.
+     *
+     * {@link #Report} runs the check and writes the log line, and changes nothing else - not even
+     * when the verdict is no. That is the mode in which the numbers of section 7 of the design doc
+     * can be collected without the machine doing anything it would not have done anyway.
+     */
+    public enum PreCheckAction {
+        Disabled, Report, Sequential, Error
+    }
+
     @Deprecated
     @Root
     public static class PartSettings extends AbstractModelObject {
@@ -1619,12 +1639,41 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             
             // Perform auto-settle and capture - this captures multiple frames until stable
             // The camera must support settling (extend AbstractSettlingCamera)
-            if (camera instanceof org.openpnp.machine.reference.camera.AbstractSettlingCamera) {
-                org.openpnp.machine.reference.camera.AbstractSettlingCamera settlingCamera = 
-                    (org.openpnp.machine.reference.camera.AbstractSettlingCamera) camera;
+            if (camera instanceof AbstractSettlingCamera) {
+                AbstractSettlingCamera settlingCamera = 
+                    (AbstractSettlingCamera) camera;
+                // The pre-check, if the part wants one: the first frame of this very settling,
+                // analysed while the mechanics are still settling. A part whose pipeline composites
+                // several shots is left alone, because the frame the pre-check would judge is not
+                // the frame the alignment uses.
+                PreCheckResult preCheckResult = null;
+                Consumer<Mat> firstFrameConsumer = null;
+                if (bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
+                        && shots.size() == 1) {
+                    preCheckResult = new PreCheckResult();
+                    final PreCheckResult result = preCheckResult;
+                    firstFrameConsumer = mat -> startPreCheck(mat, result, part, camera, nozzle,
+                            wantedLocation, bottomVisionSettings, settlingCamera);
+                }
+
                 BufferedImage capturedBufferedImage = settlingCamera.settleAndCapture(
-                    org.openpnp.machine.reference.camera.AbstractSettlingCamera.SettleOption.Settle);
+                    AbstractSettlingCamera.SettleOption.Settle,
+                    firstFrameConsumer);
                 Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
+                if (preCheckResult != null) {
+                    // These two numbers only exist now that the settling is over. The check is not
+                    // waited for: if it has not reported by now then it has not reported at all, and
+                    // that is a normal outcome rather than a failure. It is written here, with the
+                    // complete numbers, whenever the verdict happens to be in by now; if it is not,
+                    // the line goes out with the verdict still pending and the check adds its own
+                    // line when it gets round to it.
+                    preCheckResult.setSettleMs(settlingCamera.getRecordedSettleMilliseconds()
+                            - settlingCamera.getRecordedFirstFrameMilliseconds());
+                    if (preCheckResult.claimLogLine()) {
+                        logPreCheck(preCheckResult, part, camera, nozzle,
+                                bottomVisionSettings.getPreCheckAction(), false);
+                    }
+                }
                 
                 // Turn off light or register with batch operation (if active)
                 try {
@@ -1635,8 +1684,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 }
                 
                 // Create a PreCapturedPlacement with the captured image and displacement delta
-                return new PreCapturedPlacement(
+                PreCapturedPlacement capturedShot = new PreCapturedPlacement(
                         camera, nozzle, capturedImage, wantedLocation, displacementDelta);
+                capturedShot.setPreCheckResult(preCheckResult);
+                return capturedShot;
             }
             else {
                 // Camera doesn't support settling - fall back to regular capture
@@ -1659,6 +1710,165 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         finally {
             // Always close the pipeline to release resources
             pipeline.close();
+        }
+    }
+
+    /**
+     * Hand the first frame of a settling to the vision executor to be pre-checked.
+     *
+     * This runs on the thread that is settling, inside the settling loop, at the moment the frame
+     * arrived. Consequently nothing may be analysed here and nothing may be waited for here: the
+     * loop measures itself, and every millisecond spent here is a millisecond of settling that did
+     * not happen. The only things done are a clone of the frame and a submit, and the frame itself
+     * stays owned by the camera, which releases it as soon as this returns.
+     */
+    protected void startPreCheck(Mat firstFrame, PreCheckResult preCheckResult, Part part,
+            Camera camera, Nozzle nozzle, Location wantedLocation,
+            BottomVisionSettings bottomVisionSettings, AbstractSettlingCamera settlingCamera) {
+        // What the frame cost, while it is still known only to the camera and the settling has not
+        // finished: the camera recorded it just before handing the frame over.
+        preCheckResult.setCaptureMs(settlingCamera.getRecordedFirstCaptureMilliseconds());
+        final Mat frame;
+        try {
+            frame = firstFrame.clone();
+        }
+        catch (Exception e) {
+            // Said nothing, as everywhere else during the settling: the line is written once the
+            // durations are known, by whoever has them all.
+            preCheckResult.finish(Verdict.Failed, "cannot keep the first frame: "+e.getMessage());
+            return;
+        }
+        // The shot owns the clone from here on, so that the single flag on it is the only answer to
+        // whether the native image has been given back.
+        final CapturedShot shot = new CapturedShot(camera, nozzle, frame, wantedLocation);
+        try {
+            ReferencePnpJobProcessor.getVisionExecutor().submit(() -> {
+                try {
+                    runPreCheck(shot, preCheckResult, part, camera, nozzle, wantedLocation,
+                            bottomVisionSettings);
+                }
+                finally {
+                    shot.release();
+                }
+            });
+        }
+        catch (RejectedExecutionException e) {
+            shot.release();
+            preCheckResult.finish(Verdict.Failed, "vision executor refused the check: "+e.getMessage());
+        }
+    }
+
+    /**
+     * Analyse one pre-captured first frame with the pipeline of the alignment itself, i.e. with the
+     * same crop and the same parameter assignments the alignment will use, so that the two verdicts
+     * mean the same thing.
+     *
+     * What it decides is presence and size, and nothing else: the distance of the part from the
+     * centre of the frame is measured and logged but never judged, because this frame was taken
+     * while the mechanics were still settling and how far the part will have drifted by the settled
+     * frame is not yet known on this machine.
+     *
+     * Never throws and never gates anything: the verdict is a piece of information handed to the
+     * job, and a check that cannot produce one is itself reported as {@link Verdict#Failed} rather
+     * than allowed to disturb the job.
+     */
+    protected void runPreCheck(CapturedShot shot, PreCheckResult result, Part part, Camera camera,
+            Nozzle nozzle, Location wantedLocation, BottomVisionSettings bottomVisionSettings) {
+        long t0 = NanosecondTime.getRuntimeMilliseconds();
+        try {
+            CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
+            try {
+                preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(),
+                        camera, part.getPackage(), nozzle, nozzle.getNozzleTip(),
+                        wantedLocation, wantedLocation, bottomVisionSettings, true);
+                pipeline.setPreCapturedShot(0, shot);
+                List<PipelineShot> shots = pipeline.getPipelineShots();
+                if (shots.isEmpty()) {
+                    result.finish(Verdict.Inconclusive, "pipeline has no shot");
+                    return;
+                }
+                shots.get(0).apply();
+                pipeline.process();
+                Result visionResult = pipeline.getResult(VisionUtils.PIPELINE_RESULTS_NAME);
+                if (visionResult == null) {
+                    // The older name of the results stage.
+                    visionResult = pipeline.getResult("result");
+                }
+                if (visionResult == null) {
+                    result.finish(Verdict.PartMissing, "pipeline has no result");
+                    return;
+                }
+                if (!(visionResult.model instanceof RotatedRect)) {
+                    result.finish(Verdict.PartMissing, "no rectangle in the pipeline result");
+                    return;
+                }
+                RotatedRect rect = (RotatedRect) visionResult.model;
+                Location upp = camera.getUnitsPerPixelAtZ();
+                result.setMeasuredSize(
+                        upp.getLengthX().multiply(rect.size.width).convertToUnits(LengthUnit.Millimeters).getValue(),
+                        upp.getLengthY().multiply(rect.size.height).convertToUnits(LengthUnit.Millimeters).getValue());
+                PipelineGeometry geometry = new PipelineGeometry(rect, visionResult);
+                result.setOffsets(geometry.getCenterOffsets(camera).getLinearLengthTo(Location.origin)
+                        .convertToUnits(LengthUnit.Millimeters).getValue());
+                result.setRotation(Utils2D.angleNorm(VisionUtils.getPixelAngle(camera, rect.angle)));
+                Location nominal = bottomVisionSettings.getPartCheckSize(part, false);
+                if (nominal != null) {
+                    result.setNominalSize(
+                            nominal.getLengthX().convertToUnits(LengthUnit.Millimeters).getValue(),
+                            nominal.getLengthY().convertToUnits(LengthUnit.Millimeters).getValue());
+                }
+                if (!(rect.size.width > 0 && rect.size.height > 0)) {
+                    result.finish(Verdict.Inconclusive, "the pipeline returned a rectangle without size");
+                    return;
+                }
+                try {
+                    partSizeCheck(part, bottomVisionSettings, rect, camera);
+                    result.finish(Verdict.Ok, (nominal == null 
+                            ? "part found, no size configured to compare with" : "part found within size tolerance"));
+                }
+                catch (Exception e) {
+                    result.finish(Verdict.SizeOut, e.getMessage());
+                }
+            }
+            finally {
+                pipeline.close();
+            }
+        }
+        catch (Exception e) {
+            result.finish(Verdict.Failed, e.getMessage());
+        }
+        finally {
+            result.setCheckMs(NanosecondTime.getRuntimeMilliseconds() - t0);
+            if (result.getSettleMs() >= 0.0) {
+                // The settling is over, so the capture thread has written or is about to write the
+                // one line: claim it if it can still be had, otherwise add the verdict as a late
+                // line of its own, because the line that went out could not contain it.
+                logPreCheck(result, part, camera, nozzle, bottomVisionSettings.getPreCheckAction(),
+                        !result.claimLogLine());
+            }
+        }
+    }
+
+    /**
+     * One line per pre-check, with capture, settle and check as three separate numbers and never as
+     * a sum of each other.
+     */
+    protected void logPreCheck(PreCheckResult result, Part part, Camera camera, Nozzle nozzle,
+            PreCheckAction action, boolean late) {
+        String line = String.format(
+                "[PRE-CHECK%s] nozzle=%s camera=%s part=%s frame=1 capture=%.1f settle=%.1f check=%.1f"
+                        + " size=%.2fx%.2f expected=%.2fx%.2f rot=%.1f offset=%.2f verdict=%s action=%s",
+                late ? "-LATE" : "", nozzle.getId(), camera.getName(), part.getId(),
+                result.getCaptureMs(), result.getSettleMs(), result.getCheckMs(),
+                result.getMeasuredWidth(), result.getMeasuredHeight(),
+                result.getNominalWidth(), result.getNominalHeight(),
+                result.getRotation(), result.getOffsets(),
+                result.getVerdict().name(), action.name());
+        if (result.getVerdict() == Verdict.Ok) {
+            Logger.debug(line);
+        }
+        else {
+            Logger.warn(line+(result.getMessage().isEmpty() ? "" : " : "+result.getMessage()));
         }
     }
 

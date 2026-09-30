@@ -5,6 +5,7 @@ import java.awt.geom.Rectangle2D;
 import org.openpnp.gui.support.Wizard;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision.MaxRotation;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision.PartSettings;
+import org.openpnp.machine.reference.vision.ReferenceBottomVision.PreCheckAction;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision.PartSizeCheckMethod;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision.PreRotateUsage;
 import org.openpnp.machine.reference.vision.wizards.BottomVisionSettingsConfigurationWizard;
@@ -24,6 +25,13 @@ public class BottomVisionSettings extends AbstractVisionSettings {
 
     @Attribute(required = false)
     protected MaxRotation maxRotation = MaxRotation.Adjust;
+
+    /**
+     * What the pre-check of the first settling frame does with its verdict. Only ever used on the
+     * parallel bottom vision path, which is the one that settles and captures ahead of the analysis.
+     */
+    @Attribute(required = false)
+    protected PreCheckAction preCheckAction = PreCheckAction.Report;
 
     @Attribute(required = false)
     protected boolean asymmetric = false;
@@ -100,6 +108,16 @@ public class BottomVisionSettings extends AbstractVisionSettings {
         firePropertyChange("maxRotation", oldValue, maxRotation);
     }
 
+    public PreCheckAction getPreCheckAction() {
+        return preCheckAction;
+    }
+
+    public void setPreCheckAction(PreCheckAction preCheckAction) {
+        Object oldValue = this.preCheckAction;
+        this.preCheckAction = preCheckAction;
+        firePropertyChange("preCheckAction", oldValue, preCheckAction);
+    }
+
     public boolean isAsymmetric() {
         if (visionOffset.isInitialized()) {
             // Where offsets were stored from previous versions, make it asymmetric.
@@ -139,6 +157,7 @@ public class BottomVisionSettings extends AbstractVisionSettings {
         setPreRotateUsage(another.getPreRotateUsage());
         setCheckPartSizeMethod(another.checkPartSizeMethod);
         setMaxRotation(another.getMaxRotation());
+        setPreCheckAction(another.getPreCheckAction());
         setCheckSizeTolerancePercent(another.getCheckSizeTolerancePercent());
         setVisionOffset(another.getVisionOffset());
         setAsymmetric(another.isAsymmetric());

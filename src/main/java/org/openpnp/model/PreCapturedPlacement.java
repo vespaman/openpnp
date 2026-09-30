@@ -20,6 +20,14 @@ public class PreCapturedPlacement extends CapturedShot {
      * This includes both the camera's configured displacement AND the nozzle tip runout error.
      */
     private final Location intendedDisplacementDelta;
+
+    /**
+     * The verdict of the pre-check that was run against the first frame of the settling this shot
+     * came out of. Filled in asynchronously, by the vision executor, possibly long after the shot
+     * itself has been handed over - and possibly never, if the check did not get round to it.
+     * Whoever reads it must treat a missing verdict as "no opinion", never as a problem.
+     */
+    private volatile PreCheckResult preCheckResult;
     
     public PreCapturedPlacement(Camera camera, Nozzle nozzle, Mat image, Location shotLocation,
                                 Location intendedDisplacementDelta) {
@@ -34,6 +42,17 @@ public class PreCapturedPlacement extends CapturedShot {
      */
     public Location getIntendedDisplacementDelta() {
         return intendedDisplacementDelta;
+    }
+
+    /**
+     * Get the pre-check verdict, or null if there is none (yet).
+     */
+    public PreCheckResult getPreCheckResult() {
+        return preCheckResult;
+    }
+
+    public void setPreCheckResult(PreCheckResult preCheckResult) {
+        this.preCheckResult = preCheckResult;
     }
     
     @Override
