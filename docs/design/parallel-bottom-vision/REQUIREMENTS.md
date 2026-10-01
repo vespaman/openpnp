@@ -605,3 +605,34 @@ candidate instead of on the announcement.
 * **Rotation.** A part that the alignment turns is turned by the offsets, so the travel without them
   arrives square while the part is not. The final move corrects it, exactly as it always has, but the
   head has travelled to a place the part is not quite in, and that is the whole risk of this step.
+
+### Asking earlier is not sending
+
+`log_w.txt` ran with the departure moved before the pre-rotation and the head still did not leave:
+
+```
+57.972 [EARLY-DEPARTURE] nozzle N1 set off for (173.109160, 106.759975, ...)
+57.990 [EARLY-DEPARTURE] 2 alignments ... are complete 23 ms later
+57.991 commandQueue offer >> M204 S10694 G1 X139.09 Y125.00 ...
+```
+
+The pre-rotation was therefore not the reason, and the explanation is one level down: the advanced motion
+planner holds a plan in its queue until something flushes it, and the flusher is the next synchronised
+move, which is the corrected approach with its `M400` - the move that waits for the alignment. No order
+inside the job thread changes that; the queue has to be emptied, and `CompletionType.CommandJog` is the
+completion type documented as sending the plan to the drivers while leaving the deceleration to the
+controller and not waiting for an asynchronous driver. `AbstractMotionPlanner.waitForCompletion()` calls
+`executeMotionPlan()` before it looks at `isEnforcingStillstand()`, and `CommandJog` is below
+`CommandStillstand`, so the call returns while the head is on its way. The advanced planner uses the same
+completion type for its own jogs.
+
+The settle margin expectation was too optimistic for the same kind of reason: 23-30 ms measured against
+25-35 ms before. Part of what remains is the exposure itself, because the frame is stamped when
+`capture()` returns, so a frame exposed at the instant the window opens is still reported a capture's
+length inside it.
+
+This run also produced the abort without being asked: a `C0402` measured too small inside a deferred
+pipeline, the batch fell back with its WARNING and its count, and the head went back over the cameras.
+That is R9 on real hardware rather than in a harness. From here on the head will already be travelling
+when such a failure is judged; the return move queues behind the departure and the driver executes in
+order, so nothing has to be revoked mid-flight.

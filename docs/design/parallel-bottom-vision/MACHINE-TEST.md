@@ -1106,3 +1106,37 @@ planner has swallowed the move; that is the failure mode of `log_v.txt` and it m
 `M` was 25-35 ms in `log_v.txt`. It should now be about one capture (8-15 ms) and `F` should not have
 grown. R4 is the requirement: what is being minimised is the time between the head stopping over the
 cameras and the head being allowed to leave.
+
+### log_w.txt: asking earlier is not sending
+
+`log_w.txt` ran with the departure moved before the pre-rotation. The head still did not move:
+
+```
+57.972 [EARLY-DEPARTURE] nozzle N1 set off for (173.109160, 106.759975, ...)
+57.990 [EARLY-DEPARTURE] 2 alignments ... are complete 23 ms later
+57.991 commandQueue offer >> M204 S10694 G1 X139.09 Y125.00 ...
+```
+
+So the diagnosis of `log_v.txt` was half right. The pre-rotation was not the culprit: whatever the order
+in the job, the advanced motion planner keeps a plan in its queue until something flushes it, and the
+thing that flushes it is the next synchronised move - here the corrected approach with its `M400`. That
+move is precisely the one waiting for the alignment, so the head starts one ms after the numbers. The
+job thread cannot fix this by ordering; it has to empty the queue, and `CompletionType.CommandJog` is
+the completion type that does exactly that (`AbstractMotionPlanner.waitForCompletion()` calls
+`executeMotionPlan()` first and only waits the drivers when `isEnforcingStillstand()`, which `CommandJog`
+is not). The advanced planner uses the same trick itself for jogs.
+
+The margin expectation above was also too optimistic: measured 23-30 ms against 25-35 ms before, still
+2 grabs. The aiming bought a little; the rest is the exposure itself, because the frame is stamped when
+`capture()` returns, so a frame that starts the instant the window opens is still reported a capture's
+length inside it. Expect 20-30 ms, not 8-15 ms; what would be wrong is `F` growing.
+
+The run also delivered the abort on its own: a `C0402` measured too small inside a deferred pipeline, the
+batch fell back with its WARNING and count, and the head went back over the cameras and lit the light
+again. From the next run onwards the head will already be travelling when that happens, and the return
+move simply queues behind the departure - the driver executes in order, so nothing has to be revoked.
+
+Unrelated thing this run made visible: on the fallback path the realignment opens `Batch START level 1
+'visionutils' - cameras: 0`, and the light then comes on only when the nozzle arrives rather than when
+the head starts back. Not caused by anything in this work, but it is a light-off/on batch that registers
+no cameras and is worth a look on its own.
