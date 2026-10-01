@@ -777,3 +777,30 @@ cp <the log of that session> tests_2026-10-01/log_q.txt
 The config files belong with the frames because replaying a frame means running *that part's* pipeline
 over it, and the pipeline lives in the settings of the moment. A frame without the settings that made it
 is a picture, not an experiment.
+
+### The corpus run happened (`log_q.txt`, `bv-corpus/`)
+
+`./openpnp.sh "-DframeDump=$HOME/bv-corpus"`, one job of four aligned batches, eight frames, two per
+batch. The dump announced itself in the log as designed, and `check_frames.py` reads the eight names and
+holds them against the log: the frame kept for each camera of each batch is there, its age after the rest
+and the margin inside the window are the numbers the `[SETTLE-WINDOW]` line gives (batch 1: `Upp2` frame 2
+at +86 ms, window opened at +58 ms, and the frame on disk says `a+230061721 c+230061807 w+230061779`),
+and the frame number in the name is the grab count the `[PRE-CHECK]` line reports for that camera. No
+frame is another frame twice. The job was a cold one (16.8 s) and its timings mean nothing, which was the
+deal struck above.
+
+Two things the eight frames cannot yet do, and one of them is not a small thing:
+
+- **The replay needs the machine's config.** Replaying a frame means running *that part's* pipeline over
+  it, and the pipeline is the part's colour thresholds, its masks and its camera geometry, all of which
+  live in `machine.xml`, `packages.xml`, `parts.xml` and `vision-settings.xml`. They were not copied with
+  the frames. There is a snapshot of them under `../../pbv-backup-20260927/config/` whose camera ids are
+  the ones in these names, which is good enough to build the harness against and not good enough to
+  publish a number from: it is five months older than the run, and a threshold that has been retuned since
+  would silently change every conclusion.
+- **A naive reader cannot see the part.** `check_frames.py` looks for the darkest thing inside the lit
+  circle, which finds the bore of the nozzle and the shape of the illumination - an 0402 held over `Upp1`
+  is a few thousand pixels of a 360 px radius field, and nothing about the field makes it the part. Only
+  the machine's own colour pipeline separates them. That is not a defect of the tool; it is the reason the
+  replay has to be the pipeline and not a substitute for it, and it is worth saying out loud in a design
+  whose whole claim is that a frame can be re-judged away from the machine.
