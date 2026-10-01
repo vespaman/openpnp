@@ -1190,47 +1190,45 @@ would release the head a frame earlier, but the light is switched off when the p
 the batch is nested per thread - so the frame still being exposed would be exposed in the dark. That is a
 question about the light batch outliving the job thread, not about the vision.
 
-### The 11 ms was an exposure, and it is taken by grabbing instead of waiting
+### The join is one exposure, tried to buy it by grabbing, and could not (`log_y.txt`)
 
-The join on the secondary camera is 7-11 ms in `log_x.txt`, and the reason is in the code rather than in
-the hardware: `grabUntilTheStillWindow()` slept until the settling had *claimed* an opening and only then
-exposed a frame. Measurement says that cannot pay. The candidate is the first frame under the threshold
-and the agreement is that frame plus the debounce, so the claim and the verdict are about one frame apart -
-`log_x`'s `window of Upp1 which opened at +24 ms` was published at +38 ms. A frame exposed once the opening
-is known is therefore a whole exposure younger than the window it was wanted in, and the head stands there
-for the exposure.
+The 7-11 ms join looked like a scheduling loss: `grabUntilTheStillWindow()` slept until the settling had
+claimed an opening and only then exposed, so the frame it accepted was exposed after the verdict rather
+than while the verdict was still on its way. The fix tried was to expose whenever there was nothing to go
+on and choose the frame afterwards, judging each frame by the instant it was *asked for* rather than the
+instant it came back. Reverted as `e5ccfa1d95`. This is what the machine said:
 
-It now exposes whenever it has nothing better to do and judges the frame afterwards:
+| batch | `log_x`: window, frame in, grabs, join | `log_y`: window, frame in, grabs, join |
+|---|---|---|
+| 1 | +61, +86, 2, 10 ms | +57, +83, 5, 9 ms |
+| 2 | +61, +85, 2, 9 ms | +38, +66, 4, 9 ms |
+| 3 | +58, +85, 2, 10 ms | +29, +55, 4, 10 ms |
+| 4 | +38, +64, 2, 9 ms | +63, +86, 5, 10 ms |
+| 5 | +30, +55, 2, 11 ms | +29, +58, 4, fell back |
+| 6 | +53, +74, 2, 7 ms | +29, +58, 4, 12 ms |
+| 7 | +24, +53, 2, 11 ms | +27, +64, 4, 8 ms |
+| 8 | +63, +87, 2, 10 ms | +55, +83, 4, 10 ms |
 
-- a frame is a picture of the interval that began when it was *asked for*, so that instant is what is
-  compared with the opening. The instant the camera handed it over is a frame's length later and flatters
-  every margin, which is why the old margins read 20-30 ms when the wait was the problem;
-- a frame asked for before the claimed opening is dropped without asking the verdict, because no verdict
-  can make it older;
-- the verdict is waited for only on a frame that a claimed opening already covers. That is the one wait
-  left, and it is short, because the claim and the verdict are one frame apart.
+The join is 8-12 ms where it was 7-11 ms. The frame is handed over 23-37 ms after the window opens where
+`log_x` was 21-29 ms. The grabs went from 2 to 4-5, and one batch fell back to sequential alignment
+(`attempts=4 fell back=1`) which had never happened in `log_x`. The change bought nothing and cost two and
+a half times the frames.
 
-The two helpers that slept before grabbing, `awaitProspectOfWindow()` and `awaitWindowOpening()`, are
-gone. In `SettleWindowCaptureTest`, on the modelled bus, the kept frame is now asked for in the same
-millisecond in which the settling announces the window rather than an exposure after it
-(`testTheKeptFrameWasAlreadyInFlightWhenTheVerdictLanded`). The cost guard is unchanged and still holds:
-17 grabs of the hunting camera made the settling 187 ms instead of 118 ms on a 5 ms a frame bus, which is
-within one bus slot per grab. 327 tests pass.
+Why it cannot work, which is the useful part: an exposure that is to be inside a window cannot begin before
+the window does. The window opens a frame or two before the settling says so, and the exposure is 9-14 ms
+(`capture=` on the `[PRE-CHECK]` lines), so the earliest frame that can honestly be called still is handed
+over one exposure after the opening - 21-29 ms in `log_x`, which is what the physical floor is, not slack.
+The head waits 7-11 ms for it because the settle camera's own frame and pre-check got there first. Asking
+for frames earlier does not make the exposure earlier; a frame in flight over the ringing is a frame that
+must be thrown away, and my stricter "asked inside the window" rule threw away even the frame that
+`log_x` had been willing to keep.
 
-### What `log_y.txt` has to show
-
-Same config as `log_x.txt`, jar of 23:16, one job.
-
-- `Waiting for 1 async camera captures to complete ... in X ms`: the four non-nil waits were 7-11 ms. They
-  should fall to 0-3 ms. This is the whole point of the change and the number to look at first.
-- `[SETTLE-WINDOW] ... margin N ms of M grabs`: the margin is now measured from when the frame was asked
-  for, so read it as "how far inside the window the exposure started", not as slack that was waited. Expect
-  a smaller number than the 20-30 ms of `log_x.txt` and a larger `M`.
-- The settle camera's `autoSettleAndCapture in X ms` (was 38-74 ms) is the thing that can go wrong: the
-  extra frames are on the same USB bus and the same light. If the settling grows by more than roughly one
-  frame per extra grab, then the bus is the binding constraint and continuous grabbing has to be metered to
-  about one frame per settling frame; the change would then be a wash and the honest conclusion is that the
-  11 ms cannot be had this way at all.
-- `[EARLY-DEPARTURE]` release to first `G1` must stay in the 5-14 ms of `log_x.txt`, and
-  `attempts=4 fell back=0 frames refused=0` must stay as it is. A frame from outside the window shows up as
-  a refusal or a fallback, and either one means the retroactive choice picked wrongly.
+So the answer to "is this a Java problem" is no, and it is not a USB problem either - the two cameras are
+on separate USB3 roots, and the settling did not slow down measurably under four times the grabs (27-63 ms
+in `log_x`, 29-62 ms in `log_y`); what the extra frames cost is CPU, one batch's capture going 9 ms to 21
+ms. The join is the exposure time of a camera that is being asked to photograph a head that has only just
+stopped. The only way to remove it is to accept a frame whose exposure straddles the start of the window,
+part of it taken while the head is still ringing, which is exactly the thing the frame provenance was
+built to refuse. If the join is ever removed it will be by not needing the second camera's frame before
+the head leaves - i.e. by deferring the whole grab, with the light, into the deferred worker
+(`TIME-BUDGET.md`) - and not by taking frames earlier than the physics allows.
