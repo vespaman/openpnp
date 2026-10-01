@@ -976,14 +976,31 @@ commanded to move.
 
 Build: the jar of commit `2467a0cebd` plus the javadoc tidy that followed it, `target/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`.
 
-One setting turns this on, and it has no GUI control yet. In `~/.openpnp2/machine.xml`, on the
-`<machine class="org.openpnp.machine.reference.ReferenceMachine" ...>` element:
+One setting turns this on, and it has no GUI control yet. In `~/.openpnp2/machine.xml`, next to
+`parallel-alignment-enabled`:
 
 ```xml
-early-alignment-departure="true"
+<early-alignment-departure>true</early-alignment-departure>
 ```
 
-Restart, and check it survived: `Machine` → `Save` and the attribute must still be there. Everything
+Not an attribute. The field is `@Element`, like `parallel-alignment-enabled`, and `@Element`s of this
+machine are child elements, so putting it on the `<machine>` tag as
+`early-alignment-departure="true"` makes the configuration refuse to load at all:
+
+```
+Attribute 'early-alignment-departure' does not have a match in class
+org.openpnp.machine.reference.ReferenceMachine at line 2
+```
+
+which is what `log_u.txt` is. (That was my doing, on the machine, at 18:24; the attribute is off the
+file again and the load was checked afterwards with a headless `Configuration.load()` of a copy of the
+whole configuration directory, which reported `early-alignment-departure = true`.)
+
+OpenPnP writes the element itself, as `false`, the first time the new jar saves the machine, so on
+`pn52` the only edit needed is `false` to `true` in the line already there under
+`<parallel-alignment-enabled>true</parallel-alignment-enabled>`.
+
+Restart, and check it survived: `Machine` → `Save` and the element must still say `true`. Everything
 else about the job stays exactly as in `log_r.txt` / `log_s.txt` — the same 8 placements, the same
 speed, the same frame dumps — because the only comparison worth making is this attribute against its
 absence.
