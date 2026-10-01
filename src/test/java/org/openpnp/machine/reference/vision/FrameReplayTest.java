@@ -82,7 +82,8 @@ public class FrameReplayTest {
 
     /**
      * Runs kept under tests_YYYY-MM-DD together with the configuration they ran with: bv-corpus with the
-     * frames, log_q.txt with what the machine said about them.
+     * frames, log_q.txt with what the machine said about them. A corpus too big or too private to commit
+     * is replayed by naming its directory instead: -Dreplay.dir=/path/to/the/run.
      */
     private static final String[] KEPT_RUNS = {
         "tests_2026-10-01",
@@ -100,7 +101,7 @@ public class FrameReplayTest {
 
     /** A centre coordinate is 17 significant digits in the log; anything looser is not the same point. */
     private static final double PIXEL_TOLERANCE = 1e-6;
-    /** The log rounds its millimetres to three decimals, so that is as close as the two can agree. */
+
     /** A frame as it lies on disk, and what its name says about it. */
     private static class Kept {
         File file;
@@ -159,7 +160,7 @@ public class FrameReplayTest {
 
     @Test
     public void framesReplayedAwayFromTheMachineMeasureWhatTheMachineMeasured() throws Exception {
-        for (String run : KEPT_RUNS) {
+        for (String run : runsToReplay()) {
             File directory = new File(run);
             File corpus = new File(directory, "bv-corpus");
             File log = new File(directory, "log_q.txt");
@@ -177,6 +178,11 @@ public class FrameReplayTest {
             Configuration.get().load();
             replayAll(frames, measured, preChecked);
         }
+    }
+
+    private String[] runsToReplay() {
+        String named = System.getProperty("replay.dir");
+        return named == null || named.trim().isEmpty() ? KEPT_RUNS : new String[] {named.trim()};
     }
 
     /**

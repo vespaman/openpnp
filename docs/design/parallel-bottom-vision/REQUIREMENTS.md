@@ -196,21 +196,28 @@ Existing building block: the pipeline already contains an
 and `bv_result_*.png` after each stage's result. There are 9703 such images from
 2026-05-02 under `~/.openpnp2/org.openpnp.vision.pipeline.stages.ImageWriteDebug/`.
 
-Plan:
-1. **Dump, on one machine run, with provenance in the filename**: nozzle, camera, head
-   stopped timestamp, frame index, settle-window state. Without provenance a dumped frame
-   cannot be used to test R1/R3.
-2. **Replay test** (`mvn test`, no machine): load the machine's pipeline XML + the real
-   package footprint + tolerance, run the pipeline over the dumped frames twice — once with
-   the alignment's configuration and once with the pre-check's — and print/assert a table:
-   frame, rect size, angle, size verdict, position verdict.
-   - Catches R6 violations (angle mismatch) mechanically. This test would have caught the
-     3 false SizeOuts in `log_j`.
-   - Answers §4: the dumped `bv_source` image shows the crop size actually used, and the
-     per-stage results show whether the part is clipped by the mask or split by the
-     threshold.
-3. Keep dumped frames **out of git** (they are ~860 kB each). The test takes a directory
-   (`-Dreplay.dir=...`) and is skipped when it is not set, so CI stays green.
+What exists now, after the run of 2026-10-01 (`MACHINE-TEST.md` has the run itself):
+
+1. **Provenance in the filename** — `org.openpnp.vision.FrameDump`, switched on with
+   `-DframeDump=<dir>`. The name carries origin, camera, nozzle, part, frame index and the three
+   instants (arrival, capture, window open) that R1 and R3 are stated in. `check_frames.py` holds the
+   names against the log's `[SETTLE-WINDOW]` lines.
+2. **Replay test** — `FrameReplayTest` (`mvn -Dtest=FrameReplayTest test`, no machine, no camera). It
+   loads the configuration of the run, prepares the part's pipeline through the production
+   `preparePipeline`, feeds the kept frame in through `CapturedShot`, and asserts the replayed rectangle
+   against the `Bottom vision part ... result rect` line of the log. All eight frames of the corpus
+   reproduce the machine's rectangle: centre and angle equal to the last digit printed, sides within the
+   decimals OpenCV drops when it prints them.
+3. **A corpus that is in git** — 860 kB x 8 was cheap and the claim is worth being checkable. A bigger
+   or private corpus is replayed with `-Dreplay.dir=<run>`; a run whose directory is absent is skipped,
+   so CI does not depend on the machine having been run.
+
+The rig cannot yet replay the **pre-check**, and not for a lack of frames: `[PRE-CHECK]` measures the
+first grab of a hunt while the dump keeps the last, so the corpus has the alignment's frames and not the
+pre-check's. R6 ("the pre-check runs the same pipeline configuration as the alignment") therefore still
+rests on the log's agreement of `clone`/`prep` timings and on the code, not on a re-judged frame. The
+next corpus run should dump every grab of a hunt, which also turns the drift between the first frame and
+the kept one into a measured number rather than an observation.
 
 ## 6. Steps and gates
 
