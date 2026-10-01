@@ -105,7 +105,7 @@ Ranked by what it is worth on this machine, per job of 10.8 s:
 
 | idea | ms/job | what it is |
 |---|---|---|
-| fewer frames per fiducial settling | ~900 | 63-88 fiducial frames a job at 33 ms, the ceiling of a 30 fps webcam. This is the only lever on the down camera's 2 s |
+| declaring the head still one frame sooner (the threshold) | ~500 | modelled from `log_y` below; the down camera cannot go faster than 30 fps, so its 2 s is frames x 33 ms |
 | a ring-buffer grabber instead of capture-on-demand | ~700-800 | the ~8.3 ms interval per bottom frame (22-27 frames), the cold first frame everywhere, and the async join - all three are the same demand-driven wait |
 | cheaper settle frames (raw, downscaled, diagnostics off) | ~300-500 | the 2-5 ms of conversions and copies per frame, and the garbage |
 | no spinning wait in `internalCapture()` | ~50-150, mostly variance | stops stealing the CPU from the camera that is trying to work |
@@ -146,11 +146,23 @@ The frame rates are measured now, so the list is short and each item says how to
 the log already prints (`autoSettleAndCapture t=... score: ... compute time:`).
 
 1. **Fewer frames per fiducial settling.** The down camera cannot be made faster than 30 fps, so its
-   ~115 ms per look is frames × 33 ms. `settle-debounce` is already 1 and the threshold is 0.48/0.4; the
-   score tails (`t50:0.60 t83:0.41 t109:0.23`) show the last frame of a settle is usually a shade below
-   the one before it, which is what a threshold change would drop. Do not change it by feel: the frames
-   and the pipeline can be re-measured offline (`FrameReplayTest`, `bv-corpus/`) - the same route that
-   proved a saved frame reproduces the machine's own rectangle exactly. Worth ~900 ms a job.
+   ~115 ms per look is frames × 33 ms. `settle-debounce` is already 1 and the threshold is 0.48 down / 0.40 up.
+   Replaying the score series of `log_y.txt` through the settling's own rule - same frames, same debounce,
+   only the threshold moved - says how much of the 3.7 s of settling a higher threshold would take away:
+
+   | threshold | settling in the job | saved | settlings ending sooner |
+   |---|---|---|---|
+   | 0.30 | 3523 ms | 189 ms | 6 of 30 |
+   | 0.40 | 3273 ms | 439 ms | 10 of 30 |
+   | 0.45 | 3175 ms | 537 ms | 13 of 30 |
+   | 0.55 | 3081 ms | 631 ms | 16 of 30 |
+
+   That is a real half second, and it is also a direct trade of residual vibration against time, which is
+   why it must not be set by feel: the corpus replay (`FrameReplayTest`, `bv-corpus/`) can re-measure saved
+   frames through the machine's own pipeline - it already reproduces the recorded rectangle to the last
+   digit - so the question "what does a score of 0.45 actually cost in millimetres" is answerable offline.
+   The score is a difference of a blurred 960x1080 frame, not a distance, so the first job is to correlate
+   one against the other.
 2. **Stop asking for frames on demand.** One background consumer per camera, taking every frame the stream
    produces into a short ring with the driver's own timestamps, so the settling and the pre-capture ask for
    "the newest frame at or after T" and get it out of memory. This is the item that removes the cold first
