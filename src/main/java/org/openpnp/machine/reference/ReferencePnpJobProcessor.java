@@ -343,6 +343,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     withoutOffsets.getRotation());
             long startedAt = System.currentTimeMillis();
             MovableUtils.moveToLocationAtSafeZ(nozzle, travelling);
+            // Handing the move to the planner is not handing it to the machine. With the advanced motion
+            // planner the plan sits in the motion queue until something flushes it, and on pn52 it was
+            // always the corrected approach that flushed it - so the head started driving a millisecond
+            // after the alignment it was supposed to overlap, twice in a row (log_v.txt, log_w.txt).
+            // CommandJog sends the plan to the driver and leaves the deceleration to the controller, and
+            // on an asynchronous driver it does not wait for the machine to get there.
+            nozzle.waitForCompletion(CompletionType.CommandJog);
             // The time measured here is the time it takes to hand the move to the motion planner, not
             // the time the head spends driving: the asynchronous driver has usually not finished the
             // move when this returns. The honest number is in awaitDeferredAlignment().
