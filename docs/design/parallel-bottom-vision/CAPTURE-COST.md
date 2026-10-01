@@ -72,6 +72,12 @@ show one batch's `capture=` go from 9 ms to 21 ms.
 The `fps="3.0"` and `fps="6.0"` attributes in `machine.xml` are the preview broadcast rate, not the stream
 rate; the stream runs at what the negotiated format gives, which the table above measured.
 
+One thing falls out of this that is free: since the bottom cameras expose for 0.1 ms inside an 8.3 ms frame
+interval, **exposure time is not on the critical path there**. It could be raised several-fold, to
+something more like 1-4 ms, without costing a millisecond of job time - and if any of the 30-110 µm
+fiducial scatter is light and signal-to-noise rather than mechanics, that is measurement quality bought
+for nothing. It has to be tried on the machine and looked at, not assumed.
+
 ## What Java costs here, itemised
 
 - **Thread handoff: not measurable.** The deferred alignment and the async capture go through
@@ -105,8 +111,8 @@ Ranked by what it is worth on this machine, per job of 10.8 s:
 
 | idea | ms/job | what it is |
 |---|---|---|
-| declaring the head still one frame sooner (the threshold) | ~500 | modelled from `log_y` below; the down camera cannot go faster than 30 fps, so its 2 s is frames x 33 ms |
 | a ring-buffer grabber instead of capture-on-demand | ~700-800 | the ~8.3 ms interval per bottom frame (22-27 frames), the cold first frame everywhere, and the async join - all three are the same demand-driven wait |
+| declaring the head still one frame sooner (the threshold) | ~500 | modelled from `log_y` below; the down camera cannot go faster than 30 fps, so its 2 s is frames x 33 ms |
 | cheaper settle frames (raw, downscaled, diagnostics off) | ~300-500 | the 2-5 ms of conversions and copies per frame, and the garbage |
 | no spinning wait in `internalCapture()` | ~50-150, mostly variance | stops stealing the CPU from the camera that is trying to work |
 | the async join gone on its own | ~40-80 | what this branch has been about |
