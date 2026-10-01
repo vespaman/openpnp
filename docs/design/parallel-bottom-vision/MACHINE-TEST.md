@@ -1192,6 +1192,12 @@ question about the light batch outliving the job thread, not about the vision.
 
 ### The join is one exposure, tried to buy it by grabbing, and could not (`log_y.txt`)
 
+*(Superseded in one respect: `CAPTURE-COST.md` measured the cameras directly and the exposure is 0.1 ms on
+the bottom cameras and 5 ms on the down one - what the join waits for is a frame interval of the stream,
+not the exposure. The conclusion "grabbing earlier cannot buy it back" stands, and so does the reason: the
+frame after the window opens does not exist yet.)*
+
+
 The 7-11 ms join looked like a scheduling loss: `grabUntilTheStillWindow()` slept until the settling had
 claimed an opening and only then exposed, so the frame it accepted was exposed after the verdict rather
 than while the verdict was still on its way. The fix tried was to expose whenever there was nothing to go
