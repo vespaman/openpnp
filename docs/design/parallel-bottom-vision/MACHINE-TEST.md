@@ -1189,3 +1189,48 @@ is a frame behind the settle camera by construction. Handing that future to the 
 would release the head a frame earlier, but the light is switched off when the pre-capture batch ends, and
 the batch is nested per thread - so the frame still being exposed would be exposed in the dark. That is a
 question about the light batch outliving the job thread, not about the vision.
+
+### The 11 ms was an exposure, and it is taken by grabbing instead of waiting
+
+The join on the secondary camera is 7-11 ms in `log_x.txt`, and the reason is in the code rather than in
+the hardware: `grabUntilTheStillWindow()` slept until the settling had *claimed* an opening and only then
+exposed a frame. Measurement says that cannot pay. The candidate is the first frame under the threshold
+and the agreement is that frame plus the debounce, so the claim and the verdict are about one frame apart -
+`log_x`'s `window of Upp1 which opened at +24 ms` was published at +38 ms. A frame exposed once the opening
+is known is therefore a whole exposure younger than the window it was wanted in, and the head stands there
+for the exposure.
+
+It now exposes whenever it has nothing better to do and judges the frame afterwards:
+
+- a frame is a picture of the interval that began when it was *asked for*, so that instant is what is
+  compared with the opening. The instant the camera handed it over is a frame's length later and flatters
+  every margin, which is why the old margins read 20-30 ms when the wait was the problem;
+- a frame asked for before the claimed opening is dropped without asking the verdict, because no verdict
+  can make it older;
+- the verdict is waited for only on a frame that a claimed opening already covers. That is the one wait
+  left, and it is short, because the claim and the verdict are one frame apart.
+
+The two helpers that slept before grabbing, `awaitProspectOfWindow()` and `awaitWindowOpening()`, are
+gone. In `SettleWindowCaptureTest`, on the modelled bus, the kept frame is now asked for in the same
+millisecond in which the settling announces the window rather than an exposure after it
+(`testTheKeptFrameWasAlreadyInFlightWhenTheVerdictLanded`). The cost guard is unchanged and still holds:
+17 grabs of the hunting camera made the settling 187 ms instead of 118 ms on a 5 ms a frame bus, which is
+within one bus slot per grab. 327 tests pass.
+
+### What `log_y.txt` has to show
+
+Same config as `log_x.txt`, jar of 23:16, one job.
+
+- `Waiting for 1 async camera captures to complete ... in X ms`: the four non-nil waits were 7-11 ms. They
+  should fall to 0-3 ms. This is the whole point of the change and the number to look at first.
+- `[SETTLE-WINDOW] ... margin N ms of M grabs`: the margin is now measured from when the frame was asked
+  for, so read it as "how far inside the window the exposure started", not as slack that was waited. Expect
+  a smaller number than the 20-30 ms of `log_x.txt` and a larger `M`.
+- The settle camera's `autoSettleAndCapture in X ms` (was 38-74 ms) is the thing that can go wrong: the
+  extra frames are on the same USB bus and the same light. If the settling grows by more than roughly one
+  frame per extra grab, then the bus is the binding constraint and continuous grabbing has to be metered to
+  about one frame per settling frame; the change would then be a wash and the honest conclusion is that the
+  11 ms cannot be had this way at all.
+- `[EARLY-DEPARTURE]` release to first `G1` must stay in the 5-14 ms of `log_x.txt`, and
+  `attempts=4 fell back=0 frames refused=0` must stay as it is. A frame from outside the window shows up as
+  a refusal or a fallback, and either one means the retroactive choice picked wrongly.
