@@ -1919,8 +1919,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 image = camera.capture();
                 capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
                 grabs = 1;
-                earliestFrameHandedTo.accept(new GrabbedFrame(image, FrameProvenance.unknown(),
-                        capturedAtMs-tCapture));
+                // Stamped as the ringing it is, with the instant it happened: the pre-check can only
+                // judge the head while the head is still moving, and a dump of that frame is worthless
+                // if the frame cannot say when it was taken or which batch it belongs to. If the window
+                // turns out to cover this very frame, the frame returned below carries the window and
+                // this stamp is gone with the callback.
+                earliestFrameHandedTo.accept(new GrabbedFrame(image,
+                        FrameProvenance.ringing(arrivalAtMs, capturedAtMs), capturedAtMs-tCapture));
             }
             else {
                 // Nothing the settling has recorded is about this batch until its epoch has moved, so
@@ -2191,9 +2196,21 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     // the thread that is settling, with the settling numbers in it.
                     preCheckResult.setSettleWindowOpen(true);
                     final PreCheckResult result = preCheckResult;
-                    firstFrameConsumer = mat -> startPreCheck(mat, result, part, camera, nozzle,
-                            wantedLocation, bottomVisionSettings,
-                            settlingCamera.getRecordedFirstCaptureMilliseconds());
+                    firstFrameConsumer = mat -> {
+                        startPreCheck(mat, result, part, camera, nozzle,
+                                wantedLocation, bottomVisionSettings,
+                                settlingCamera.getRecordedFirstCaptureMilliseconds());
+                        // And keep the frame the check was given, while it is still in this thread's
+                        // hand. A settling keeps its last frame and throws the rest away, so this - the
+                        // first - would otherwise exist nowhere: between it and the settled frame is the
+                        // ringing, which is the very distance Stage 2 would be spending. Written after
+                        // the submit rather than before, so that the half millisecond it costs overlaps
+                        // the check instead of the settling's own frame spacing.
+                        FrameDump.writeIfNeeded(bottomVisionSettings, mat,
+                                FrameProvenance.ringing(arrivalAtMs,
+                                        settlingCamera.getRecordedFirstCaptureAtMs()),
+                                camera, nozzle, part, wantedLocation.getRotation());
+                    };
                 }
 
                 BufferedImage capturedBufferedImage = settlingCamera.settleAndCapture(

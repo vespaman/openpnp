@@ -46,6 +46,13 @@ public class FrameProvenance {
          */
         SettleTimedOut,
         /**
+         * A frame handed to the pre-check while the mechanics were still ringing: the first frame of a
+         * settling, or the first grab of a hunt. Never still - that is what it is for - and never used
+         * to align on, but worth keeping, because the difference between this frame and the one the
+         * alignment ended up with is the motion itself.
+         */
+        Ringing,
+        /**
          * Nothing is known. Not still.
          */
         Unknown
@@ -112,6 +119,18 @@ public class FrameProvenance {
             int frameIndex) {
         return new FrameProvenance(Origin.SettleTimedOut, arrivalAtMs, capturedAtMs, UNKNOWN,
                 frameIndex);
+    }
+
+    /**
+     * The first frame of a settling or of a hunt, handed to the pre-check while the mechanics were still
+     * ringing. It carries the instant it was taken and the batch it belongs to, and no claim about
+     * stillness: it is the "before" of a settling, and only worth having next to the "after".
+     *
+     * @param arrivalAtMs when the head was reported at stillstand after moving to the cameras.
+     * @param capturedAtMs when this frame was captured, on the same millisecond scale.
+     */
+    public static FrameProvenance ringing(long arrivalAtMs, long capturedAtMs) {
+        return new FrameProvenance(Origin.Ringing, arrivalAtMs, capturedAtMs, UNKNOWN, 1);
     }
 
     /**

@@ -181,6 +181,9 @@ def role_of(frame, counted, checked, group):
     alignment was measured on, or a frame no line of the log speaks of. Where the hunt took a single
     frame the first two are the same frame, and the count stays unknown.
     """
+    if frame["origin"] == "Ringing":
+        # The dump says so itself: this is the frame handed to the pre-check while the head rang.
+        return "pre-check"
     if frame["frame"] is None:
         return "?"
     if counted is not None:
@@ -215,11 +218,18 @@ def main():
           "light r    dark px   md5        log size mm    rot    offset")
 
     by_arrival = {}
+    anonymous = []
     for frame in frames:
-        by_arrival.setdefault(frame["arrival"], []).append(frame)
+        # A frame that cannot say when it was taken cannot be evidence of anything, and a whole run's
+        # worth of them would collapse into one filename overwriting itself, so they are counted and
+        # complained about rather than sorted.
+        (by_arrival.setdefault(frame["arrival"], []) if frame["arrival"] is not None
+         else anonymous).append(frame)
     ordered = sorted(by_arrival.items())
 
-    failures = []
+    failures = ["%s: named like a dump but carrying no provenance at all: no arrival, no capture, no "
+                "frame number. Such frames all land on the same filename, so a run of them leaves one "
+                "file behind." % frame["file"][:70] for frame in anonymous]
     notes = []
     digests = {}
     previous = {}
@@ -241,7 +251,8 @@ def main():
             # given, so they belong on that frame's row and on no other. A dump older than the pre-check's
             # frame having been written down has no such row, and says so below rather than putting the
             # numbers somewhere they were not measured.
-            judged = checked is not None and frame["frame"] == checked
+            judged = frame["origin"] == "Ringing" or (checked is not None
+                                                      and frame["frame"] == checked)
             quotes = log_entry if judged else None
             if judged:
                 judged_of.add((index + 1, frame["nozzle"]))

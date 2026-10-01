@@ -237,6 +237,13 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
     // either a millisecond stale or the one the settling ended with.
     private volatile long recordedSettleMilliseconds;
     private volatile double recordedFirstCaptureMilliseconds;
+    /**
+     * The instant the first frame of this settling was taken, on the {@link NanosecondTime} millisecond
+     * scale, as opposed to {@link #recordedFirstCaptureMilliseconds} which is how long that capture
+     * took. A frame handed to the pre-check has to be able to say when it happened, or a dump of it is a
+     * picture with no place in the run.
+     */
+    private volatile long recordedFirstCaptureAtMs = FrameProvenance.UNKNOWN;
     private volatile double recordedFirstFrameMilliseconds;
     private volatile int recordedFrameCount;
     /**
@@ -362,6 +369,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 if (firstFrame) {
                     // What the pre-check is judged against, so what it costs has to be known too.
                     recordedFirstCaptureMilliseconds = t1 - tCapture0;
+                    recordedFirstCaptureAtMs = t1;
                     recordedFirstFrameMilliseconds = t1 - t0;
                 }
                 double tCapture = 0.0; 
@@ -789,6 +797,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         // they are looking at has just stopped being the current one.
         settleEpoch++;
         recordedFirstCaptureMilliseconds = 0.0;
+        recordedFirstCaptureAtMs = FrameProvenance.UNKNOWN;
         recordedFirstFrameMilliseconds = 0.0;
         recordedSettleMilliseconds = 0;
         recordedFrameCount = 0;
@@ -801,7 +810,8 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
             BufferedImage image = capture();
-            recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
+            recordedFirstCaptureAtMs = NanosecondTime.getRuntimeMilliseconds();
+            recordedFirstCaptureMilliseconds = recordedFirstCaptureAtMs - tStart;
             recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
             recordedFrameCount = 1;
             if (firstFrameConsumer != null) {
@@ -832,7 +842,8 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
                 }
                 BufferedImage image = capture();
-                recordedFirstCaptureMilliseconds = NanosecondTime.getRuntimeMilliseconds() - tStart;
+                recordedFirstCaptureAtMs = NanosecondTime.getRuntimeMilliseconds();
+                recordedFirstCaptureMilliseconds = recordedFirstCaptureAtMs - tStart;
                 recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
                 recordedFrameCount = 1;
                 recordedSettleMilliseconds = (long) recordedFirstCaptureMilliseconds;
@@ -964,6 +975,14 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      * How long the capture of the very first frame of the last settling took, in ms. This is the
      * frame a pre-check judges, so this is what a pre-check's "capture" means.
      */
+    /**
+     * When the first frame of this settling was taken, on the {@link NanosecondTime} millisecond scale;
+     * {@link FrameProvenance#UNKNOWN} before there has been a first frame.
+     */
+    public long getRecordedFirstCaptureAtMs() {
+        return recordedFirstCaptureAtMs;
+    }
+
     public double getRecordedFirstCaptureMilliseconds() {
         return recordedFirstCaptureMilliseconds;
     }

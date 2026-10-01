@@ -23,6 +23,7 @@ import org.opencv.core.RotatedRect;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.openpnp.model.BottomVisionSettings;
 import org.openpnp.model.CapturedShot;
+import org.openpnp.model.FrameProvenance;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
@@ -85,8 +86,9 @@ public class FrameReplayTest {
      * frames, log_q.txt with what the machine said about them. A corpus too big or too private to commit
      * is replayed by naming its directory instead: -Dreplay.dir=/path/to/the/run.
      */
-    private static final String[] KEPT_RUNS = {
-        "tests_2026-10-01",
+    private static final String[][] KEPT_RUNS = {
+        { "tests_2026-10-01", "bv-corpus", "log_q.txt" },
+        { "tests_2026-10-01", "bv-corpus-r", "log_r.txt" },
     };
 
     /** The rectangle as the alignment logged it, in pixels of the image it was found in. */
@@ -160,10 +162,10 @@ public class FrameReplayTest {
 
     @Test
     public void framesReplayedAwayFromTheMachineMeasureWhatTheMachineMeasured() throws Exception {
-        for (String run : runsToReplay()) {
-            File directory = new File(run);
-            File corpus = new File(directory, "bv-corpus");
-            File log = new File(directory, "log_q.txt");
+        for (String[] run : runsToReplay()) {
+            File directory = new File(run[0]);
+            File corpus = new File(directory, run[1]);
+            File log = new File(directory, run[2]);
             Assumptions.assumeTrue(new File(directory, "machine.xml").isFile()
                     && corpus.isDirectory() && log.isFile(),
                     "the kept run "+run+" (its configuration, its corpus and its log) is not here");
@@ -176,13 +178,28 @@ public class FrameReplayTest {
 
             Configuration.initialize(directory);
             Configuration.get().load();
-            replayAll(frames, measured, preChecked);
+            replayAll(run[0]+"/"+run[1], frames, measured, preChecked);
         }
     }
 
-    private String[] runsToReplay() {
+    /**
+     * A run to replay is a directory holding a machine's configuration, a corpus of frames inside it and
+     * the log of the session that made them. -Dreplay.dir names another such directory to replay instead
+     * of the ones kept in git; -Dreplay.corpus and -Dreplay.log say what its corpus and log are called
+     * when they are not the usual ones.
+     */
+    private String[][] runsToReplay() {
         String named = System.getProperty("replay.dir");
-        return named == null || named.trim().isEmpty() ? KEPT_RUNS : new String[] {named.trim()};
+        if (named == null || named.trim().isEmpty()) {
+            return KEPT_RUNS;
+        }
+        return new String[][] {
+            {
+                named.trim(),
+                System.getProperty("replay.corpus", "bv-corpus").trim(),
+                System.getProperty("replay.log", "log_q.txt").trim(),
+            }
+        };
     }
 
     /**
@@ -193,10 +210,28 @@ public class FrameReplayTest {
      * exactly, and no reading may be matched twice. A rectangle with a centre quoted to seventeen digits
      * is not something a wrong pairing can hit by luck.
      */
-    private void replayAll(List<Kept> frames, List<Measured> measured, List<PreChecked> preChecked)
-            throws Exception {
-        Map<Long, List<Kept>> byArrival = new LinkedHashMap<>();
+    private void replayAll(String run, List<Kept> frames, List<Measured> measured,
+            List<PreChecked> preChecked) throws Exception {
+        // Only a frame the alignment ended up with can be replayed against a rectangle, because only
+        // such a frame has one in the log. The ringing frame a pre-check judged, and any frame whose
+        // provenance is missing altogether, are counted here and left for check_frames.py to worry
+        // about; they are the "before" of a settling and no measurement was ever taken on them.
+        List<Kept> measuredFrames = new ArrayList<>();
+        int ringing = 0;
+        int unprovenanced = 0;
         for (Kept frame : frames) {
+            if (frame.name.origin == FrameProvenance.Origin.Ringing) {
+                ringing++;
+            }
+            else if (frame.name.arrivalAtMs == FrameProvenance.UNKNOWN) {
+                unprovenanced++;
+            }
+            else {
+                measuredFrames.add(frame);
+            }
+        }
+        Map<Long, List<Kept>> byArrival = new LinkedHashMap<>();
+        for (Kept frame : measuredFrames) {
             byArrival.computeIfAbsent(frame.name.arrivalAtMs, key -> new ArrayList<>()).add(frame);
         }
         int perBatch = largestBatch(byArrival);
@@ -207,6 +242,8 @@ public class FrameReplayTest {
                 +"; they are not the same run");
 
         System.out.println();
+        System.out.println(measuredFrames.size()+" frames to replay, "+ringing+" taken while the head was "
+                +"still ringing and "+unprovenanced+" without provenance, which no alignment measured.");
         System.out.println("batch nozzle frame  the rectangle the replay found              replayed mm "
                 + "   the first frame of the hunt was");
 
@@ -259,7 +296,7 @@ public class FrameReplayTest {
         }
         assertTrue(problems.isEmpty(), byArrival.size()+" alignments replayed and "+problems.size()
                 + " of their frames not the rectangle the machine reported; see the table above.");
-        System.out.println(byArrival.size()+" alignments of "+KEPT_RUNS[0]+" replayed through the pipeline "
+        System.out.println(byArrival.size()+" alignments of "+run+" replayed through the pipeline "
                 + "of the run itself, and every frame is the picture the machine measured.");
     }
 
