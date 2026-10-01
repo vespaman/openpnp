@@ -1080,3 +1080,29 @@ So the next work is not behind the release but before it: the settle hunt and th
 `AbstractSettlingCamera` kept its last frame or two with their exposure times, a camera whose frame
 landed 7 ms early could be handed a frame it has already taken once the neighbour's window is known,
 instead of being made to take another one and to sit through it.
+
+### What the next armed run has to show
+
+Two changes went in after `log_v.txt` (REQUIREMENTS §11, "the two things that made the first armed run
+achieve nothing"), and neither can be proved off the machine, because neither is about whether the job is
+correct - both are about when the driver is handed a command. Arm as above, run one job, and look for
+these two lines in this order:
+
+```
+[EARLY-DEPARTURE] nozzle N. set off for (...) while its alignment was still being computed
+commandQueue offer >> ... G1 X... Y...          <- must come BEFORE the next line
+[EARLY-DEPARTURE] N alignments ... are complete K ms later
+```
+
+If the `G1` comes after the `complete` line, the head has again been asked instead of sent, and the
+planner has swallowed the move; that is the failure mode of `log_v.txt` and it must not be read as
+"working". The second thing is the margin on the settle line:
+
+```
+[SETTLE-WINDOW] camera Upp2 frame F at +A ms after the rest is inside the window of Upp1
+                which opened at +W ms, margin M ms of F grabs
+```
+
+`M` was 25-35 ms in `log_v.txt`. It should now be about one capture (8-15 ms) and `F` should not have
+grown. R4 is the requirement: what is being minimised is the time between the head stopping over the
+cameras and the head being allowed to leave.

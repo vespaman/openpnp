@@ -1937,6 +1937,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 // taken while the head is still visibly moving are paid for twice and thrown away.
                 // Aiming at the window is what leaves the settling alone while it measures.
                 awaitProspectOfWindow(settlingCamera, settleEpochBefore, deadlineAtMs);
+                // And aim at it properly: a frame exposed before the window opens is a frame that will be
+                // refused, however good a picture of the part it is. The start of the window is known
+                // before the settling has finished saying it (the candidate), so the wait is against that
+                // instant and the capture that follows is exposed inside the window rather than in the
+                // hope of it. Measured on pn52 (log_v.txt), the frame that was wanted landed 27 ms after
+                // the window opened, because the capture was started as soon as a window looked likely
+                // and the head stood by while the exposure and the verdict ran.
+                awaitWindowOpening(settlingCamera, settleEpochBefore, deadlineAtMs);
 
                 tCapture = NanosecondTime.getRuntimeMilliseconds();
                 image = camera.capture();
@@ -1952,6 +1960,23 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         camera.getName(), grabs, grabs, settlingCamera.getName());
                 return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
                         FrameProvenance.UNKNOWN, grabs), capturedAtMs - tCapture);
+            }
+            // Before waiting for the settling to announce a window, ask the question that can already be
+            // answered: a frame exposed before the opening of the window - and the opening is known from
+            // the candidate, long before the verdict - is refused whatever the verdict then says. Waiting
+            // for the announcement to be told that is the head standing over the cameras for nothing.
+            long openingAtMs = windowOpening(settlingCamera, settleEpochBefore);
+            if (openingAtMs != FrameProvenance.UNKNOWN && capturedAtMs < openingAtMs
+                    && (NanosecondTime.getRuntimeMilliseconds() >= deadlineAtMs
+                            || grabs >= MAX_WINDOW_GRABS)) {
+                Logger.debug("[SETTLE-WINDOW] camera {} drops frame {} after {} grabs: taken {} ms "
+                        +"before the window of {} could open", camera.getName(), grabs, grabs,
+                        openingAtMs-capturedAtMs, settlingCamera.getName());
+                return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
+                        FrameProvenance.UNKNOWN, grabs), capturedAtMs - tCapture);
+            }
+            if (openingAtMs != FrameProvenance.UNKNOWN && capturedAtMs < openingAtMs) {
+                continue;
             }
             // The frame is either already inside a window that has been announced, or the settling is
             // one frame away from announcing one it belongs to. Asking the settling is cheaper than
@@ -2018,6 +2043,42 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     || (settlingCamera.getSettleEpoch() > settleEpochBefore
                             && settlingCamera.getCandidateStillWindowStartAtMs()
                                     != FrameProvenance.UNKNOWN)) {
+                return;
+            }
+            Thread.sleep(SETTLE_POLL_MS);
+        }
+    }
+
+    /**
+     * The earliest instant this settling has already claimed as the opening of a still window, whether it
+     * has said so formally or only has a run of alike frames going, or {@link FrameProvenance#UNKNOWN}
+     * while it has claimed nothing. The candidate is the whole of the point: it is known one or two
+     * frames before the verdict, and a frame aimed at the window can be aimed at it rather than at the
+     * verdict that describes it afterwards.
+     */
+    private static long windowOpening(AbstractSettlingCamera settlingCamera,
+            long settleEpochBefore) {
+        if (settlingCamera.getSettleEpoch() <= settleEpochBefore) {
+            return FrameProvenance.UNKNOWN;
+        }
+        long announced = stillWindowOf(recordedResult(settlingCamera, settleEpochBefore),
+                settlingCamera);
+        return announced != FrameProvenance.UNKNOWN ? announced
+                : settlingCamera.getCandidateStillWindowStartAtMs();
+    }
+
+    /**
+     * Wait until the clock has reached the opening of the window that the next frame is to be taken
+     * inside. Nothing is waited for when no opening has been claimed yet, nor when the settling has given
+     * up (it then claims nothing, and the caller finds that out from the verdict); the deadline bounds it
+     * either way.
+     */
+    private static void awaitWindowOpening(AbstractSettlingCamera settlingCamera,
+            long settleEpochBefore, long deadlineAtMs) throws Exception {
+        while (NanosecondTime.getRuntimeMilliseconds() < deadlineAtMs) {
+            long openingAtMs = windowOpening(settlingCamera, settleEpochBefore);
+            if (openingAtMs == FrameProvenance.UNKNOWN
+                    || NanosecondTime.getRuntimeMilliseconds() >= openingAtMs) {
                 return;
             }
             Thread.sleep(SETTLE_POLL_MS);

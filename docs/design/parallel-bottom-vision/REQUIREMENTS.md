@@ -564,9 +564,44 @@ Full suite with this: 327 tests, no failures.
   10-25 ms, which is all this hides, against a cycle of about 1.9 s and a run-to-run spread of 1.7 s.
   The head is held at the cameras by the settle hunt and by re-shooting a frame that landed outside the
   other camera's window, both of which happen before the release and are untouched here.
-* **The second nozzle.** One nozzle per batch travels before its numbers are in. The other still waits,
-  because the first `Place` collects the whole deferred batch. Sending both to their two places at the
-  release is a larger change of motion than this step was, and has not been done.
+* **The second nozzle.** One nozzle per batch travels before its numbers are in, and it can only be
+  one: the head has a single XY and the two placements are not as far apart as the two nozzles are.
+  Which of the two goes first is decided by the routing step, not by the alignment.
+
+### The two things that made the first armed run achieve nothing
+
+Both are in `log_v.txt` and both were fixed the same evening; both are of the kind that is invisible in
+the job and visible only in the log.
+
+**The head was not sent, it was only asked.** The travel was issued in the placement step, which runs
+after `PrerotateAllNozzlesForPlace`. That step has already queued the placement location as a
+*subordinate* motion (`head.moveTo(..., MotionOption.SubordinateRotation)`), and a subordinate motion
+puts its location into what the motion planner considers the planned destination without the head moving
+an inch. The travel that followed asked for that same XY, so the planner saw no change and handed the
+driver nothing:
+
+```
+01.227 PrerotateAllNozzlesStep: All nozzle pre-rotation for place requested
+01.227 N1.moveTo((155.727478, 99.901314, ...))        <- subordinate, planner now "at" the placement
+01.229 N1.moveTo((155.727478, 99.901314, ...))        <- the early departure; nothing emitted
+01.235 [EARLY-DEPARTURE] 2 alignments ... complete 10 ms later
+01.236 N1.moveTo((155.754131, 99.861207, ...))        <- corrected, differs: G1 at last
+01.236 commandQueue offer >> M204 S10501 G1 X121.81 Y118.08 ...
+```
+
+The head left the cameras at 01.236, one millisecond after the numbers arrived, which is the whole of
+what stage 2 was supposed to hide and is why the measurement showed nothing. The departure is therefore
+issued in `PrerotateAllNozzlesForPlace.step()`, before `prerotateAllNozzles(placeLocator)`, and the
+routing that decides which of the two nozzles goes first has by then been done. R4 is the requirement
+this breaks: the head stood still while the machine was being routed.
+
+**The frame was aimed at the verdict, not at the window.** The camera that does not drive the settling
+took its second frame as soon as a window looked likely, and the still window it then had to satisfy
+opened 27 ms later than the exposure. The start of the window is known before the settling has finished
+saying it - the candidate, `getCandidateStillWindowStartAtMs()` - and a frame that is exposed before the
+opening is refused whatever the verdict says, so waiting for the verdict to be told so is standing still
+for nothing. `awaitWindowOpening()` now waits for the instant, and the too-early frame is rejected on the
+candidate instead of on the announcement.
 * **Rotation.** A part that the alignment turns is turned by the offsets, so the travel without them
   arrives square while the part is not. The final move corrects it, exactly as it always has, but the
   head has travelled to a place the part is not quite in, and that is the whole risk of this step.

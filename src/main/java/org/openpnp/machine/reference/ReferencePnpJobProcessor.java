@@ -293,6 +293,37 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      * <p>The descent is deliberately not split: the corrected location is still reached, and the part
      * still put down, in the one move that the placement has always made.</p>
      */
+    /**
+     * Send the head on its way to the board as early as the route is known, which is the moment the
+     * routing for the place step has been done and before anything else is queued.
+     *
+     * <p>This has to happen before {@link #prerotateAllNozzles(TravellingSalesman.Locator)}, and not in
+     * the placement step, for a reason that is invisible in the job and visible in the log: the
+     * pre-rotation queues the placement location as a <em>subordinate</em> motion, and from then on the
+     * motion planner counts that XY as the planned destination even though the head has not moved. A
+     * move to the same XY afterwards is therefore a move to where the planner already thinks it is, and
+     * it hands the driver nothing at all - the head stands still at the cameras until the corrected
+     * approach supplies a different destination, which is after the alignment it was supposed to
+     * overlap. Measured on pn52 (log_v.txt): released at 01.225, numbers at 01.235, first G1 at 01.236.
+     * Asked before the pre-rotation, the same move is a real one and the head is driving while the last
+     * of the computation finishes.</p>
+     *
+     * @param inOrder the planned placements in the order the place step will work through them
+     */
+    protected void sendOffForTheBoard(List<PlannedPlacement> inOrder) throws JobProcessorException {
+        DeferredAlignment deferred = deferredAlignment;
+        if (deferred == null) {
+            return;
+        }
+        for (PlannedPlacement plannedPlacement : inOrder) {
+            if (deferred.covers(plannedPlacement)
+                    && !deferred.travelling.contains(plannedPlacement.nozzle)) {
+                travelWhileAligning(plannedPlacement);
+                return;
+            }
+        }
+    }
+
     protected void travelWhileAligning(PlannedPlacement plannedPlacement) throws JobProcessorException {
         DeferredAlignment deferred = deferredAlignment;
         if (deferred == null || !deferred.covers(plannedPlacement)
@@ -2748,7 +2779,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
         }
 
         public Step step() throws JobProcessorException {
-            
+            // Before the pre-rotation, not after it: see sendOffForTheBoard().
+            sendOffForTheBoard(plannedPlacements);
+
             prerotateAllNozzles(placeLocator);
             
             return new Place(plannedPlacements);
