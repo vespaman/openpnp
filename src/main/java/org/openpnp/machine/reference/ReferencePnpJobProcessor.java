@@ -247,6 +247,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
          */
         ImageBuffer imageBuffer;
         final long releasedAtMs;
+        /**
+         * The nozzles that have already been sent towards their boards. A nozzle makes the journey
+         * once; the placements behind it are placed from where it stands.
+         */
+        final Set<Nozzle> travelling = new HashSet<>();
+
+        boolean covers(PlannedPlacement plannedPlacement) {
+            return placements.contains(plannedPlacement);
+        }
 
         DeferredAlignment(Align aligner, List<PlannedPlacement> placements,
                 List<CompletableFuture<Void>> futures, ImageBuffer imageBuffer) {
@@ -284,6 +293,44 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
      * same fallback the parallel path already used, only now entered from above the placement instead
      * of from over the cameras.</p>
      */
+    /**
+     * Send a nozzle towards its board while its alignment is still being computed, as far as it can go
+     * without knowing the offsets: to the placement location as it would be with no alignment at all,
+     * at safe Z. A part that came out of the feeder crooked is off by a fraction of a millimetre and a
+     * board is tens of centimetres away, so this is the journey and what the wait that follows covers
+     * is the approach to it.
+     *
+     * <p>The descent is deliberately not split: the corrected location is still reached, and the part
+     * still put down, in the one move that the placement has always made.</p>
+     */
+    protected void travelWhileAligning(PlannedPlacement plannedPlacement) throws JobProcessorException {
+        DeferredAlignment deferred = deferredAlignment;
+        if (deferred == null || !deferred.covers(plannedPlacement)
+                || deferred.travelling.contains(plannedPlacement.nozzle)) {
+            return;
+        }
+        deferred.travelling.add(plannedPlacement.nozzle);
+        Nozzle nozzle = plannedPlacement.nozzle;
+        Location withoutOffsets = getPlacementLocation(plannedPlacement, false);
+        try {
+            Length safeZ = nozzle.getEffectiveSafeZ();
+            if (safeZ == null) {
+                return;
+            }
+            Location travelling = new Location(withoutOffsets.getUnits(), withoutOffsets.getX(),
+                    withoutOffsets.getY(), safeZ.convertToUnits(withoutOffsets.getUnits()).getValue(),
+                    withoutOffsets.getRotation());
+            long startedAt = System.currentTimeMillis();
+            MovableUtils.moveToLocationAtSafeZ(nozzle, travelling);
+            Logger.debug("[EARLY-DEPARTURE] nozzle {} travelled to {} while its alignment was still "
+                    +"being computed, {} ms", nozzle.getId(), travelling,
+                    System.currentTimeMillis()-startedAt);
+        }
+        catch (Exception e) {
+            throw new JobProcessorException(nozzle, e);
+        }
+    }
+
     protected void awaitDeferredAlignment() throws JobProcessorException {
         DeferredAlignment deferred = deferredAlignment;
         if (deferred == null) {
@@ -2733,6 +2780,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             // departure buys: the head has travelled towards the board while the numbers were being
             // made. The travel itself is deliberately not split in two yet, so this is still a
             // stop-and-wait at the placement location; see the design notes.
+            travelWhileAligning(plannedPlacement);
             awaitDeferredAlignment();
 
             // Calculate this after running the script, because the script might have fine-tuned the location data.
@@ -3033,6 +3081,16 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     }
      
     private Location getPlacementLocation(PlannedPlacement plannedPlacement) {
+        return getPlacementLocation(plannedPlacement, true);
+    }
+
+    /**
+     * Where the nozzle has to be to place this part. Without the alignment offsets it is where the
+     * job says the part goes, which is the same journey to within the width of a part and therefore
+     * good enough to travel to while the alignment is still being made.
+     */
+    private Location getPlacementLocation(PlannedPlacement plannedPlacement,
+            boolean withAlignmentOffsets) {
         final JobPlacement jobPlacement = plannedPlacement.jobPlacement;
         final Placement placement = jobPlacement.getPlacement();
         final BoardLocation boardLocation = plannedPlacement.jobPlacement.getBoardLocation();
@@ -3042,7 +3100,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 Utils2D.calculateBoardPlacementLocation(boardLocation, placement.getLocation());
 
         // If there are alignment offsets update the placement location with them
-        if (plannedPlacement.alignmentOffsets != null) {
+        if (withAlignmentOffsets && plannedPlacement.alignmentOffsets != null) {
             /*
              * preRotated means during alignment we have already rotated the component - this is
              * useful for say an external rotating stage that the component is placed on,
