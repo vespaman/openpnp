@@ -2,7 +2,6 @@ import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.RescaleOp;
 import java.io.File;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
@@ -122,8 +121,6 @@ public class SettleWindowCaptureTest {
         private volatile long watchedEpochBefore = 0;
         private volatile Object bus;
         private volatile long busCostMs = 0;
-        private volatile long lastFrameAskedAtMs = FrameProvenance.UNKNOWN;
-        private volatile long lastFrameReturnedAtMs = FrameProvenance.UNKNOWN;
 
         public int getCaptures() {
             return captures;
@@ -134,19 +131,6 @@ public class SettleWindowCaptureTest {
          */
         public int getBlindCaptures() {
             return blindCaptures;
-        }
-
-        /**
-         * When the last frame of this camera was asked for. A frame is a picture of the interval that
-         * begins there, not of the one that ends when the camera hands it over, so this - and not the
-         * time it came back - is the instant that has to be inside a still window.
-         */
-        public long getLastFrameAskedAtMs() {
-            return lastFrameAskedAtMs;
-        }
-
-        public long getLastFrameReturnedAtMs() {
-            return lastFrameReturnedAtMs;
         }
 
         public void watchSettling(AbstractSettlingCamera settlingCamera, long epochBefore) {
@@ -194,10 +178,7 @@ public class SettleWindowCaptureTest {
         @Override
         public BufferedImage capture() throws Exception {
             boolean blind = !hasProspectOfWindow();
-            long askedAtMs = NanosecondTime.getRuntimeMilliseconds();
             BufferedImage image = captureThroughBus();
-            lastFrameAskedAtMs = askedAtMs;
-            lastFrameReturnedAtMs = NanosecondTime.getRuntimeMilliseconds();
             captures++;
             if (blind) {
                 blindCaptures++;
@@ -631,37 +612,25 @@ public class SettleWindowCaptureTest {
     }
 
     /**
-     * Whether there was a frame in flight when the settling said the window was open.
+     * What the camera that hunts for a window is allowed to spend while the other one settles.
      *
-     * The settling claims the opening of a window and announces it in very nearly the same breath: the
-     * candidate is the first frame under the threshold and the agreement is that frame plus the debounce,
-     * which on pn52 is one frame of about 12 ms apart (log_x). So a frame that is exposed only after the
-     * verdict is a whole exposure younger than the window it was wanted in, and the head stands over the
-     * cameras for that exposure. The hunt instead keeps exposing while it has nothing to go on and picks
-     * the frame out afterwards, which buys the frame's length back - at the price of frames thrown away,
-     * which is what the bus test below is for.
-     *
-     * The bus is on here because without one a capture costs nothing, and a frame started after the
-     * verdict is then indistinguishable from one that was already on its way when the verdict came.
+     * It may take one frame before the settling has anything a frame could be still by, because that
+     * frame is the pre-check's and the ringing is where the pre-check works. Every frame after that is
+     * paid for twice: once by this camera, which throws it away, and once by the settling, whose frames
+     * come slower for it. Aiming at the window instead of hammering at it is the difference.
      */
     @Test
-    public void testTheKeptFrameWasAlreadyInFlightWhenTheVerdictLanded() throws Exception {
+    public void testNothingIsGrabbedBeforeThereIsAnythingToAimAt() throws Exception {
         setUp();
 
-        settlingCamera.useBus(BUS, BUS_COST_MS);
-        otherCamera.useBus(BUS, BUS_COST_MS);
-
-        // Frames that move for a while, so the window cannot open before the settling has seen them.
         settlingCamera.setLoudCaptures(12);
         final long settleEpochBefore = settlingCamera.getSettleEpoch();
         otherCamera.watchSettling(settlingCamera, settleEpochBefore);
 
         final AtomicReference<Exception> settlingFailure = new AtomicReference<>();
-        final AtomicLong verdictAtMs = new AtomicLong(FrameProvenance.UNKNOWN);
         Thread settlingThread = new Thread(() -> {
             try {
                 settlingCamera.settleAndCapture(AbstractSettlingCamera.SettleOption.Settle, null);
-                verdictAtMs.set(NanosecondTime.getRuntimeMilliseconds());
             }
             catch(Exception e) {
                 settlingFailure.set(e);
@@ -692,27 +661,16 @@ public class SettleWindowCaptureTest {
         FrameProvenance provenance = captured.get().getProvenance();
         assert provenance.isStill() : "the frame says it is not the one from the window: "
                 + provenance;
-        long windowStartAtMs = provenance.getStillWindowStartAtMs();
-        long askedAtMs = otherCamera.getLastFrameAskedAtMs();
-        assert askedAtMs >= windowStartAtMs : "the frame kept was asked for "+(windowStartAtMs-askedAtMs)
-                +" ms before the window opened, so it pictures the head still moving: "+provenance;
-        // Either the frame was on its way before it was asked for - which is the saving - or the verdict
-        // was already there when it was asked for, and then it had better come straight back.
-        assert askedAtMs <= verdictAtMs.get()
-                || provenance.getCapturedAtMs()-verdictAtMs.get() < BUS_COST_MS
-                : "nothing was in flight when the settling announced the window: it was told at +"
-                        +verdictAtMs.get()+" ms and the frame it accepted was not asked for until +"+askedAtMs
-                        +" ms and came back at +"+provenance.getCapturedAtMs()+" ms, on a bus of "
-                        +BUS_COST_MS+" ms a frame";
-        // What the frames cost is the bus test's business; this one only stops a hunt that never runs
-        // out of ideas, which would grab until the deadline with both cameras drowning.
-        int grabs = otherCamera.getCaptures();
-        assert grabs <= 4*settlingCamera.getCaptureCount()+8 : "took "+grabs+" frames while the settling "
-                +("took "+settlingCamera.getCaptureCount()+", so the hunt is not being stopped by anything");
-        System.out.println("[TEST] settling announced the window at +"+verdictAtMs.get()+" ms; the kept frame "
-                +"was asked for at +"+askedAtMs+" ms and handed over at +"
-                +provenance.getCapturedAtMs()+" ms, grab "+provenance.getFrameIndex()+" of "+grabs
-                +" against "+settlingCamera.getCaptureCount()+" frames of settling");
+        assert otherCamera.getBlindCaptures() <= 1
+                : "took "+otherCamera.getBlindCaptures()+" frames while the settling had no window and "
+                        +"no prospect of one; only the frame the pre-check judges the ringing on is "
+                        +"worth taking then";
+        assert otherCamera.getCaptures() <= 4
+                : "took "+otherCamera.getCaptures()+" frames to find a window it was told the moment "
+                        +"of; the kept frame is number "+provenance.getFrameIndex();
+        System.out.println("[TEST] "+otherCamera.getCaptures()+" grabs into the window, "
+                +otherCamera.getBlindCaptures()+" of them before there was anything to aim at, after "
+                +settlingCamera.getCaptureCount()+" frames of settling");
     }
 
     /**
