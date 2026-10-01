@@ -886,18 +886,18 @@ property is on the command line.
 Bring it back together, frames, config and log, into a new dated directory:
 
 ```
-mkdir -p tests_2026-10-02
-cp -r ~/bv-corpus-r tests_2026-10-02/bv-corpus
+mkdir -p tests_2026-10-01                     # one directory per day, corpora named after the log
+cp -r ~/bv-corpus-r tests_2026-10-01/bv-corpus-r
 cp ~/.openpnp2/machine.xml ~/.openpnp2/packages.xml ~/.openpnp2/parts.xml \
-   ~/.openpnp2/boards.xml ~/.openpnp2/vision-settings.xml tests_2026-10-02/
-cp <the log of that session> tests_2026-10-02/log_r.txt
+   ~/.openpnp2/boards.xml ~/.openpnp2/vision-settings.xml tests_2026-10-01/
+cp <the log of that session> tests_2026-10-01/log_r.txt
 ```
 
 and say whether it is a corpus:
 
 ```
-python3 docs/design/parallel-bottom-vision/check_frames.py tests_2026-10-02/bv-corpus \
-        tests_2026-10-02/log_r.txt
+python3 docs/design/parallel-bottom-vision/check_frames.py tests_2026-10-01/bv-corpus-r \
+        tests_2026-10-01/log_r.txt
 ```
 
 What will be read out of it, in this order:
@@ -907,3 +907,67 @@ What will be read out of it, in this order:
   made of it, which is the number that decides whether an early departure can answer for a still frame;
 - whether the drift has a shape at all (does it fall to nothing by grab three, or does it wander);
 - whether the timings of the run still look like the previous one, i.e. whether the dump changed anything.
+
+### `log_r.txt` happened: the replay holds at eight batches, the ringing frame did not survive
+
+`bv-corpus-r` is that run: 8 alignments, 16 kept frames, `log_r.txt`. Replayed against the log of the run
+itself, every one of the 16 reproduces the rectangle the machine measured - the same result as the first
+corpus, twice as long and with the machine warm:
+
+```
+mvn -Dtest=FrameReplayTest test     # replays every corpus in git, one per log
+```
+
+The ringing frames, which were the point of the run, did not survive, in two ways that the frames
+themselves make plain:
+
+- the hunt handed its first frame to the pre-check with `FrameProvenance.unknown()` - true enough of a
+  frame nobody has proved anything about, but it means the name of the file had no arrival, no capture
+  instant and no frame number, so all eight ringing frames of the run were written to **one filename over
+  each other** and one file is all that is left (`bv__Unknown__...__fna__ana__cna__wna__r+0.0.png`).
+- the settling camera's first frame - the one `Upp1`'s pre-check actually judged - is handed to the check
+  inside the settling loop and was never handed to the dumper at all.
+
+Both are fixed: `FrameProvenance.Origin.Ringing` (dated, belonging to a batch, never still, which is the
+reason to keep it), `AbstractSettlingCamera.getRecordedFirstCaptureAtMs()`, and a dump from the settling's
+first-frame consumer. So: **run it again** with the jar built at 15:01, same command, and the corpus
+should now have two frames per alignment, the older one named `bv__Ringing__...__f1__...`.
+
+What the log gives up even without the frames, comparing what the pre-check saw on grab 1 with what the
+alignment accepted on the frame it kept (the accepted offsets are `Offsets accepted (dx, dy, -, dr)` in
+the part's own frame, so the sizes are the pre-check's and the position is a magnitude):
+
+```
+batch noz   ringing frame          settled frame         offset moved
+            size mm      rot    off     rot      Δ off
+    1 N1    0.99x0.51   -0.0   0.100    -1.98    -0.033 mm
+    1 N2    0.92x0.47   -0.0   0.220     0.14    -0.030 mm
+    2 N1    1.00x0.52   -2.3   0.120    -2.25    -0.065 mm
+    2 N2    0.47x0.97   -0.0   0.180     0.14    +0.034 mm
+    3 N1    1.00x0.52  -13.5   0.250   -13.36    -0.042 mm
+    3 N2    0.92x0.47   -0.0   0.160     0.14    -0.006 mm
+    5 N1    0.96x0.48   -0.0   0.100    -2.10    -0.014 mm
+    5 N2    0.92x0.47   -0.0   0.180     0.10    -0.012 mm
+    6 N1    1.00x0.52   -6.8   0.160    -6.74    -0.035 mm
+    6 N2    0.42x0.95   -0.0   0.210     0.10    -0.005 mm
+    7 N1    0.99x0.52   -5.0   0.160    -6.74    -0.020 mm
+    7 N2    0.97x0.47   -0.0   0.160     0.10    -0.030 mm
+```
+
+Two things read out of that, and they point in different directions:
+
+- **The angle survives the ringing.** Where the pick came out of the feeder rotated - batch 3 by 13.5 deg,
+  batch 6 by 6.8 - the first frame already says the same thing to within 0.1 deg. The head's residual
+  motion does not turn the part.
+- **The size and the centre do not.** The centre is read high by 0.005 to 0.065 mm on the ringing frame,
+  always high, which is the ringing and nothing else. And the size scatters in both directions by up to 6%
+  - `Upp2` saw batch 6's part as 0.42x0.95 mm where its own kept frame says 0.448x0.975, and batch 3's as
+  0.92x0.47 against 0.948x0.501. An 0402 is 1.0x0.5 mm, so 6% of a side is most of the slack a size check
+  has. That is the mechanism the false `SizeOut`s in `log_j` needed and did not have an explanation for:
+  the pre-check judges the one frame on which the mechanics are still moving, and a silhouette measured
+  while it moves is not the silhouette measured after.
+
+So the honest summary for Stage 2 is narrower than it was yesterday: an early departure may rely on the
+angle seen on the ringing frame, must not rely on its size, and cannot rely on its position at all - and
+in any case the still window that has to be waited for opens only 27 to 58 ms after the head stops being
+commanded to move.
