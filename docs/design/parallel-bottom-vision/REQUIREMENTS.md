@@ -500,3 +500,69 @@ What is deliberately *not* done here is changing what the alignment itself accep
 is a real one and it will occasionally throw a job error on a turned part; making that a warning instead
 is a change of behaviour on the gate, and this design's rule about the gate is that it does not move it.
 Full suite with this: 322 tests, no failures.
+
+## 11. Stage 2: letting the head go before the numbers are in
+
+R9 asked for a setting that defaults off and an abort path that is exercised in a test before it is
+ever armed on the machine. Both now exist.
+
+`ReferenceMachine.earlyAlignmentDeparture` is the setting, off, spoken to by
+`Machine.isEarlyAlignmentDepartureEnabled()`. With it off nothing whatever changes: `ParallelAlign`
+waits over the cameras exactly as it always did. With it on, STEP 4 hands the futures, the pictures
+they are reading and the reckoning of what was refused to a `DeferredAlignment`, and the alignment
+step ends.
+
+The head then does the part of the placement that does not need the numbers.
+`getPlacementLocation(plannedPlacement, false)` is the placement as the job describes it, with the
+alignment offsets left out; the nozzle goes there at safe Z through the same
+`MovableUtils.moveToLocationAtSafeZ()` the placement itself uses. A part that came off the feeder
+crooked is out by a fraction of a millimetre and a board is tens of centimetres away, so that is the
+journey, and what the wait that follows covers is the approach to it. The descent is deliberately not
+split: the corrected location is still reached, and the part still put down, in the one move the
+placement has always made.
+
+`ReferencePnpJobProcessor.awaitDeferredAlignment()` is the wait, and it is also the abort. It joins
+the futures, it checks the parts are still on the nozzles, and if any of it fails it calls
+`Align.realignSequentially()` on the whole batch, which walks the head back to the cameras and shoots
+again the ordinary way. A job that was aborted and never reached a placement is not left holding
+pictures: `Cleanup` releases them.
+
+### The abort path, seen in a test
+
+`EarlyDepartureAbortTest` runs a real job on a machine: the `JobProcessorTest` machine with its
+feeders, a second bottom camera so that the two nozzles are not sharing one lens (they would be, and
+then the parallel alignment declines to try and the test would prove nothing), and two parts on one
+board.
+
+The failure is injected by a subclass of `ReferenceBottomVision` that throws once, at the seam the
+deferred pipelines use. That it has to be a subclass and not a wrapper is worth writing down:
+`VisionUtils.findPartAlignmentOffsetsWithCapturedShot()` tests
+`p instanceof ReferenceBottomVision` rather than asking the interface whether it can take a picture
+taken beforehand. A wrapper would therefore not be handed the picture at all, would quietly align the
+old way, and the test would pass while measuring nothing. The same is true of any future second
+alignment implementation: it cannot take part in the parallel alignment until that dispatch is put on
+the interface.
+
+The machine has no way to have a part alignment added to it - the GUI edits XML, and the machine that
+loads with none is given a `ReferenceBottomVision` for itself - so the test stands that one aside for
+its own, keeping its name.
+
+What the test asserts, in order:
+
+* the machine really was armed;
+* a deferred alignment was asked for a pre-captured picture, and refused one;
+* that same placement then went *over the camera* - the ordinary alignment, which moves the head back
+  and shoots for itself;
+* both parts were aligned, put down, and the head came to rest with nothing on it.
+
+Full suite with this: 327 tests, no failures.
+
+### What is not yet claimed
+
+* **The saving.** No measurement on `pn52` yet; the arithmetic says the trip to the board is the
+  expensive part and the numbers arrive long before it ends, but arithmetic is not a stopwatch.
+* **A machine run with the setting on.** Not done, deliberately: this section is the point at which
+  R9's precondition is met, not a run.
+* **Rotation.** A part that the alignment turns is turned by the offsets, so the travel without them
+  arrives square while the part is not. The final move corrects it, exactly as it always has, but the
+  head has travelled to a place the part is not quite in, and that is the whole risk of this step.
