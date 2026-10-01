@@ -4,9 +4,11 @@ What the frames themselves say, as against what the log says was measured on the
 
     check_frames.py <dump directory> <log of the same session>
 
-The dump is the one FrameDump writes when OpenPnP is started with -DframeDump=<directory>: one PNG per
-frame the alignment used, with its whole provenance in its name and nothing in a side file that can get
-separated from it. Two things are read out of it here, and they are of very different kinds.
+The dump is the one FrameDump writes when OpenPnP is started with -DframeDump=<directory>: a PNG per
+frame an alignment kept *and* per frame the pre-check judged, with the whole provenance of each in its
+name and nothing in a side file that can get separated from it. An alignment therefore leaves two frames
+where the hunt took more than one grab: the first frame, which is the ringing and what the pre-check
+answered for, and the last, which is what was measured. The role column says which is which. Two things are read out of it here, and they are of very different kinds.
 
 The first is the provenance, checked against the log: the age of the frame after the head came to rest,
 the instant its still window opened, how many grabs the hunt took, and that the frames on disk are
@@ -154,6 +156,47 @@ def batches(log):
     return groups
 
 
+def grabs(log_entry):
+    """
+    How many grabs the hunt took and which of them the pre-check judged, as the pre-check line says.
+    Either can be unknown: a camera grabbing inside somebody else's window answers before the hunt is
+    over, and the count only fills in once it is.
+    """
+    if not log_entry:
+        return None, None
+    first, _, last = log_entry["frame"].partition("/")
+
+    def number(text):
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return None
+
+    return number(last), number(first)
+
+
+def role_of(frame, counted, checked, group):
+    """
+    Which frame of an alignment this is: the one the pre-check judged, the one the hunt kept and the
+    alignment was measured on, or a frame no line of the log speaks of. Where the hunt took a single
+    frame the first two are the same frame, and the count stays unknown.
+    """
+    if frame["frame"] is None:
+        return "?"
+    if counted is not None:
+        if frame["frame"] == counted:
+            return "kept"
+        if checked is not None and frame["frame"] == checked:
+            return "pre-check"
+        return "unclaimed"
+    highest = max((other["frame"] or 0) for other in group if other["nozzle"] == frame["nozzle"])
+    if frame["frame"] == highest:
+        return "kept"
+    if checked is not None and frame["frame"] == checked:
+        return "pre-check"
+    return "unclaimed"
+
+
 def main():
     if len(sys.argv) != 3:
         print(__doc__.strip())
@@ -168,7 +211,7 @@ def main():
           "  (%d file(s) refused as not ours: %s)" % (len(rejected), ", ".join(rejected))))
     print("batches in the log  %d" % len(groups))
     print()
-    print("batch  nozzle camera                origin    grabs    age    window  margin   "
+    print("batch  nozzle role       camera                origin    grabs    age    window  margin   "
           "light r    dark px   md5        log size mm    rot    offset")
 
     by_arrival = {}
@@ -177,11 +220,14 @@ def main():
     ordered = sorted(by_arrival.items())
 
     failures = []
+    notes = []
     digests = {}
     previous = {}
+    kept_of = set()
+    judged_of = set()
     for index, (arrival, group) in enumerate(ordered):
         log_group = groups[index] if index < len(groups) else {}
-        for frame in sorted(group, key=lambda f: f["nozzle"]):
+        for frame in sorted(group, key=lambda f: (f["nozzle"], f["frame"] or 0)):
             seen = describe(frame["path"])
             log_entry = log_group.get(frame["nozzle"])
             age = frame["captured"] - frame["arrival"]
@@ -189,35 +235,45 @@ def main():
             if seen is None:
                 failures.append("%s: cannot be read as an image" % frame["file"][:70])
                 continue
-            print("%5d  %-6s %-22s %-9s %5s  %5.0f  %6.0f  %6.0f   %6.0f  %7.0f  %s   "
+            counted, checked = grabs(log_entry)
+            role = role_of(frame, counted, checked, group)
+            # The size, rotation and offset in the log are the pre-check's reading of the frame it was
+            # given, so they belong on that frame's row and on no other. A dump older than the pre-check's
+            # frame having been written down has no such row, and says so below rather than putting the
+            # numbers somewhere they were not measured.
+            judged = checked is not None and frame["frame"] == checked
+            quotes = log_entry if judged else None
+            if judged:
+                judged_of.add((index + 1, frame["nozzle"]))
+            print("%5d  %-6s %-9s %-22s %-9s %5s  %5.0f  %6.0f  %6.0f   %6.0f  %7.0f  %s   "
                   "%5.2fx%-5.2f %6s %7s"
-                  % (index + 1, frame["nozzle"], frame["camera"][:22], frame["origin"],
+                  % (index + 1, frame["nozzle"], role, frame["camera"][:22], frame["origin"],
                      "f%d" % frame["frame"] if frame["frame"] is not None else "-",
                      age, frame["window"] - frame["arrival"], margin,
                      seen["radius"], seen["dark_area"], seen["digest"],
-                     log_entry["width"] if log_entry else float("nan"),
-                     log_entry["height"] if log_entry else float("nan"),
-                     log_entry["rotation"] if log_entry else "-",
-                     log_entry["offset"] if log_entry else "-"))
+                     quotes["width"] if quotes else float("nan"),
+                     quotes["height"] if quotes else float("nan"),
+                     quotes["rotation"] if quotes else "-",
+                     quotes["offset"] if quotes else "-"))
 
-            # The frame that was kept is the frame the hunt finished with, and the same hunt counter is
-            # what the pre-check line reports. If the two disagree, the dump and the log are not the run.
-            if log_entry and frame["frame"] is not None:
-                counted = log_entry["frame"].split("/")[1]
-                if counted not in ("?", "None") and int(counted) != int(frame["frame"]):
-                    failures.append("batch %d %s: the log says the hunt took %s grabs and the frame kept "
-                                    "on disk is number %d"
-                                    % (index + 1, frame["nozzle"], counted, frame["frame"]))
-            if frame["origin"] != "QuickCapture" and margin < 0:
-                failures.append("%s: the frame is %.0f ms outside the window it claims to be inside"
-                                % (frame["file"][:70], -margin))
+            if role == "kept":
+                kept_of.add((index + 1, frame["nozzle"]))
+                # Only the kept frame promises to be inside the still window. The pre-check's frame is
+                # taken before it opens, which is the whole reason the pre-check may not judge position.
+                if frame["origin"] != "QuickCapture" and margin < 0:
+                    failures.append("%s: the frame the hunt kept is %.0f ms outside the window it claims "
+                                    "to be inside" % (frame["file"][:70], -margin))
+            if role == "unclaimed":
+                failures.append("%s: a frame numbered %d, which neither the hunt's grab count nor the "
+                                "pre-check accounts for" % (frame["file"][:70], frame["frame"]))
             if seen["levels"] < BLANK_LEVELS:
                 failures.append("%s: the frame is uniform, nothing was captured"
                                 % frame["file"][:70])
             digests.setdefault(seen["digest"], []).append(frame["file"])
 
             # Two frames of one camera have to be two frames. A dump that wrote the same image twice
-            # would look like a settling that held perfectly still.
+            # would look like a settling that held perfectly still, and since the ringing frame and the
+            # kept frame of one alignment are now both here, this is the drift showing or not showing.
             earlier = previous.get(frame["camera"])
             if earlier is not None:
                 difference = float(np.mean(cv2.absdiff(earlier["gray"], seen["gray"])))
@@ -227,6 +283,22 @@ def main():
             previous[frame["camera"]] = seen
 
     print()
+    for index, (arrival, group) in enumerate(ordered):
+        for nozzle in sorted({frame["nozzle"] for frame in group}):
+            if (index + 1, nozzle) not in judged_of:
+                notes.append("batch %d %s: the frame the pre-check judged is not in this dump, so the "
+                             "size and rotation columns are empty for it (run 2026-10-01 is like this; "
+                             "a dump written since FrameDump was told to keep that frame is not)"
+                             % (index + 1, nozzle))
+    for note in notes:
+        print("note: " + note)
+    if notes:
+        print()
+    for index, (arrival, group) in enumerate(ordered):
+        for nozzle in sorted({frame["nozzle"] for frame in group}):
+            if (index + 1, nozzle) not in kept_of:
+                failures.append("batch %d %s: nothing on disk is the frame that hunt kept"
+                                % (index + 1, nozzle))
     for digest, files in digests.items():
         if len(files) > 1:
             failures.append("the same image was written %d times: %s" % (len(files), files[0][:70]))
@@ -243,8 +315,8 @@ def main():
         for failure in failures:
             print("  - " + failure)
         return 1
-    print("every frame on disk is one the hunt kept, its provenance is what the log says it is, and no "
-          "frame is another frame twice.")
+    print("every frame on disk is one the log accounts for, every hunt's kept frame is there and inside "
+          "its window, and no frame is another frame twice.")
     return 0
 
 

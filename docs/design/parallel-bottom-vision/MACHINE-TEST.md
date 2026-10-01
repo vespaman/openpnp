@@ -840,3 +840,70 @@ To do again, and it is the shape of the next corpus run rather than a fault in t
 - **More than one part, and a warm job.** Eight frames of one 0402 on a cold machine say a frame replays;
   they do not say a pipeline replays across packages, which is what a changed threshold would have to
   survive.
+
+## The run that has to happen next: the ringing frame too (`log_r.txt`)
+
+The corpus above settles one question and opens another. It proves that a frame plus the settings of the
+run contain the whole measurement, and it does that on the frame the hunt *kept*. It says nothing about
+the frame the pre-check judged, because a hunt keeps its last frame and throws the rest away, and only the
+kept one was written down. That difference is the quantity Stage 2 is made of: a head may leave the glass
+before the alignment is finished only if the frame it left behind, taken while the head was still ringing,
+says what the frame taken afterwards would have said.
+
+So `ReferenceBottomVision` now dumps the frame the pre-check was given as well, from the same place it
+hands it to the check (`earliestFrameHandedTo`), and the corpus of the next run has two frames per
+alignment where it had one: `f1` from the ringing, `fN` from the settled. `check_frames.py` labels the
+role of each row and complains about a frame no line of the log accounts for; run against the old corpus
+it says so in a note instead, because that corpus genuinely lacks the frames.
+
+The cost was measured before making the trade (`FrameDumpCostTest`, which prints and does not assert):
+
+    measuring a 1080x926 frame of 2 MB of pixels
+    the capture thread pays 0.61 ms per frame for the copy; the writer thread pays 28.09 ms for the PNG,
+    827 kB on disk
+
+which is the whole argument for why a dump does not force the stillness it is trying to observe: the
+capturing thread pays half a millisecond and the encoding is another thread's business at minimum
+priority. It also bounds what dumping *every* grab would have cost, and that is why it is not done: a
+hunt is three to five grabs, so a warm 24-placement job would be a hundred and fifty frames, five seconds
+of stolen CPU and a hundred and twenty megabytes, in exchange for four points on a curve nobody has asked
+for yet. Two frames per alignment, before and after, is the curve that matters.
+
+To run it, on `pn52`, with the jar built from this commit (the share is the repo the machine starts from,
+so `openpnp.sh` needs nothing but a restart):
+
+```
+pgrep -af openpnp-gui                                    # close OpenPnP first if it is open
+cd /mnt/public/stuff/OpenPnP/openpnp
+rm -rf ~/bv-corpus-r                                     # a fresh directory; two runs in one is not a corpus
+./openpnp.sh "-DframeDump=$HOME/bv-corpus-r"
+```
+
+Then the same job as before, and if the machine is being warmed anyway, two or three passes of it, since
+the first pass of a cold machine measures the cold machine. Nothing else to do: the dump is off unless the
+property is on the command line.
+
+Bring it back together, frames, config and log, into a new dated directory:
+
+```
+mkdir -p tests_2026-10-02
+cp -r ~/bv-corpus-r tests_2026-10-02/bv-corpus
+cp ~/.openpnp2/machine.xml ~/.openpnp2/packages.xml ~/.openpnp2/parts.xml \
+   ~/.openpnp2/boards.xml ~/.openpnp2/vision-settings.xml tests_2026-10-02/
+cp <the log of that session> tests_2026-10-02/log_r.txt
+```
+
+and say whether it is a corpus:
+
+```
+python3 docs/design/parallel-bottom-vision/check_frames.py tests_2026-10-02/bv-corpus \
+        tests_2026-10-02/log_r.txt
+```
+
+What will be read out of it, in this order:
+
+- the drift between `f1` and `fN` of one alignment, measured rather than inferred - `FrameReplayTest` can
+  now be pointed at the ringing frame with `-Dreplay.dir=tests_2026-10-02` and will say what the pipeline
+  made of it, which is the number that decides whether an early departure can answer for a still frame;
+- whether the drift has a shape at all (does it fall to nothing by grab three, or does it wander);
+- whether the timings of the run still look like the previous one, i.e. whether the dump changed anything.

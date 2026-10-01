@@ -1772,6 +1772,11 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     = bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
                     && shots.size() == 1 ? new PreCheckResult() : null;
             final boolean[] checkStarted = new boolean[1];
+            // The frame the pre-check judged, kept hold of so that it can be written down below. It is a
+            // frame that exists nowhere else: the hunt keeps the last frame it took and throws the rest
+            // away, and the difference between the first and the last is the ringing, which is the thing
+            // Stage 2 needs a number for.
+            final GrabbedFrame[] earliest = new GrabbedFrame[1];
             // Given the first frame the camera produces, from inside the hunt if there is a hunt,
             // because that is the frame that exists earliest and therefore the one the ringing window
             // can be spent on. Of this frame only the pixels and the duration are used: it carries no
@@ -1779,6 +1784,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             final Consumer<GrabbedFrame> earliestFrameHandedTo = (earliestFrame) -> {
                 if (preCheckResult != null && !checkStarted[0]) {
                     checkStarted[0] = true;
+                    earliest[0] = earliestFrame;
                     Mat earliestImage = OpenCvUtils.toMat(earliestFrame.image);
                     try {
                         startPreCheck(earliestImage, preCheckResult, part, camera, nozzle,
@@ -1802,6 +1808,22 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             }
             FrameDump.writeIfNeeded(bottomVisionSettings, capturedImage, provenance, camera, nozzle,
                     part, wantedLocation.getRotation());
+            // And the frame the pre-check answered for, if the hunt took one before the frame it kept.
+            // Written here rather than in the callback because by now the check has been submitted to the
+            // vision executor and is being judged in another thread, so the millisecond this costs is a
+            // millisecond the settling wait does not notice. Written at all because the two frames of an
+            // alignment are the before and the after of the ringing, and only the after used to survive.
+            if (earliest[0] != null && earliest[0] != grabbed && earliest[0].image != null) {
+                Mat earliestImage = OpenCvUtils.toMat(earliest[0].image);
+                try {
+                    FrameDump.writeIfNeeded(bottomVisionSettings, earliestImage,
+                            earliest[0].provenance, camera, nozzle, part,
+                            wantedLocation.getRotation());
+                }
+                finally {
+                    earliestImage.release();
+                }
+            }
 
             // Turn off light or register with batch operation (if active)
             try {

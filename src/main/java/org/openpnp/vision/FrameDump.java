@@ -41,12 +41,20 @@ import org.pmw.tinylog.Logger;
  * counted is {@code fna}, and every identifier has anything outside {@code A-Za-z0-9.-} replaced by
  * {@code -}, because part ids are full of slashes. {@link #parse(String)} reads a name back.</p>
  *
- * <p>Turning this on is not free: encoding and writing a frame takes tens of milliseconds, which is
- * of the same order as the settling it is meant to observe. The encoding of the pixels into a
- * {@code BufferedImage} is kept on the capturing thread, because the frame belongs to that thread and
- * stops existing when it returns, but the PNG encoding and the write happen on a thread of their own,
- * so that the dump does not lengthen the thing it is watching. It exists to produce evidence for
- * offline analysis, not to be left enabled while timings are being measured.</p>
+ * <p>Two frames of one alignment can be written, because an alignment keeps two: the frame the hunt
+ * finished with, which is the one the part was measured on, and the first frame the camera gave, which
+ * is the one the pre-check answered for and which nothing else preserves. The first is the ringing and
+ * the second is what came after it; between them is the motion that decides whether a head may leave
+ * before the second exists.</p>
+ *
+ * <p>Turning this on is not free, but it is cheaper than it looks, because what is expensive is done
+ * elsewhere: copying the pixels into a {@code BufferedImage} is under a millisecond and has to happen on
+ * the capturing thread, since the frame belongs to that thread and stops existing when it returns, while
+ * the PNG encoding - forty times the work, tens of milliseconds - and the write happen on a thread of
+ * their own at minimum priority. {@code FrameDumpCostTest} measures both on whatever machine runs it. The
+ * dump therefore does not lengthen the settling it is watching, though it is still not something to leave
+ * enabled while timings are being compared between runs: it writes megabytes per job and touches the same
+ * disk the log goes to.</p>
  *
  * <p>{@code -DframeDump=<directory>} turns it on for every vision setting at once, which is what a
  * run meant to produce a corpus needs: the alternative is to open every Bottom Vision setting in the
