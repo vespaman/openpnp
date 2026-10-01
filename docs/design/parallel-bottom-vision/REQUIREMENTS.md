@@ -559,10 +559,14 @@ Full suite with this: 327 tests, no failures.
 
 ### What is not yet claimed
 
-* **The saving.** No measurement on `pn52` yet; the arithmetic says the trip to the board is the
-  expensive part and the numbers arrive long before it ends, but arithmetic is not a stopwatch.
-* **A machine run with the setting on.** Not done, deliberately: this section is the point at which
-  R9's precondition is met, not a run.
+* **The saving.** Measured, and it is not there. `log_v.txt` (MACHINE-TEST) ran the machine with the
+  setting on: every batch was released with its alignments owed, and the wait at the placement was
+  10-25 ms, which is all this hides, against a cycle of about 1.9 s and a run-to-run spread of 1.7 s.
+  The head is held at the cameras by the settle hunt and by re-shooting a frame that landed outside the
+  other camera's window, both of which happen before the release and are untouched here.
+* **The second nozzle.** One nozzle per batch travels before its numbers are in. The other still waits,
+  because the first `Place` collects the whole deferred batch. Sending both to their two places at the
+  release is a larger change of motion than this step was, and has not been done.
 * **Rotation.** A part that the alignment turns is turned by the offsets, so the travel without them
   arrives square while the part is not. The final move corrects it, exactly as it always has, but the
   head has travelled to a place the part is not quite in, and that is the whole risk of this step.

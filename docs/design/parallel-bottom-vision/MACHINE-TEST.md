@@ -1045,3 +1045,38 @@ anything invented:
 
 Neither of these is required to pass. They are the two chances the physical machine gets to say
 something the simulation cannot.
+
+### The armed run, and what it bought
+
+`log_v.txt`, 2026-10-01 18:56 and 18:57, two jobs of four placements, setting on. The machinery works.
+It buys nothing that can be seen.
+
+| | unarmed `log_t.txt` | armed `log_v.txt` |
+|---|---|---|
+| job, the comparable runs | 10.58 s and 8.91 s | 10.88 s (the first job was 15.72 s, warming up) |
+| batches released with an alignment owed | never | 8 of 8 |
+| wait at the placement | nothing to wait | 10, 10, 10, 12, 12, 14, 23, 25 ms |
+| nozzles that travelled before their numbers | - | one per batch, never two |
+
+The wait column is the whole of what was hidden: 10 to 25 ms against a cycle of about 1.9 s. It is
+hidden while the head is on its way, and the head is on its way for hundreds of ms, so hiding it changes
+nothing that a stopwatch on the machine can resolve - the unarmed runs of `log_t.txt` differ from each
+other by 1.7 s.
+
+The reason is visible at the front of the batch, not the back. At 18:56:44 `Upp2` shot a frame at
+44.544, `Upp1`'s window opened at +51 ms, so that frame was 7 ms too early, was refused, and `Upp2` shot
+again at 44.572. The head was released at 44.575 and both alignments were in hand at 44.600. Everything
+expensive happened *before* the release, and stage 2 begins after it.
+
+Two numbers in these logs need reading carefully:
+
+* `set off for ... , {} ms to queue` is the time taken to hand the move to the motion planner, and the
+  asynchronous driver has usually not finished the move when that returns. It is not driving time and
+  must not be compared with anything; the old wording (`travelled ... 3 ms`) invited precisely that
+  mistake, which is how this run came to look as though the head moved after the numbers arrived.
+* `are complete {} ms later` is the honest one: release to last future, measured on the machine.
+
+So the next work is not behind the release but before it: the settle hunt and the re-shot frame. If
+`AbstractSettlingCamera` kept its last frame or two with their exposure times, a camera whose frame
+landed 7 ms early could be handed a frame it has already taken once the neighbour's window is known,
+instead of being made to take another one and to sit through it.

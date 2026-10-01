@@ -312,8 +312,11 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     withoutOffsets.getRotation());
             long startedAt = System.currentTimeMillis();
             MovableUtils.moveToLocationAtSafeZ(nozzle, travelling);
-            Logger.debug("[EARLY-DEPARTURE] nozzle {} travelled to {} while its alignment was still "
-                    +"being computed, {} ms", nozzle.getId(), travelling,
+            // The time measured here is the time it takes to hand the move to the motion planner, not
+            // the time the head spends driving: the asynchronous driver has usually not finished the
+            // move when this returns. The honest number is in awaitDeferredAlignment().
+            Logger.debug("[EARLY-DEPARTURE] nozzle {} set off for {} while its alignment was still "
+                    +"being computed, {} ms to queue", nozzle.getId(), travelling,
                     System.currentTimeMillis()-startedAt);
         }
         catch (Exception e) {
