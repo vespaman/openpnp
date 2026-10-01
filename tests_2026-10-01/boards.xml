@@ -1,0 +1,15 @@
+<openpnp-boards>
+   <board>/home/micke/.openpnp2/voltum_boards/node.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/base_mainboard.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/rm22_40016-1.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/rm10_40017-1.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/vtester.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/40016-2.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/40017-2.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/40016-3.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/40017-3.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/camera_adapter.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/volt003_40022-0.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/chmt_chgr.board.xml</board>
+   <board>/home/micke/.openpnp2/voltum_boards/volt004.board.xml</board>
+</openpnp-boards>

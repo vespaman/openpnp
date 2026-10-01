@@ -789,18 +789,54 @@ and the frame number in the name is the grab count the `[PRE-CHECK]` line report
 frame is another frame twice. The job was a cold one (16.8 s) and its timings mean nothing, which was the
 deal struck above.
 
-Two things the eight frames cannot yet do, and one of them is not a small thing:
+### The replay happened: the frame and the config are the whole measurement
 
-- **The replay needs the machine's config.** Replaying a frame means running *that part's* pipeline over
-  it, and the pipeline is the part's colour thresholds, its masks and its camera geometry, all of which
-  live in `machine.xml`, `packages.xml`, `parts.xml` and `vision-settings.xml`. They were not copied with
-  the frames. There is a snapshot of them under `../../pbv-backup-20260927/config/` whose camera ids are
-  the ones in these names, which is good enough to build the harness against and not good enough to
-  publish a number from: it is five months older than the run, and a threshold that has been retuned since
-  would silently change every conclusion.
-- **A naive reader cannot see the part.** `check_frames.py` looks for the darkest thing inside the lit
-  circle, which finds the bore of the nozzle and the shape of the illumination - an 0402 held over `Upp1`
-  is a few thousand pixels of a 360 px radius field, and nothing about the field makes it the part. Only
-  the machine's own colour pipeline separates them. That is not a defect of the tool; it is the reason the
-  replay has to be the pipeline and not a substitute for it, and it is worth saying out loud in a design
-  whose whole claim is that a frame can be re-judged away from the machine.
+The config came over with the frames (`machine.xml`, `packages.xml`, `parts.xml`, `boards.xml`,
+`vision-settings.xml`; the live set, and `pn52:~/.openpnp2` is where they will be for the next run), and
+the eight frames then went through the pipeline of the run itself on a machine with no head, no lights and
+no camera:
+
+```
+mvn -B -Dtest=FrameReplayTest -DfailIfNoTests=false test
+```
+
+The test loads that config, finds the part, prepares its pipeline the way the head does
+(`preparePipeline` with the part's package and the camera brought down to the part's height), hands one
+kept frame to the pipeline through `CapturedShot` so that `ImageCapture` never reaches for a camera, and
+reads the rectangle out of the `results` stage. The assertion is the rectangle the log recorded for that
+measurement:
+
+```
+Bottom vision part C0402-4n7/50V result rect { {97.96086120605469, 97.51771545410156} 36x18 * 2.2025983333587646 }
+```
+
+All eight frames reproduce it. The centres and the angles agree to the last digit OpenCV prints, which is
+1e-15 of a pixel and not a distance anyone arrives at by being nearly right. Two things keep the
+comparison from being literally bit-for-bit, and neither is a difference in the measurement: OpenCV prints
+a rectangle's sides through `toString()` with the decimals dropped, and it has no opinion about which side
+it calls the width, so one frame came back `18x37 * 0` against the log's `37x18 * 90` - the same four
+corners, named the other way round.
+
+What that buys is the precondition for the rest of the design. The frame plus the settings that were in
+the machine at the time contain the entire measurement: nothing in the analysis needs the head to still be
+over the glass. A saved frame can be re-judged away from the machine and the judgement is the machine's
+own. Stage 2 - leaving before the alignment is finished - rests on that, and so does any future tuning of
+a pipeline against frames kept from a production run.
+
+One thing the corpus turned out not to be, discovered while making the test: `[PRE-CHECK]` measures the
+*first* frame of a hunt (`frame=1/N`), while the frame the hunt keeps, and therefore the frame the dump
+saves, is the last one it took (`f3`, `f4`, `f5`). The eight frames are evidence about the alignment's
+measurement, not the pre-check's. The gap between the two readings of the same part is the motion the hunt
+exists to take out - batch 1 on `Upp1` is 0.98x0.51 mm at -2.4 deg, 0.17 mm off centre on frame 1 and
+0.974x0.488 mm at 2.2 deg on the kept frame. The test prints both columns and compares neither against
+the other.
+
+To do again, and it is the shape of the next corpus run rather than a fault in this one:
+
+- **Dump the frame the pre-check measured.** A run whose dump is switched on early enough catches every
+  grab, not the kept one, if the dump moves into the pre-check as well as the alignment; then the drift
+  above becomes a measured quantity instead of an anecdote, and it is the quantity that decides whether
+  an early departure can be allowed to answer for a still frame.
+- **More than one part, and a warm job.** Eight frames of one 0402 on a cold machine say a frame replays;
+  they do not say a pipeline replays across packages, which is what a changed threshold would have to
+  survive.

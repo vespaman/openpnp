@@ -1,0 +1,13 @@
+<openpnp-panels>
+   <panel>/home/micke/.openpnp2/node-1.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/rm22_v40018-1.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/rm10_v40018-1.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/vtester.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/vtester1.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/40016-2.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/40017-2.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/40016-3.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/40017-3.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/camera_adapter.panel.xml</panel>
+   <panel>/home/micke/.openpnp2/voltum_panels/40030-0.panel.xml</panel>
+</openpnp-panels>
