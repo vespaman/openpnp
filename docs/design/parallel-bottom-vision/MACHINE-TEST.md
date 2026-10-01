@@ -1140,3 +1140,52 @@ Unrelated thing this run made visible: on the fallback path the realignment open
 'visionutils' - cameras: 0`, and the light then comes on only when the nozzle arrives rather than when
 the head starts back. Not caused by anything in this work, but it is a light-off/on batch that registers
 no cameras and is worth a look on its own.
+
+### log_x.txt: the head is now sent before the numbers are in
+
+One job with the `CommandJog` flush, 8 batches, every one of them leaving the cameras before its offsets
+existed:
+
+| batch | release -> first `G1` | release -> offsets complete |
+|---|---|---|
+| 1 | 7 ms | 22 ms |
+| 2 | 5 ms | 22 ms |
+| 3 | 14 ms | 20 ms |
+| 4 | 5 ms | 14 ms |
+| 5-8 | 5, 5, 5, 6 ms | 10, 11, 10, 10 ms |
+
+`attempts=4 fell back=0 frames refused=0` on both jobs, so the deferred path carried everything. This is
+the first run in which R9 is true in the driver log rather than only in the code: the machine was told to
+go, and the arithmetic caught up afterwards.
+
+What it is worth has to be said carefully, because the run time does not show it. The job took 10.8 s;
+the unarmed job took 11.1 s and 9.4 s in `log_t.txt`, and the same binary armed-but-not-overlapping took
+11.4 s in `log_v.txt`. The spread between runs of the same job is a couple of seconds, and what the
+overlap hides is one pipeline per camera, about 14 ms each, so the expected gain is a few tens of
+milliseconds per batch - around one percent. The job clock is the wrong instrument for that; the table
+above is the measurement, and it says the overlap is 10-22 ms per batch and the head is 5-14 ms on its way
+before the offsets land.
+
+The rest of the time over the cameras is not the alignment. One batch, from the light coming on to the
+head being released (278 ms):
+
+```
+   0  M810 on, G1 to the cameras, M400, M114
+ 224  position report back          <- 219 ms of travelling in and confirming
+ 225  first frames, settle starts
+ 265  autoSettleAndCapture in 38 ms
+ 266  pre-check done on Upp1, Waiting for 1 async camera captures
+ 277  the second settle-window frame of Upp2 arrives, 11 ms of that wait
+ 278  head released
+```
+
+So: 219 ms is the approach, which no part of this work touches, and 55 ms is the camera work, of which
+the settling is 38 ms and the join on the other camera's capture is 11 ms. The 10-22 ms now hidden behind
+the departure is most of what is left to hide in those 55 ms.
+
+The join itself is worth naming: eight waits in the run, 38 ms in total, four of them nil and four of
+7-11 ms. It is the job thread waiting at `PASS 1 END` for the secondary camera's settle-window grab, which
+is a frame behind the settle camera by construction. Handing that future to the deferred worker instead
+would release the head a frame earlier, but the light is switched off when the pre-capture batch ends, and
+the batch is nested per thread - so the frame still being exposed would be exposed in the dark. That is a
+question about the light batch outliving the job thread, not about the vision.
