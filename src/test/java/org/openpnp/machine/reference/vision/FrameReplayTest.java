@@ -162,6 +162,11 @@ public class FrameReplayTest {
 
     @Test
     public void framesReplayedAwayFromTheMachineMeasureWhatTheMachineMeasured() throws Exception {
+        String measure = System.getProperty("replay.measure");
+        if (measure != null && !measure.trim().isEmpty()) {
+            measureEveryFrame(new File(measure.trim()));
+            return;
+        }
         for (String[] run : runsToReplay()) {
             File directory = new File(run[0]);
             File corpus = new File(directory, run[1]);
@@ -298,6 +303,45 @@ public class FrameReplayTest {
                 + " of their frames not the rectangle the machine reported; see the table above.");
         System.out.println(byArrival.size()+" alignments of "+run+" replayed through the pipeline "
                 + "of the run itself, and every frame is the picture the machine measured.");
+    }
+
+    /**
+     * What the part's own pipeline makes of every frame on disk, with the log left out of it. An
+     * alignment that refused a part never writes the rectangle it measured into the log, so the only way
+     * to read such a frame back is to measure it here: -Dreplay.measure=the corpus directory, whose
+     * parent holds the configuration of the run that took it.
+     */
+    private void measureEveryFrame(File corpus) throws Exception {
+        File directory = corpus.getParentFile();
+        Assumptions.assumeTrue(directory != null && new File(directory, "machine.xml").isFile()
+                && corpus.isDirectory(), "-Dreplay.measure="+corpus+" has no machine.xml beside it");
+        List<Kept> frames = readFrames(corpus);
+        assertFalse(frames.isEmpty(), "no frame dump in "+corpus);
+        Configuration.initialize(directory);
+        Configuration.get().load();
+        System.out.println();
+        System.out.println("the pipeline of "+directory+" over every frame of "+corpus
+                +", in the order they arrived:");
+        for (Kept frame : frames) {
+            FrameProvenance provenance = frame.name.toProvenance();
+            String when = provenance.isStill() ? "still" : "not still";
+            try {
+                double[] replayed = replay(frame);
+                System.out.printf("%s %-8s %-3s f%-2s %-9s  %.3fx%.3f mm   {%s}%n", when,
+                        frame.name.origin,
+                        frame.name.nozzleId, frame.name.frameIndex,
+                        "+"+(frame.name.capturedAtMs-frame.name.arrivalAtMs)+" ms",
+                        replayed[0], replayed[1], replayed[6], replayed[7], replayed[8], replayed[4],
+                        replayed[5]);
+            }
+            catch (Throwable e) {
+                String why = e.getMessage() == null ? e.toString() : e.getMessage();
+                System.out.printf("%s %-8s %-3s f%-2s %-9s  found nothing: %s%n", when,
+                        frame.name.origin, frame.name.nozzleId, frame.name.frameIndex,
+                        "+"+(frame.name.capturedAtMs-frame.name.arrivalAtMs)+" ms",
+                        why.replaceAll("\\s+", " "));
+            }
+        }
     }
 
     /**
