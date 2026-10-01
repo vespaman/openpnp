@@ -231,6 +231,85 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
         return parallelFramesRefused.get();
     }
 
+    /**
+     * An alignment whose pictures exist but whose numbers do not yet, because the head was allowed to
+     * leave the cameras while the pipelines were still running. Held by the job processor rather than
+     * by the alignment step, because what has to wait for it is a later step, and the wait belongs to
+     * whatever is about to use the offsets.
+     */
+    private static class DeferredAlignment {
+        final Align aligner;
+        final List<PlannedPlacement> placements;
+        final List<CompletableFuture<Void>> futures;
+        /**
+         * The captured pixels, which the pipelines below are reading. They cannot be released when the
+         * alignment step ends, because the alignment step ends before they do.
+         */
+        ImageBuffer imageBuffer;
+        final long releasedAtMs;
+
+        DeferredAlignment(Align aligner, List<PlannedPlacement> placements,
+                List<CompletableFuture<Void>> futures, ImageBuffer imageBuffer) {
+            this.aligner = aligner;
+            this.placements = placements;
+            this.futures = futures;
+            this.imageBuffer = imageBuffer;
+            this.releasedAtMs = System.currentTimeMillis();
+        }
+
+        void release() {
+            if (imageBuffer != null) {
+                imageBuffer.release();
+                imageBuffer = null;
+            }
+        }
+    }
+
+    private DeferredAlignment deferredAlignment;
+
+    /**
+     * @return the alignment that is still being computed after the head has left the cameras, or null.
+     */
+    public DeferredAlignment getDeferredAlignment() {
+        return deferredAlignment;
+    }
+
+    /**
+     * Wait for an alignment that was left running when the head departed, and make sure the parts are
+     * still on their nozzles. Does nothing when there is none, which is the normal case, and the case
+     * whenever the machine has not been armed for an early departure.
+     *
+     * <p>If the computation failed, the batch is aligned the ordinary way, which sends the head back to
+     * the cameras by itself: that is the abort path this feature is required to have, and it is the
+     * same fallback the parallel path already used, only now entered from above the placement instead
+     * of from over the cameras.</p>
+     */
+    protected void awaitDeferredAlignment() throws JobProcessorException {
+        DeferredAlignment deferred = deferredAlignment;
+        if (deferred == null) {
+            return;
+        }
+        deferredAlignment = null;
+        try {
+            CompletableFuture.allOf(deferred.futures.toArray(new CompletableFuture[0])).join();
+            for (PlannedPlacement p : deferred.placements) {
+                deferred.aligner.checkPartOn(p.nozzle);
+            }
+            Logger.debug("[EARLY-DEPARTURE] {} alignments were still being computed when the head "
+                    +"left the cameras and are complete {} ms later", deferred.futures.size(),
+                    System.currentTimeMillis()-deferred.releasedAtMs);
+        }
+        catch (Exception e) {
+            // The head is where it is and the pictures are what they are; the only honest way on is the
+            // way that was there before this feature. Say so, count it, and go and look again.
+            parallelVisionFellBack(e.getCause() == null ? e : e.getCause());
+            deferred.aligner.realignSequentially(deferred.placements);
+        }
+        finally {
+            deferred.release();
+        }
+    }
+
     protected static void resetParallelVisionTally() {
         parallelAttempts.set(0);
         parallelFallbacks.set(0);
@@ -1829,12 +1908,36 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 ParallelAlign parallelAlign = new ParallelAlign(plannedPlacements);
                 parallelAlign.alignAllParallel();
                 for (PlannedPlacement p : plannedPlacements) {
-                    checkPartOn(p.nozzle);
+                    // A batch that was left running is checked when it is waited for, not now: the
+                    // part may still be found to be misplaced, and then it is aligned again.
+                    if (deferredAlignment == null) {
+                        checkPartOn(p.nozzle);
+                    }
                     completed.add(p);
                 }
             }
         }
         
+        /**
+         * Align a batch of placements the ordinary way, one nozzle at a time, checking each part is
+         * still on afterwards. This is the abort path of an early departure and the fallback of a
+         * failed parallel pass: the head is returned to the cameras by the alignment itself, so the
+         * caller does not have to know where the head is, only that it may not be over the board.
+         */
+        private void realignSequentially(List<PlannedPlacement> placements)
+                throws JobProcessorException {
+            for (PlannedPlacement p : placements) {
+                PartAlignment partAlignment = AbstractPartAlignment
+                        .getPartAlignment(p.jobPlacement.getPlacement().getPart());
+                if (partAlignment == null) {
+                    p.alignmentOffsets = null;
+                    continue;
+                }
+                align(p, partAlignment);
+                checkPartOn(p.nozzle);
+            }
+        }
+
         private void align(PlannedPlacement plannedPlacement, PartAlignment partAlignment) throws JobProcessorException {
             final Nozzle nozzle = plannedPlacement.nozzle;
             final JobPlacement jobPlacement = plannedPlacement.jobPlacement;
@@ -1978,7 +2081,19 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     }, getVisionExecutor()));
                 }
                 
-                // STEP 4: Wait for all background threads
+                // STEP 4: Wait for all background threads - unless the machine lets the head go while
+                // they run. Then the wait, the pixels they are reading and the reckoning of what was
+                // refused all belong to the placing of the parts, and this step is finished.
+                if (machine.isEarlyAlignmentDepartureEnabled()) {
+                    deferredAlignment = new DeferredAlignment(this, plannedPlacements, futures,
+                            imageBuffer);
+                    // The finally below must not release what the worker threads have not finished
+                    // reading; it now owns nothing.
+                    imageBuffer = null;
+                    Logger.debug("[EARLY-DEPARTURE] head released with {} alignments still being "
+                            +"computed", futures.size());
+                    return;
+                }
                 try {
                     CompletableFuture.allOf(futures.toArray(
                         new CompletableFuture[0])).join();
@@ -2611,7 +2726,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             final BoardLocation boardLocation = plannedPlacement.jobPlacement.getBoardLocation();
 
             scriptBeforeAssembly(plannedPlacement);
-            
+
+            // An alignment that was left running when the head left the cameras has to be finished
+            // before anything reads the offsets it produces - which is everything below this line.
+            // Waiting here rather than in the alignment step is the whole of the time the early
+            // departure buys: the head has travelled towards the board while the numbers were being
+            // made. The travel itself is deliberately not split in two yet, so this is still a
+            // stop-and-wait at the placement location; see the design notes.
+            awaitDeferredAlignment();
+
             // Calculate this after running the script, because the script might have fine-tuned the location data.
             // Such scripts can be used as a crude alternative to a "local fiducial" feature.
             Location placementLocation = getPlacementLocation(plannedPlacement);
@@ -2782,7 +2905,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     protected class Cleanup implements Step {
         public Step step() throws JobProcessorException {
             fireTextStatus("Cleaning up.");
-            
+
+            // An alignment that was left running when the head went away has nobody left to wait for
+            // it now. Nothing is owed but the pixels it was reading, and paying that debt means
+            // releasing them rather than leaving them to the garbage collector.
+            if (deferredAlignment != null) {
+                deferredAlignment.release();
+                deferredAlignment = null;
+            }
+
             try {
                 // Safe Z the machine
                 head.moveToSafeZ();

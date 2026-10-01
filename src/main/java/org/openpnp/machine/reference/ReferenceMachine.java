@@ -207,6 +207,15 @@ public class ReferenceMachine extends AbstractMachine {
     @Element(required = false)
     private boolean parallelAlignmentEnabled = true;
 
+    /**
+     * Stage 2 of the parallel bottom vision: let the head fly to the board while the alignment of the
+     * pictures it took is still being computed, and apply the offsets when it gets there. Aborts back
+     * to the ordinary sequential alignment if the computation fails. Default off; see
+     * ReferencePnpJobProcessor and docs/design/parallel-bottom-vision.
+     */
+    @Element(required = false)
+    private boolean earlyAlignmentDeparture = false;
+
     @Element(required = false)
     private Solutions solutions = new Solutions();
 
@@ -461,6 +470,18 @@ public class ReferenceMachine extends AbstractMachine {
     @Override
     public void setParallelAlignmentEnabled(boolean parallelAlignmentEnabled) {
         this.parallelAlignmentEnabled = parallelAlignmentEnabled;
+    }
+
+    @Override
+    public boolean isEarlyAlignmentDepartureEnabled() {
+        return earlyAlignmentDeparture;
+    }
+
+    @Override
+    public void setEarlyAlignmentDeparture(boolean earlyAlignmentDeparture) {
+        boolean old = this.earlyAlignmentDeparture;
+        this.earlyAlignmentDeparture = earlyAlignmentDeparture;
+        firePropertyChange("EarlyAlignmentDeparture", old, earlyAlignmentDeparture);
     }
 
     @Override

@@ -478,6 +478,24 @@ public interface Machine extends WizardConfigurable, PropertySheetHolder, Closea
     public default void setParallelAlignmentEnabled(boolean parallelAlignmentEnabled) {
     }
 
+    /**
+     * @return True if the head may leave the cameras before the alignment of the batch has been
+     *         computed, the pictures having been taken and the pre-checks having passed. The alignment
+     *         is then finished while the head is on its way to the board, and the offsets are applied
+     *         when it arrives. If the computation fails, the head goes back to the cameras and the
+     *         batch is aligned the ordinary way.
+     *
+     *         Off by default, and it should stay off until the abort path above has been seen to work
+     *         on the machine in question: it trades a wrong placement risk that is bounded by the
+     *         abort path for a little time per placement. See ReferencePnpJobProcessor.
+     */
+    public default boolean isEarlyAlignmentDepartureEnabled() {
+        return false;
+    }
+
+    public default void setEarlyAlignmentDeparture(boolean earlyAlignmentDeparture) {
+    }
+
     public CameraBatchOperation getCameraBatchOperation();
 
 }

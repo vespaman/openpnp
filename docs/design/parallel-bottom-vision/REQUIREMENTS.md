@@ -167,6 +167,20 @@ Machine values (from `~/.openpnp2` on `pn52`, package `C0402`, bottom vision `R0
 | one pad of the footprint | 0.25 x 0.50 mm = 7 x 15 px |
 | part centre in the failing frame | 17 px from the crop centre = 0.58 mm |
 
+`log_s.txt` (2026-10-01, `bv-corpus-s` in git) hit it again on `N2`, and this time the
+frames came out with it: the ringing grab and the settled grab of the same batch both
+measure `0.237 x 0.501 mm` when replayed here through the machine's own pipeline, while
+the short side is exactly nominal and only the long side reads a quarter. A part slid
+sideways on the tip, with the rest of it behind the shoulder of the tip or outside the
+mask, looks exactly like that; a part blurred by ringing does not, because ringing makes
+an outline bigger and does not reproduce to the pixel 26 ms later.
+
+So the question of this section is still open, and it is now answerable from the corpus:
+overlay the mask circle of `R0402` on
+`bv__Settled__CAM1830e742fb154786__N2__C0402-4n7-50V__f3__a+240515342.0__c+240515380.0__w+240515369.0__r+0.0.png`
+and see whether the part's own outline runs outside it. Parked until Stage 2 lands,
+because it changes what the size check is allowed to say, not when the head may leave.
+
 Two candidate mechanisms, and they need different fixes:
 
 1. **The mask clips the part.** The mask radius is the part's half-diagonal *plus* the
