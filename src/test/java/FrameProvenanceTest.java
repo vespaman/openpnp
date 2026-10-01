@@ -291,6 +291,23 @@ public class FrameProvenanceTest {
         assert parsed.toProvenance().isStill() : "the frame that came back is not as still as the "
                 + "frame that went out";
 
+        // The frame taken while the head is still ringing is the one a corpus is gathered for, so it
+        // has to keep its name through a round trip too - and above all two of them have to keep two
+        // names. A run whose ringing frames were all handed over as unknown wrote all eight of them to
+        // one filename over each other, and the corpus had one frame where eight should have been.
+        String ringingName = FrameDump.fileName(FrameProvenance.ringing(1000, 1016), camera, nozzle,
+                realPart, -12.5);
+        FrameDump.Name ringing = FrameDump.parse(ringingName);
+        assert ringing.origin == FrameProvenance.Origin.Ringing : ringing.origin;
+        assert ringing.arrivalAtMs == 1000 : "a ringing arrival lost: "+ringing.arrivalAtMs;
+        assert ringing.capturedAtMs == 1016 : "a ringing capture lost: "+ringing.capturedAtMs;
+        assert !ringing.toProvenance().isStill() : "a ringing frame claims to be still: "+ringingName;
+        assert !FrameProvenance.ringing(1000, 1033).equals(FrameProvenance.ringing(1000, 1016));
+        String anotherRinging = FrameDump.fileName(FrameProvenance.ringing(1000, 1033), camera, nozzle,
+                realPart, -12.5);
+        assert !anotherRinging.equals(ringingName) : "two ringing frames of one batch would be written "
+                +"to one file over each other: "+ringingName;
+
         // A frame with nothing to say has to survive as a frame with nothing to say, rather than
         // coming back as something more encouraging.
         String unknownName = FrameDump.fileName(FrameProvenance.unknown(), camera, nozzle, realPart,
