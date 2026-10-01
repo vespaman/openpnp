@@ -8,6 +8,7 @@ import org.openpnp.machine.reference.vision.ReferenceBottomVision.PartSizeCheckM
 import org.openpnp.machine.reference.vision.ReferenceBottomVision.PreCheckAction;
 import org.openpnp.model.BottomVisionSettings;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Part;
@@ -18,6 +19,7 @@ import org.openpnp.spi.Machine;
 import org.openpnp.spi.Nozzle;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.VisionUtils;
+
 
 import com.google.common.io.Files;
 
@@ -70,16 +72,23 @@ public class PreCheckReportTest {
     }
 
     private PreCapturedPlacement captureWithSettle(Location offset) throws Exception {
+        return captureWithSettle(offset, 0.0);
+    }
+
+    /**
+     * The rotation is the rotation of the nozzle, and the simulated camera draws the part at the
+     * rotation it is held at, which is how a part a quarter turn off is produced without lying about
+     * its size.
+     */
+    private PreCapturedPlacement captureWithSettle(Location offset, double rotation) throws Exception {
         final PreCapturedPlacement[] captured = new PreCapturedPlacement[1];
         machine.execute(() -> {
             nozzle.pick(part, null);
             Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
             if (offset != null) {
-                MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation.add(offset));
+                wantedLocation = wantedLocation.add(offset);
             }
-            else {
-                MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
-            }
+            MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation.derive(null, null, null, rotation));
             captured[0] = bottomVision.captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, true);
             return true;
         });
@@ -163,7 +172,10 @@ public class PreCheckReportTest {
         assert result.getSettleMs() < 0.0 : "a camera that does not settle claims a settling: "+result;
         assert !result.isSettleWindowOpen() : "the settling of a camera that does not settle is still open: "+result;
         assert result.getFrameCount() == 1 : "one frame was captured, the log says "+result.getFrameCount();
-        assert result.getCaptureMs() > 0.0 : "the capture was not timed: "+result;
+        // Zero is a number this one may honestly reach: a simulated frame is rendered between two
+        // readings of a clock that counts milliseconds. What must not happen is the field being left
+        // at the -1 of a thing that was never timed.
+        assert result.getCaptureMs() >= 0.0 : "the capture was not timed: "+result;
         assert result.getPipelineMs() >= 0.0 : "cloning the pipeline was not timed: "+result;
         System.out.println("[TEST] pre-check on the only frame of a camera that does not settle: "+result);
     }
@@ -230,4 +242,5 @@ public class PreCheckReportTest {
         assert shot.getImage() != null : "the shot has no image, and the pre-check is supposed to be unrelated";
         assert shot.getPreCheckResult() == null : "a disabled pre-check still produced "+shot.getPreCheckResult();
     }
+
 }

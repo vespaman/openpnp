@@ -270,6 +270,28 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
     private volatile long recordedSettledFrameAtMs = FrameProvenance.UNKNOWN;
     private volatile long recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
     private volatile long recordedPreviousFrameAtMs = FrameProvenance.UNKNOWN;
+    /**
+     * The same claim as {@link #recordedStillWindowStartAtMs}, but made while the settling is still
+     * running: the moment from which the frames so far look alike, or {@link FrameProvenance#UNKNOWN}
+     * while the last frame still said "moving".
+     *
+     * It is a promise and not a verdict. One more frame can break the run and reset it, in which case
+     * the stillness the settling eventually certifies starts later than this said. Anyone acting on it
+     * therefore has to have the verdict checked afterwards, which is what the recorded window is for.
+     *
+     * It exists because a frame cannot be recognised as still by the camera that is not settling. That
+     * camera can only go by what the settling says and when, and every frame it takes for itself is a
+     * frame the settling wanted: taking frames before there is any prospect of one of them being still
+     * is pure cost for both cameras.
+     */
+    private volatile long candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+    /**
+     * Counts the settlings this camera has been asked to perform. Another camera waiting on this one's
+     * still window cannot tell a window of this batch from a window of the batch before it by looking at
+     * the window alone - both are perfectly good timestamps - so it has to watch this number move
+     * before it believes any of them.
+     */
+    private volatile long settleEpoch = 0;
 
     private SimpleGraph startDiagnostics() {
         if (settleDiagnostics) {
@@ -471,10 +493,20 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 if (result > settleThreshold) {
                     // No good, reset the debounce count, as we crossed over the limit (again).
                     debounceCount = 0;
+                    // The run of alike frames is broken, so nothing before this frame can be called
+                    // still. Whoever was watching for a window has to start over as well.
+                    candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
                 }
                 else if (result > 0.0) {
                     // Register one "bounce" under the limit.
                     debounceCount++;
+                    if (candidateStillWindowStartAtMs == FrameProvenance.UNKNOWN) {
+                        // Two frames that look alike. From the earlier of them the head may
+                        // provisionally be called still, which is the earliest moment another camera
+                        // has any prospect of taking a still frame. The verdict itself only comes when
+                        // the debounce is full; until then this is a promise that can still be broken.
+                        candidateStillWindowStartAtMs = previousFrameAtMs;
+                    }
                 }
                 if (t > timeout || debounceCount > settleDebounce) {
                     // Timeout or debounced settleThreshold reached.
@@ -486,6 +518,11 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                     recordedSettledFrameAtMs = t1;
                     recordedStillWindowStartAtMs = agreed ? previousFrameAtMs
                             : FrameProvenance.UNKNOWN;
+                    if (!agreed) {
+                        // Nothing was demonstrated, so the provisional claim that some two frames
+                        // once looked alike is worth exactly as much as the settling that produced it.
+                        candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+                    }
                     // Cleanup.
                     lastSettleMat.release();
                     lastSettleMat = null;
@@ -748,7 +785,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      */
     public BufferedImage settleAndCapture(SettleOption settleOption, Consumer<Mat> firstFrameConsumer) throws Exception {
         // Whatever happens below, the recorded numbers are about this settling and not about the
-        // previous one.
+        // previous one. The epoch moves first, so anyone watching for a window can tell that the one
+        // they are looking at has just stopped being the current one.
+        settleEpoch++;
         recordedFirstCaptureMilliseconds = 0.0;
         recordedFirstFrameMilliseconds = 0.0;
         recordedSettleMilliseconds = 0;
@@ -757,6 +796,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         recordedSettledFrameAtMs = FrameProvenance.UNKNOWN;
         recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
         recordedPreviousFrameAtMs = FrameProvenance.UNKNOWN;
+        candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
         long tStart = NanosecondTime.getRuntimeMilliseconds();
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
@@ -974,6 +1014,27 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      */
     public long getRecordedStillWindowStartAtMs() {
         return recordedStillWindowStartAtMs;
+    }
+
+    /**
+     * From when the head may provisionally be called still while the settling is still going on, see
+     * {@link #candidateStillWindowStartAtMs}. Another camera aims its own frame at this and has the
+     * claim confirmed afterwards by {@link #getRecordedStillWindowStartAtMs()}, because a run of alike
+     * frames can still be broken by the next one. {@link FrameProvenance#UNKNOWN} while the last frame
+     * said "moving", and while this camera has not been asked to settle.
+     */
+    public long getCandidateStillWindowStartAtMs() {
+        return candidateStillWindowStartAtMs;
+    }
+
+    /**
+     * How many settlings this camera has been asked to perform. Another camera waiting for this one's
+     * still window takes the number before it starts waiting and must see it move before the recorded
+     * window means anything about its own batch: the window of the previous placement was a real
+     * stillness, but it belongs to a head that has since moved away.
+     */
+    public long getSettleEpoch() {
+        return settleEpoch;
     }
 
     public SimpleGraph getSettleGraph() {

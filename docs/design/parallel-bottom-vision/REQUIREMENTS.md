@@ -56,11 +56,12 @@ Cameras that are not driving the settling free-run during the settling. The fram
 is the **last one captured after the second-to-last agreeing settle frame** of the settle
 camera. A frame from before that window is discarded, not used.
 
-*Enforced by:* the settle camera exposes the timestamps of its agreeing frames; the
-non-settle camera keeps its frame ring with timestamps; selection picks the newest frame
-inside the window; nothing outside is eligible (R1).
-*Proved by:* per-camera log field showing the frame's age relative to the window start.
-*(missing)*
+*Enforced by:* the settle camera exposes the timestamps of its agreeing frames and the epoch of
+the settling they belong to; the non-settle camera keeps grabbing until a window exists and
+keeps the first frame captured at or after its start; nothing outside is eligible (R1).
+*Proved by:* per-camera log field showing the frame's age relative to the window start, and the
+`[SETTLE-WINDOW]` line with the margin. Implemented in step 2, off-machine proof in §10, machine
+proof outstanding.
 
 ### R4 — Arrival cost is what we are minimising, and it is measured
 The quantity to reduce is the wall time between "head stopped over the cameras" and
@@ -73,6 +74,13 @@ must be shown against this line, not argued.
 The pre-check answers "is there a part on this tip, and is it the right part". It must
 not fail on the part being off-centre, because during the ringing window the position is
 not trustworthy and the offset is going to be corrected by the alignment anyway.
+
+When the two cameras do not settle the same way, the frame the pre-check looks at and the frame the
+alignment gets are deliberately different frames. The camera that waits hands over its very first
+frame for checking and a later, in-window frame for measuring, because the first frame is the only
+one that exists while there is still time to look at it: stage 1 above is what the ringing window is
+for. A check that waited for the alignment's own frame would run after the settling, on the executor
+the alignment is about to want, and would deliver its verdict to a head that has already left.
 
 *Enforced by:* the position verdict must not be able to make the overall verdict bad.
 *Proved by:* a log line per nozzle whose verdict is independent of its offset field.
@@ -306,3 +314,144 @@ The arrival instant itself needed a fix to be measurable at all: `preCaptureAllI
 it, so every frame in `log_l` reads `quickcapture f1` with no age. It is now recorded in
 `moveNozzlesToAlignmentPosition()` after `WaitForStillstand` and passed to all three pre-captures,
 which is what produced the ages above.
+
+## 10. Step 2: a frame from inside somebody else's still window
+
+`ReferenceBottomVision.captureImageFromSettlingWindow()` is the non-settling camera's capture now.
+It grabs frames while the main thread waits for the settling and keeps the first one whose capture
+instant is at or after the start of the settling camera's window. The check is made after each grab,
+so the frame that gets kept is the one that was being exposed while the settling came to its
+conclusion, not a frame after it: on the machine that should mean no additional arrival cost at all.
+
+Four things had to be decided, and they are in the code as comments as well:
+
+- **Whose window.** `AbstractSettlingCamera` counts the settlings it is asked for
+  (`getSettleEpoch()`), and the grabber is handed that number before the batch submits anything. The
+  window recorded by an earlier settling was a real stillness about a head that has since moved away,
+  so none of the recorded numbers are read until the epoch has moved. Without this, a job whose
+  second camera is occasionally slower than the settling would quote the previous placement's
+  stillness, which is exactly the kind of wrong that no log would show.
+- **A waiting that measured nothing.** `SettleResult.FixedTime` has no window, yet its own frame is
+  accepted on the claim of the configured wait. The other camera's frame at that instant has the
+  same claim or it has none, so the end of the wait is the window for it too. This is a decision
+  about what the existing rule means, not a new permission.
+- **When to stop.** The deadline is the settling's own timeout plus 100 ms counted from the rest, and
+  a settling that reports `TimedOut` is noticed between grabs and ends the hunt at once: no window is
+  coming, so waiting is only a slower way of refusing. There is also a grab-count ceiling, which is
+  not a timing decision but a guard for a clock that cannot be trusted to have reached the deadline.
+- **Nothing is thrown away silently.** A frame with no window goes over with `UNKNOWN` in it, the
+  alignment refuses it (R1), the fallback is counted (R8), and the `[SETTLE-WINDOW]` line says how
+  many grabs it took and what the margin was.
+
+Proved off machine, with generated frames, in `SettleWindowCaptureTest`. The simulated camera is the
+interesting difficulty: it renders identical pixels, and a difference of exactly zero is *not*
+agreement but the absence of a measurement, so such a camera can only ever time out. The test camera
+therefore supplies motion that stops — the first frames are shifted bodily, after them they wobble by
+one grey level — and the settling agrees for the reason it agrees on the machine:
+
+```
+[TEST] frame inside the window of the other camera: streamed f1 +77.0ms window+17.0ms
+[TEST] configured wait shared with the other camera: streamed f1 +51.0ms window+8.0ms
+[TEST] refused after a timed out settling in 8 ms: streamed f1 +209.0ms
+[TEST] stale window refused after 152 ms: streamed f81 +193.0ms
+[TEST] grabbed into the window on another thread: streamed f69 +167.0ms window+5.0ms after 15 frames of settling
+```
+
+The last of those is the shape of the machine: one thread settling, another thread grabbing, neither
+knowing what the other has done, and the kept frame inside the window that the settling recorded.
+
+### The pre-check belongs to the ringing, not to the stillness
+
+`log_n` showed the in-window frame working, and showed the mistake next to it: the camera that hunts
+for a window was starting its pre-check on the frame it keeps, which is the frame that ends the hunt,
+so the `[PRE-CHECK]` line came *after* the settling and after the `[SETTLE-WINDOW]` line. That is the
+opposite of stage 1. It also takes the vision executor at the moment the alignment wants it, and its
+verdict arrives too late to be the safety net it is supposed to be, since a net is only a net if it is
+under the head while the head is still there.
+
+`FrameGrab` now takes a handover callback: a strategy that produces more than one frame passes the
+earliest one to it as soon as it has it. The first grab of the hunt is therefore also the frame the
+pre-check is running on, roughly the whole ringing window before the alignment frame exists, and the
+`frame=1/n` field of the `[PRE-CHECK]` line has become the fact it always looked like: the first frame
+checked, out of that many grabbed. The `[SETTLE-WINDOW]` line quotes camera names rather than ids now,
+for the same reason: the two lines have to be seen to belong to the same camera.
+
+What asserts it is not a stopwatch. Three threads contending for a CPU make any deadline in a test a
+race, and the first version of this test failed for that reason and proved nothing either way. Instead
+the test subclasses the vision and records how many frames the camera had served when `startPreCheck`
+was called, and the camera counts its own captures; the number is left behind by the code and cannot
+be late:
+
+```
+[TEST] pre-check started on grab 1 of a hunt of 89: ... verdict=Ok ... nominal=2.0x1.25 ... frames=89
+```
+
+One grab for the check, eighty-nine for the alignment, and the verdict was `Ok` before the head could
+have gone. Full suite with this: 318 tests, no failures.
+
+`log_o` has since shown that: for the camera that does not drive the settling the `[PRE-CHECK]` line is
+now the earlier of the two, `PRE-CHECK-LATE` is 0, and everything else stayed where `log_n` left it.
+One field of it was a lie and has been taken back: `frame=1/0`. The check can report while the hunt is
+still running, and filling the denominator from `camera.getRecordedFrameCount()` quoted that camera's
+*previous* settling - the camera that hunts does not settle at all in this batch. The number belongs to
+whoever captured, so the check no longer invents one and the line says `frame=1/?`, with the grab count
+in the `[SETTLE-WINDOW]` line of the same batch, which knows it.
+
+### The hunt aims at the window; it does not hammer at it
+
+`log_o` also showed something that had nothing to do with the pre-check and everything to do with the
+settling, and it had been there since `log_n`: the settling of the camera that drives it took 66-70 ms
+where `log_m` had measured 34-40 ms. Reading the frame gap rather than the total says what happened.
+
+| log | what the other camera did meanwhile | settling | settling frames | gap between them |
+|---|---|---|---|---|
+| `log_c`..`log_j` | captured afterwards, one at a time | 38-48 ms | 2.2-2.5 | 11-13 ms |
+| `log_m` | one quick frame | 34.5 ms | 5.1 | 11.8 ms |
+| `log_n`, `log_o` | 4-7 frames during the settling | 65.6-66.9 ms | 3.2-3.4 | 16.3-18.3 ms |
+
+The frames the settling needs are the mechanics and they did not change; the *gap* did, by a third. Two
+cameras share a USB bus, a CPU and a light, and `OpenPnpCaptureCamera.internalCapture()` waits for a
+fresh frame by spinning on `hasNewFrame()` with `Thread.yield()`, so a second camera taking frames at
+full rate is not free: on this machine it costs the settling about 1 ms of its frame period per frame
+taken next door. A settling of four frames then costs 66 ms instead of 48, which is the whole of the
+regression. It arrived with step 2's frame hunting, not with the pre-check: `log_n` and `log_o` have the
+same gap and the same totals.
+
+The hunting camera does not need those frames. It needs one frame at the moment the window opens, and it
+was taking five to get it, throwing four away and paying the settling for all five. So it aims:
+
+- the first frame is still taken at once, for the pre-check, because the ringing is where that works;
+- then it waits, without capturing, until the settling has a run of alike frames under way. That is a new
+  live signal on the settling camera, `getCandidateStillWindowStartAtMs()`: the moment from which the
+  frames so far look alike, reset when the next one breaks the run. It is a promise and not a verdict, so
+  the frame taken on the strength of it is still checked against the recorded window afterwards, exactly
+  as before;
+- having taken that frame it *holds* it while the settling finishes, instead of grabbing another one to
+  find out. The verdict is one frame away and the frame is already in hand.
+
+Off machine this was invisible in exactly the way a rendered image guarantees: a `SimulatedUpCamera`
+hands out a frame as fast as the CPU can draw one, so "grab ten frames while somebody settles" measures
+as free, and the test that was supposed to protect the settling had nothing to say. The camera is now
+modelled as a device where the test needs it - one frame at a time on a shared bus, each frame occupying
+the bus for a fixed transfer time - and the budget is asserted directly as well:
+
+```
+[TEST] 2 grabs into the window, 1 of them before there was anything to aim at, after 15 frames of settling
+[TEST] settling 130 ms alone, 124 ms against 2 grabs of another camera (5 ms per frame on the bus)
+```
+
+With the waiting removed again, to see whether they bite, the same two tests say `took 81 frames while
+the settling had no window and no prospect of one` and `the settling took 274 ms with the hunt and 128 ms
+without it, so 27 grabs cost it 146 ms on a bus of 5 ms per frame`. Full suite with this: 320 tests, no
+failures.
+
+R7 says the pre-check may not lengthen the settling. That was always the narrower version of the rule;
+what `log_n` measured is that *nothing* on the other camera may lengthen it, and least of all the frames
+this design grabs on purpose.
+
+The machine had the last word and it agreed: in `log_p` the hunt takes 2 grabs instead of 4-7, the frame
+gap of the settling is 12.3 ms where `log_o` measured 18.3 and `log_m` 11.8, the settling is 46.9 ms where
+`log_o` measured 65.6, and the alignment step is 331 ms, the best this machine has done. The frames the
+settling needs are what is left of it: 3-4 frames of 12 ms, which is the mechanics coming to rest and not
+the camera being asked twice. What was paid for before is paid for once now.
+

@@ -48,6 +48,7 @@ import org.openpnp.Translations;
 import org.openpnp.gui.JobPanel;
 import org.openpnp.gui.MainFrame;
 import org.openpnp.gui.support.Wizard;
+import org.openpnp.machine.reference.camera.AbstractSettlingCamera;
 import org.openpnp.machine.reference.vision.AbstractPartAlignment;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision;
 import org.openpnp.machine.reference.wizards.ReferencePnpJobProcessorConfigurationWizard;
@@ -2137,15 +2138,15 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             cameraInfo.append("Parallel alignment: settling camera ").append(settleCamera.getName())
                       .append(" (").append(settleCameraPlacements.size()).append(" placements)");
             if (cameras.size() > 1) {
-                cameraInfo.append(", quick-capturing cameras ");
-                for (int i = 0; i < cameras.size(); i++) {
-                    if (!cameras.get(i).equals(settleCamera)) {
-                        if (cameraInfo.toString().contains("quick-capturing cameras") && 
-                            cameraInfo.toString().contains(")")) {
-                            cameraInfo.append(", ");
-                        }
-                        cameraInfo.append(cameras.get(i).getName())
-                                  .append(" (").append(placementsByCamera.get(cameras.get(i)).size()).append(" placements)");
+                cameraInfo.append(", cameras grabbing inside that window");
+                boolean firstListed = true;
+                for (Camera captureCamera : cameras) {
+                    if (!captureCamera.equals(settleCamera)) {
+                        cameraInfo.append(firstListed ? " " : ", ")
+                                  .append(captureCamera.getName())
+                                  .append(" (").append(placementsByCamera.get(captureCamera).size())
+                                  .append(" placements)");
+                        firstListed = false;
                     }
                 }
             }
@@ -2187,6 +2188,21 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 // during the 10-12ms settle time.
                 // ===================================================================
                 
+                // The camera that drives the settling is the one that will demonstrate the head has
+                // stopped, and the others have to fit their frames inside that demonstration. Take the
+                // epoch of the settling before anything is submitted: the settling of this batch has not
+                // begun, and a window recorded by an earlier one describes a head that has since moved
+                // away. The deadline is that settling's own timeout plus room, counted from the rest, so
+                // that a settling which never starts holds the head up by a bounded amount rather than
+                // stopping the job.
+                final AbstractSettlingCamera settlingCamera = settleCamera instanceof
+                        AbstractSettlingCamera ? (AbstractSettlingCamera) settleCamera : null;
+                final long settleEpochBefore = settlingCamera == null ? 0L
+                        : settlingCamera.getSettleEpoch();
+                final long windowDeadlineAtMs = (arrivedAtMs == FrameProvenance.UNKNOWN
+                        ? NanosecondTime.getRuntimeMilliseconds() : arrivedAtMs)
+                        + (settlingCamera == null ? 0L : settlingCamera.getSettleTimeoutMs()) + 100;
+
                 // First, identify all secondary cameras and their single-shot placements
                 for (Camera captureCamera : cameras) {
                     // Skip the settle camera - it handles its own captures
@@ -2250,8 +2266,17 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                 try {
                                     Logger.trace("Async capture started for camera {}, part {}", 
                                         cam.getName(), prt.getId());
-                                    PreCapturedPlacement shot = 
-                                        bv.captureImageOnly(prt, cam, noz, loc, firstTip, arrivedAtMs);
+                                    // Not one frame taken as soon as the motion command was done, but
+                                    // the first frame this camera can show was taken inside the stillness
+                                    // the other camera measured. Without a settling to be measured
+                                    // against there is no window, and then the old quick capture is all
+                                    // there is - which the alignment refuses, and rightly.
+                                    PreCapturedPlacement shot = settlingCamera == null
+                                            ? bv.captureImageOnly(prt, cam, noz, loc, firstTip,
+                                                    arrivedAtMs)
+                                            : bv.captureImageFromSettlingWindow(prt, cam, noz, loc,
+                                                    firstTip, arrivedAtMs, settlingCamera,
+                                                    settleEpochBefore, windowDeadlineAtMs);
                                     Logger.trace("Async capture completed for camera {}, part {}", 
                                         cam.getName(), prt.getId());
                                     return shot;

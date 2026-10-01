@@ -73,6 +73,21 @@ import org.simpleframework.xml.Root;
 
 public class ReferenceBottomVision extends AbstractPartAlignment {
 
+    /**
+     * How many frames one camera will grab at most while waiting for another camera's settling to open
+     * a still window. The waiting is bounded by a deadline as well, and this is the bound for the case
+     * where the deadline cannot be trusted, because a capture loop that does not end is a head that
+     * never leaves the cameras.
+     */
+    protected static final int MAX_WINDOW_GRABS = 500;
+
+    /**
+     * How patiently a camera waits for another camera's settling: it polls the settling rather than
+     * counting milliseconds, and it polls by sleeping, because the waiting is not the work and a
+     * spinning thread is one less core for the settling to measure on.
+     */
+    protected static final long SETTLE_POLL_MS = 1;
+
     @Deprecated
     @Element(required = false)
     protected CvPipeline pipeline;
@@ -1526,10 +1541,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      *
      * The frame this produces is not a still frame and is never going to be one: nothing measured the
      * motion, the head had merely stopped being commanded to move. It is captured anyway because the
-     * pre-check wants a frame and because the alternative is not waiting, and it is stamped
-     * {@link FrameProvenance.Origin#QuickCapture} so that the alignment can say so and refuse it. The
-     * frame that this camera ought to hand to the alignment is one taken inside the still window of
-     * the settling camera, which is a different capture and a later step.
+     * pre-check wants a frame, and it is stamped {@link FrameProvenance.Origin#QuickCapture} so that
+     * the alignment can say so and refuse it. The frame this camera ought to hand to the alignment is
+     * the one taken inside the still window of the settling camera, which is what
+     * {@link #captureImageFromSettlingWindow} is for.
      *
      * @param arrivalAtMs when the head was reported at stillstand after moving to the cameras, so that
      *            the age of this frame can be stated; {@link FrameProvenance#UNKNOWN} if nobody
@@ -1538,12 +1553,109 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs)
             throws Exception {
+        return capturePreparedFrame(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                (earliestFrameHandedTo) -> {
+            long tCapture = NanosecondTime.getRuntimeMilliseconds();
+            BufferedImage capturedBufferedImage = camera.capture();
+            long capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+            // Stamped as what it is: a frame nobody proved anything about. The alignment will refuse
+            // it, which is the point - see the requirements.
+            return new GrabbedFrame(capturedBufferedImage,
+                    FrameProvenance.quickCapture(arrivalAtMs, capturedAtMs),
+                    capturedAtMs - tCapture);
+        });
+    }
+
+    /**
+     * The frame of a camera that does not drive the settling, taken inside the still window of the one
+     * that does.
+     *
+     * The head is one piece of metal, so the stillness that the settling camera demonstrates by finding
+     * two of its frames alike is the same stillness this camera is standing in. What this camera has to
+     * get right is being looking at the part at a moment inside that window, and the only way to know
+     * that afterwards is to keep grabbing until there is a window and then keep the first frame whose
+     * capture time is at or after its start. Frames grabbed earlier are dropped, and so is the whole
+     * effort if the settling never agreed: with no window there is nothing to be inside, the frame is
+     * handed over with no claim on it, the alignment refuses it and the batch goes sequential - which
+     * costs a re-shoot and is counted.
+     *
+     * The camera is grabbed rather than taken from its running preview because a preview frame is a
+     * preview frame: its own exposure and no light actuation of its own. At 8-17 ms a grab this is three
+     * or four frames inside a settling of 25-53 ms, and those grabs are free in the only sense that
+     * matters, because the main thread is waiting for that settling anyway and this runs on another
+     * thread while it waits.
+     *
+     * @param arrivalAtMs as recorded by the motion of this batch, {@link FrameProvenance#UNKNOWN} if
+     *            nobody recorded it.
+     * @param settlingCamera the camera whose settling the head is waiting for.
+     * @param settleEpochBefore {@link AbstractSettlingCamera#getSettleEpoch()} as it stood before this
+     *            batch began. The window recorded by an older settling is a real stillness about a head
+     *            that has since moved away, so none of the recorded numbers are looked at until this
+     *            number has moved.
+     * @param deadlineAtMs stop asking at this instant on the {@link NanosecondTime} millisecond scale;
+     *            the caller takes the settling's own timeout plus room, so that a settling which never
+     *            starts holds the head up for a bounded time instead of stopping the job.
+     */
+    public PreCapturedPlacement captureImageFromSettlingWindow(Part part, Camera camera,
+            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs,
+            AbstractSettlingCamera settlingCamera, long settleEpochBefore, long deadlineAtMs)
+            throws Exception {
+        return capturePreparedFrame(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                (earliestFrameHandedTo) -> grabUntilTheStillWindow(camera, settlingCamera,
+                        settleEpochBefore, arrivalAtMs, deadlineAtMs, earliestFrameHandedTo));
+    }
+
+    /**
+     * One frame from a camera together with the claim that goes with it.
+     */
+    private static class GrabbedFrame {
+        final BufferedImage image;
+        final FrameProvenance provenance;
+        final double captureMs;
+
+        GrabbedFrame(BufferedImage image, FrameProvenance provenance, double captureMs) {
+            this.image = image;
+            this.provenance = provenance;
+            this.captureMs = captureMs;
+        }
+    }
+
+    /**
+     * How a frame is obtained. Everything else about a pre-capture - the pipeline preparation, the
+     * displacement, the pre-check, the light - is the same whether the frame was grabbed once or hunted
+     * for inside a window, so it is written once, in {@link #capturePreparedFrame}.
+     *
+     * A strategy that produces more than one frame hands the earliest of them to
+     * {@code earliestFrameHandedTo} as soon as it has it, without waiting for the frame it is hunting
+     * for, because the pre-check has work to do while the head is still ringing. See
+     * {@link #capturePreparedFrame}.
+     */
+    private interface FrameGrab {
+        GrabbedFrame grab(Consumer<GrabbedFrame> earliestFrameHandedTo) throws Exception;
+    }
+
+    /**
+     * The body the pre-captures share: prepare the pipeline so the displacement comes out the same way
+     * as everywhere else, obtain a frame by the strategy given, start the pre-check on the earliest
+     * frame there is, and put the light out on the way back.
+     *
+     * The pre-check frame and the alignment frame are deliberately not the same frame wherever they can
+     * differ. Stage 1 of this design is "fill the ringing window with useful work": the frames the head
+     * may not align on are exactly the frames the pre-check is for, and it has to look at them while
+     * the ringing is still going on, so that the verdict is in hand when the head may leave. A check
+     * that waited for the frame the alignment gets would run after the settling, take the vision
+     * executor away from the alignment, and be worth nothing as a safety net because by then the head
+     * has gone. What it judges is presence and size, which survive the ringing; position is not its to
+     * judge, the alignment corrects that anyway.
+     */
+    private PreCapturedPlacement capturePreparedFrame(Part part, Camera camera, Nozzle nozzle,
+            Location wantedLocation, boolean isFirstNozzleTip, FrameGrab frameGrab) throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
-        
+
         if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
             throw new Exception("Bottom vision not enabled for part "+part.getId());
         }
-        
+
         // Clone pipeline for this capture
         CvPipeline pipeline = getThreadLocalPipeline(bottomVisionSettings);
         try {
@@ -1552,77 +1664,57 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             preparePipeline(pipeline, bottomVisionSettings.getPipelineParameterAssignments(), 
                     camera, part.getPackage(), nozzle, nozzle.getNozzleTip(), 
                     wantedLocation, wantedLocation, bottomVisionSettings, true);
-            
+
             // Get the first pipeline shot (typically only one for simple capture)
             List<PipelineShot> shots = pipeline.getPipelineShots();
             if (shots.isEmpty()) {
                 throw new Exception("No pipeline shots configured for part "+part.getId());
             }
-            
-            PipelineShot pipelineShot = shots.get(0);
-            
+
             // Apply the shot - with skipMovement=true, this sets properties but doesn't move hardware
-            pipelineShot.apply();
-            
-            // Light was already turned on in moveNozzlesToAlignmentPosition() before waitForCompletion()
-            // This ensures M810 is queued before M400, so light is guaranteed on when capture happens
-            
-            // Calculate the displacement delta: nozzle tip camera offset + nozzle runout compensation
-            // The camera offset comes from Nozzle Tip Runout Calibration (camera offset per nozzle tip)
-            // The nozzle runout compensation comes from Nozzle Tip Runout Calibration at the wanted rotation
-            ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
-            ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
-            
-            // Get the camera offset for this nozzle tip (this is the offset between nozzle tip and camera)
-            Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-                cameraOffset = calibrationNozzleTip.getCalibration().getCalibratedCameraOffset(refNozzle, camera);
+            shots.get(0).apply();
+
+            // The light was already turned on in moveNozzlesToAlignmentPosition() before its
+            // waitForCompletion(), so that the M810 was queued before the M400 and the light is on by
+            // the time anything is captured here.
+            Location displacementDelta = displacementDelta(camera, nozzle, wantedLocation,
+                    isFirstNozzleTip);
+
+            final PreCheckResult preCheckResult
+                    = bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
+                    && shots.size() == 1 ? new PreCheckResult() : null;
+            final boolean[] checkStarted = new boolean[1];
+            // Given the first frame the camera produces, from inside the hunt if there is a hunt,
+            // because that is the frame that exists earliest and therefore the one the ringing window
+            // can be spent on. Of this frame only the pixels and the duration are used: it carries no
+            // claim, since a frame this early is the ringing itself.
+            final Consumer<GrabbedFrame> earliestFrameHandedTo = (earliestFrame) -> {
+                if (preCheckResult != null && !checkStarted[0]) {
+                    checkStarted[0] = true;
+                    Mat earliestImage = OpenCvUtils.toMat(earliestFrame.image);
+                    try {
+                        startPreCheck(earliestImage, preCheckResult, part, camera, nozzle,
+                                wantedLocation, bottomVisionSettings, earliestFrame.captureMs);
+                    }
+                    finally {
+                        earliestImage.release();
+                    }
+                }
+            };
+
+            GrabbedFrame grabbed = frameGrab.grab(earliestFrameHandedTo);
+            Mat capturedImage = OpenCvUtils.toMat(grabbed.image);
+            FrameProvenance provenance = grabbed.provenance;
+            if (preCheckResult != null) {
+                // A strategy that takes one frame hands nothing over early: there the frame is the
+                // frame. How many frames the camera was asked for is only known once a hunt is over,
+                // which is why that number is filled in here and starts out as "not known".
+                earliestFrameHandedTo.accept(grabbed);
+                preCheckResult.setFrameCount(Math.max(1, provenance.getFrameIndex()));
             }
-            
-            // Get nozzle runout compensation at the wanted rotation angle
-            Location runoutCompensation = new Location(cameraOffset.getUnits(), 0, 0, 0, 0);
-            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-                runoutCompensation = calibrationNozzleTip.getCalibration().getCalibratedOffset(refNozzle, wantedLocation.getRotation());
-            }
-            
-            // Combine: displacement delta = camera offset + runout compensation
-            // This should be small (< 2mm in each direction)
-            // For the first nozzle tip, displacement is zero since we're already at the correct position
-            Location displacementDelta;
-            if (isFirstNozzleTip) {
-                displacementDelta = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-            }
-            else {
-                displacementDelta = cameraOffset.add(runoutCompensation);
-            }
-            Logger.debug("captureImageOnly: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={}, displacementDelta={}", 
-                isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
-            
-            // Capture the image. Nothing settles here, so nothing is demonstrated about the motion.
-            long tCapture = NanosecondTime.getRuntimeMilliseconds();
-            BufferedImage capturedBufferedImage = camera.capture();
-            long capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
-            Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
-            double captureMs = capturedAtMs - tCapture;
-            // Stamped as what it is: a frame nobody proved anything about. The alignment will refuse
-            // it, which is the point - see the requirements.
-            FrameProvenance provenance = FrameProvenance.quickCapture(arrivalAtMs, capturedAtMs);
             FrameDump.writeIfNeeded(bottomVisionSettings, capturedImage, provenance, camera, nozzle,
                     part, wantedLocation.getRotation());
 
-            // The pre-check for a camera that does not settle. Its single frame is the frame the
-            // alignment analyses, so this check cannot buy an earlier frame; what it buys is that a
-            // verdict exists at all. Without it the second nozzle would have no verdict when the head
-            // departs, and a safety net with a hole in it is not a safety net.
-            PreCheckResult preCheckResult = null;
-            if (bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
-                    && shots.size() == 1) {
-                preCheckResult = new PreCheckResult();
-                preCheckResult.setFrameCount(1);
-                startPreCheck(capturedImage, preCheckResult, part, camera, nozzle, wantedLocation,
-                        bottomVisionSettings, captureMs);
-            }
-            
             // Turn off light or register with batch operation (if active)
             try {
                 camera.actuateLightAfterCapture();
@@ -1630,8 +1722,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             catch (Exception e) {
                 Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
             }
-            
-            // Create a PreCapturedPlacement with the captured image and displacement delta
+
             PreCapturedPlacement capturedShot = new PreCapturedPlacement(
                     camera, nozzle, capturedImage, wantedLocation, displacementDelta, provenance);
             capturedShot.setPreCheckResult(preCheckResult);
@@ -1641,6 +1732,236 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Always close the pipeline to release resources
             pipeline.close();
         }
+    }
+
+    /**
+     * How far the part has moved on the camera between the place the head was taken to and the place
+     * this nozzle's tip is really at: the calibrated camera offset of this nozzle tip, plus the runout
+     * of that tip at the wanted rotation. The first nozzle tip is the one the head was positioned for,
+     * so for it the displacement is nothing at all.
+     */
+    private Location displacementDelta(Camera camera, Nozzle nozzle, Location wantedLocation,
+            boolean isFirstNozzleTip) {
+        ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
+        ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
+
+        // The offset between the nozzle tip and the camera, from the nozzle tip runout calibration.
+        Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+        if (calibrationNozzleTip != null
+                && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+            cameraOffset = calibrationNozzleTip.getCalibration()
+                    .getCalibratedCameraOffset(refNozzle, camera);
+        }
+
+        // The runout of the nozzle tip at the wanted rotation, from the same calibration.
+        Location runoutCompensation = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+        if (calibrationNozzleTip != null
+                && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
+            runoutCompensation = calibrationNozzleTip.getCalibration()
+                    .getCalibratedOffset(refNozzle, wantedLocation.getRotation());
+        }
+
+        Location displacementDelta = isFirstNozzleTip
+                ? new Location(LengthUnit.Millimeters, 0, 0, 0, 0)
+                : cameraOffset.add(runoutCompensation);
+        Logger.debug("displacement: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={},"
+                + " displacementDelta={}", isFirstNozzleTip, cameraOffset, runoutCompensation,
+                displacementDelta);
+        return displacementDelta;
+    }
+
+    /**
+     * Get a frame from this camera that is demonstrably inside the still window the other camera's
+     * settling is opening, and keep that one.
+     *
+     * The window is not something this camera can decide for itself; it is what the settling says, when
+     * it says it, which is why the loop reads the settling rather than counting a predicted number of
+     * milliseconds. What it does with that is aim rather than hammer: it takes one frame immediately
+     * (for the pre-check, which has to see the ringing while it rings), then waits for the settling to
+     * have a run of alike frames going, and only then captures again. A camera grabbing at full rate
+     * while another one settles is not free - the two share the bus, the CPU and the light, and on the
+     * machine the settling's own frames were measurably slower for every extra frame taken next door -
+     * and a frame taken while the head is still moving is a frame that is going to be thrown away.
+     *
+     * Three ways out, in order of how much they mean:
+     *
+     *  - a frame captured at or after the start of the window: {@link FrameProvenance.Origin#Streamed}
+     *    with that window in it, and the alignment accepts it;
+     *  - the settling gave up: no window will open, so the frame is handed over with nothing claimed
+     *    and the alignment refuses it, without waiting for a deadline that cannot help;
+     *  - the deadline: same refusal, and the head leaves the cameras a bounded time after the rest.
+     */
+    private GrabbedFrame grabUntilTheStillWindow(Camera camera,
+            AbstractSettlingCamera settlingCamera, long settleEpochBefore, long arrivalAtMs,
+            long deadlineAtMs, Consumer<GrabbedFrame> earliestFrameHandedTo) throws Exception {
+        long tCapture = 0;
+        BufferedImage image = null;
+        long capturedAtMs = 0;
+        int grabs = 0;
+
+        while (true) {
+            if (grabs == 0) {
+                // The first frame is taken at once, whatever the settling is doing: the head is over
+                // the cameras, the light is on, and the pre-check can only judge the ringing while it
+                // rings. It is also the frame the alignment gets if the settling had already made up its
+                // mind before we arrived, which is why nothing is waited for here.
+                tCapture = NanosecondTime.getRuntimeMilliseconds();
+                image = camera.capture();
+                capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+                grabs = 1;
+                earliestFrameHandedTo.accept(new GrabbedFrame(image, FrameProvenance.unknown(),
+                        capturedAtMs-tCapture));
+            }
+            else {
+                // Nothing the settling has recorded is about this batch until its epoch has moved, so
+                // the numbers of the previous placement cannot be quoted as the stillness of this one.
+                awaitSettling(settlingCamera, settleEpochBefore, deadlineAtMs);
+                // Then wait until there is a prospect of a frame being still. Sleeping instead of
+                // grabbing is the whole point: the two cameras share the bus, the CPU and the light, and
+                // every frame taken here costs the settling a fraction of a frame of its own, so frames
+                // taken while the head is still visibly moving are paid for twice and thrown away.
+                // Aiming at the window is what leaves the settling alone while it measures.
+                awaitProspectOfWindow(settlingCamera, settleEpochBefore, deadlineAtMs);
+
+                tCapture = NanosecondTime.getRuntimeMilliseconds();
+                image = camera.capture();
+                capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+                grabs++;
+            }
+
+            AbstractSettlingCamera.SettleResult result =
+                    recordedResult(settlingCamera, settleEpochBefore);
+            if (result == AbstractSettlingCamera.SettleResult.TimedOut) {
+                Logger.debug("[SETTLE-WINDOW] camera {} drops frame {} after {} grabs: {} ran out of"
+                        + " time, so there is no window this frame could be inside",
+                        camera.getName(), grabs, grabs, settlingCamera.getName());
+                return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
+                        FrameProvenance.UNKNOWN, grabs), capturedAtMs - tCapture);
+            }
+            // The frame is either already inside a window that has been announced, or the settling is
+            // one frame away from announcing one it belongs to. Asking the settling is cheaper than
+            // taking another frame to find out, and the answer is bounded either way.
+            long windowStartAtMs = awaitWindowCovering(settlingCamera, settleEpochBefore,
+                    capturedAtMs, deadlineAtMs);
+            if (windowStartAtMs != FrameProvenance.UNKNOWN) {
+                Logger.debug("[SETTLE-WINDOW] camera {} frame {} at +{} ms after the rest is inside the"
+                        + " window of {} which opened at +{} ms, margin {} ms of {} grabs",
+                        camera.getName(), grabs, elapsed(arrivalAtMs, capturedAtMs),
+                        settlingCamera.getName(), elapsed(arrivalAtMs, windowStartAtMs),
+                        capturedAtMs-windowStartAtMs, grabs);
+                return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
+                        windowStartAtMs, grabs), capturedAtMs - tCapture);
+            }
+            if (NanosecondTime.getRuntimeMilliseconds() >= deadlineAtMs || grabs >= MAX_WINDOW_GRABS) {
+                Logger.debug("[SETTLE-WINDOW] camera {} drops frame {} after {} grabs: no still window"
+                        + " by +{} ms", camera.getName(), grabs, grabs,
+                        elapsed(arrivalAtMs, capturedAtMs));
+                return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
+                        FrameProvenance.UNKNOWN, grabs), capturedAtMs - tCapture);
+            }
+        }
+    }
+
+    /**
+     * What the settling has said about the settling this batch asked for, or nothing at all while the
+     * epoch has not moved: see {@link AbstractSettlingCamera#getSettleEpoch()}.
+     */
+    private static AbstractSettlingCamera.SettleResult recordedResult(
+            AbstractSettlingCamera settlingCamera, long settleEpochBefore) {
+        return settlingCamera.getSettleEpoch() > settleEpochBefore
+                ? settlingCamera.getRecordedSettleResult()
+                : AbstractSettlingCamera.SettleResult.NotSettled;
+    }
+
+    /**
+     * Wait until the settling being watched is the one this batch asked for, or until there is no time
+     * left to wait for. Nothing is captured while waiting, because a settling that has not been asked
+     * for yet has nothing to say about a frame.
+     */
+    private static void awaitSettling(AbstractSettlingCamera settlingCamera, long settleEpochBefore,
+            long deadlineAtMs) throws Exception {
+        while (settlingCamera.getSettleEpoch() <= settleEpochBefore
+                && NanosecondTime.getRuntimeMilliseconds() < deadlineAtMs) {
+            Thread.sleep(SETTLE_POLL_MS);
+        }
+    }
+
+    /**
+     * Wait until a frame of this camera has something to be still by: either the settling has a run of
+     * alike frames going, which is the earliest a window can be said to open, or the settling is done
+     * and has announced a window of its own - which for a configured wait is the whole of what it
+     * knows, and there is no point in arriving before it. A settling that gave up ends the wait too,
+     * because nothing is going to be still.
+     */
+    private static void awaitProspectOfWindow(AbstractSettlingCamera settlingCamera,
+            long settleEpochBefore, long deadlineAtMs) throws Exception {
+        while (NanosecondTime.getRuntimeMilliseconds() < deadlineAtMs) {
+            AbstractSettlingCamera.SettleResult result =
+                    recordedResult(settlingCamera, settleEpochBefore);
+            if (stillWindowOf(result, settlingCamera) != FrameProvenance.UNKNOWN
+                    || result == AbstractSettlingCamera.SettleResult.TimedOut
+                    || (settlingCamera.getSettleEpoch() > settleEpochBefore
+                            && settlingCamera.getCandidateStillWindowStartAtMs()
+                                    != FrameProvenance.UNKNOWN)) {
+                return;
+            }
+            Thread.sleep(SETTLE_POLL_MS);
+        }
+    }
+
+    /**
+     * The start of the still window that a frame captured at capturedAtMs is inside, waiting for the
+     * settling to get round to saying it if it is going to. {@link FrameProvenance#UNKNOWN} means the
+     * settling has finished with this frame and does not cover it: it gave up, ran out of the time this
+     * head can spare, or certified a stillness that started after the frame was taken.
+     */
+    private static long awaitWindowCovering(AbstractSettlingCamera settlingCamera,
+            long settleEpochBefore, long capturedAtMs, long deadlineAtMs) throws Exception {
+        while (true) {
+            AbstractSettlingCamera.SettleResult result =
+                    recordedResult(settlingCamera, settleEpochBefore);
+            long windowStartAtMs = stillWindowOf(result, settlingCamera);
+            if (windowStartAtMs != FrameProvenance.UNKNOWN) {
+                // Settled and said. It either covers this frame or it started after the frame was
+                // taken; asking again will not make the frame older, so this is where the caller gets
+                // to take another one.
+                return capturedAtMs >= windowStartAtMs ? windowStartAtMs : FrameProvenance.UNKNOWN;
+            }
+            if (result == AbstractSettlingCamera.SettleResult.TimedOut
+                    || NanosecondTime.getRuntimeMilliseconds() >= deadlineAtMs) {
+                return FrameProvenance.UNKNOWN;
+            }
+            Thread.sleep(SETTLE_POLL_MS);
+        }
+    }
+
+    /**
+     * The instant from which the settling calls the head still, or {@link FrameProvenance#UNKNOWN} when
+     * it has not said anything yet.
+     *
+     * A settling that measures takes the window from the earlier of the two frames it found alike. A
+     * settling that is a configured wait has measured nothing and has no window, yet the frame it hands
+     * over is still accepted on that claim (see {@link FrameProvenance}), and the frame of the other
+     * camera at that same instant is entitled to exactly the same claim, so for it the end of the wait
+     * is the window. A settling that timed out has no claim to give away.
+     */
+    private static long stillWindowOf(AbstractSettlingCamera.SettleResult result,
+            AbstractSettlingCamera settlingCamera) {
+        switch (result) {
+            case Agreed:
+                return settlingCamera.getRecordedStillWindowStartAtMs();
+            case FixedTime:
+                return settlingCamera.getRecordedSettledFrameAtMs();
+            default:
+                return FrameProvenance.UNKNOWN;
+        }
+    }
+
+    private static double elapsed(long fromMs, long toMs) {
+        if (fromMs == FrameProvenance.UNKNOWN || toMs == FrameProvenance.UNKNOWN) {
+            return Double.NaN;
+        }
+        return toMs-fromMs;
     }
 
     /**
@@ -2001,14 +2322,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
         finally {
             result.setCheckMs(NanosecondTime.getRuntimeMilliseconds() - startedAt);
-            if (result.getFrameCount() <= 0 && camera instanceof AbstractSettlingCamera) {
-                // However many frames the settling has got through by now. If it is still settling
-                // then this is the count so far and the capture thread replaces it with the final
-                // one when it writes the line; if it has finished then they are the same number.
-                // A camera that does not settle has already been told to have produced the one frame
-                // it captured, and that number is not to be overwritten by the count of a settling
-                // that never ran.
-                result.setFrameCount(((AbstractSettlingCamera) camera).getRecordedFrameCount());
+            if (result.getFrameCount() < 0) {
+                // Nobody has told this check how many frames were captured for the placement, which
+                // means the capture is still going on: the check was handed the first frame of a hunt
+                // and the hunt has not ended. The number is the capturer's to fill in when it does, and
+                // guessing it from this camera's last settling would quote a different batch. The line
+                // therefore says "?" and the hunt says "of N grabs" in its own line.
+                Logger.trace("pre-check reports before the frame count is known");
             }
             if (!result.isSettleWindowOpen()) {
                 // Either there was no settling at all, so nobody else will write this line, or the

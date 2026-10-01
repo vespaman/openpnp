@@ -553,3 +553,148 @@ back to back and a grep for `Offsets accepted` pairs the wrong rect with the wro
   error at 13:53:07 it stayed on for 20.6 s, until the retried step unwound the batch. That is not a
   leak - aborting closes it, which `JobAbortTest` covers - but it is what "the light is still on while I
   am looking at the error dialog" is.
+
+### 2026-09-30, step 2 is in the jar: what `log_n.txt` has to show (`target/openpnp-gui-...jar`, 20:17)
+
+The second camera no longer takes its one frame and calls it good; it grabs frames while the other
+camera settles and keeps the first one inside the window that settling opened (§10 of
+`REQUIREMENTS.md`). Nothing about the settings has to change for this run: `frameDumpEnabled` stays off,
+the job is the same 8 placements.
+
+    ./openpnp.sh          # on pn52, from the repo, as usual
+    tee tests_2026-09-28/log_n.txt        # two or three jobs, then copy the log
+
+    ./check_run.py tests_2026-09-28/log_m.txt tests_2026-09-28/log_n.txt
+
+What has to be true, in the order one would notice it:
+
+- `frames kept inside the window` is about one per aligned batch, each entry of the form
+  `Upp2 f4@38ms +17ms in 4 grabs`, and `window margin mean` is a positive number of a few tens of
+  milliseconds. The frame index is how many frames were thrown away to get it, which is the cost of
+  the honesty and should be small.
+- `frames with no window` is `0`, `frame refused as not still` is `0` and `parallel fell back` is `0`.
+  Step 1 had four of each per job; a run that still has them is not a failed run, it is a run that says
+  the settling of that batch genuinely did not agree - the `[SETTLE-WINDOW]` line says which camera and
+  after how many grabs.
+- `alignment step (move->after)` stays where `log_m` left it (355-456 ms) and the pipeline tail stays at
+  81-112 ms. The kept frame is the one that was being exposed while the settling reached its verdict, so
+  this step should cost nothing new; if it costs 10-20 ms per batch, that is one frame too many being
+  thrown away after the window opened, and the `[SETTLE-WINDOW]` margins will show it.
+- The head should still be over the cameras for about 330 ms per batch. If it is noticeably longer, the
+  deadline (settling timeout + 100 ms) is being reached rather than the window, which is a bug and not a
+  property of the mechanics.
+
+
+### 2026-09-30, the pre-check back inside the ringing: what `log_o.txt` has to show (`target/openpnp-gui-...jar`, 21:49)
+
+`log_n` measured the second camera honestly and showed the pre-check of that camera running after the
+settling, which is stage 1 upside down (§10 of `REQUIREMENTS.md`). The check now starts on the first
+frame that comes out of the camera and the alignment still takes the frame from inside the window, so
+the two frames of that camera are different frames on purpose. Same job, same settings.
+
+    ./openpnp.sh          # on pn52, from the repo, as usual
+    tee tests_2026-09-28/log_o.txt        # two or three jobs, then copy the log
+
+    ./check_run.py tests_2026-09-28/log_n.txt tests_2026-09-28/log_o.txt
+
+What has to be true:
+
+- `pre-checks before the window` is `N/N`. For the camera that does not drive the settling, the
+  `[PRE-CHECK]` line must appear *before* its `[SETTLE-WINDOW]` line, because the check went in with the
+  first grab and the window line is only written when the hunt is over. Both lines carry the camera's
+  name now rather than its id, which is what lets the analyzer pair them at all.
+- In that `[PRE-CHECK]` line, `frame=1/%d` where the denominator is the number of grabs of the matching
+  `[SETTLE-WINDOW]` line. That is the whole change in one field: the first frame was checked, that many
+  were grabbed. The settling camera's own line keeps its old meaning.
+  (Corrected on the same evening, see the `log_p` section below: the check can report before the hunt is
+  over, and a denominator taken from the previous placement's settling was worse than no number, so the
+  line says `frame=1/?` while the hunt is still running and the `[SETTLE-WINDOW]` line is what says how
+  many grabs it took.)
+- `verdict` is still `Ok` and the size fields still look like the part. The frame the check saw is one
+  the head was still ringing on, so a `SizeOut` here is worth reading twice: presence and size are the
+  two things that survive the ringing, and if one of them does not, the check is looking at the wrong
+  thing.
+- Everything else stays where `log_n` left it: `frames kept inside a window` one per batch, `frames with
+  no window` 0, `parallel fell back` 0, `alignment step` in the 330-350 ms band. The check costs the hunt
+  nothing: it runs on the vision executor while the grabbing thread does what it was doing.
+- One thing to expect and not mistake for a regression: the `[PRE-CHECK]` line of the second camera is
+  earlier now, so `queue=` may show a few milliseconds it did not show before, because the check and the
+  settling want a CPU at the same moment. R7 is the one to watch: if the settling of that batch gets
+  slower in step with it, the check is stealing from the wrong pocket.
+
+### 2026-09-30, the hunt aims at the window instead of hammering at it: what `log_p.txt` has to show (`target/openpnp-gui-...jar`, 23:21)
+
+`log_n` and `log_o` were honest about one more thing than anyone wanted: the settling of the camera that
+drives it had become slower, from 34-40 ms to 66-70 ms, and the reason is in the frame gap, which the
+analyzer now prints. It went from 11.8 ms between settling frames (`log_m`, where the other camera took
+one quick frame) to 17-18 ms (`log_n`, `log_o`, where it took 4-7 of them). Two cameras on a bus, a CPU
+and a light: frames taken while the head is still visibly moving are paid for twice, once by the camera
+that throws them away and once by the settling that gets its frames later.
+
+So the camera that hunts no longer grabs at full rate. It takes one frame immediately - that is the
+pre-check's, and the ringing is where the pre-check works - and then it waits for the settling to have a
+run of alike frames under way before it captures again, and once it has a frame it holds that frame while
+the settling finishes saying whether it covers it. Same job, same settings.
+
+    ./openpnp.sh          # on pn52, from the repo, as usual
+    tee tests_2026-09-28/log_p.txt        # two or three jobs, then copy the log
+
+    ./check_run.py tests_2026-09-28/log_m.txt tests_2026-09-28/log_o.txt tests_2026-09-28/log_p.txt
+
+What has to be true, and this is the run where the numbers are the point rather than a side effect:
+
+- `grabs` in the `frames kept inside the window` line drops from 4-7 to 2-3. The margin may be smaller
+  than the 22-46 ms of `log_o` - the frame is taken as the window opens rather than after a while of
+  hammering - and it must still be positive.
+- `settling frame gap` comes back towards the 11.8-12.3 ms of `log_m`. This is the number the change was
+  about. It is a property of the machine, not of the code, so it will not be identical between sessions;
+  what must not happen is it sitting at 17 ms while the other camera is down to 2 grabs, because that
+  would mean the frames were never the reason.
+- `settling` therefore comes back towards 35-50 ms with the same `settling frames` count. Fewer frames
+  and a shorter total are not the same improvement: the frames the settling needs are the mechanics, and
+  the gap is the camera being slow to hand the next one over.
+- `alignment step` stays in the 330-350 ms band or better. It was 348 ms in `log_o` and 405 ms in
+  `log_m`; the whole design has never been about the settling line, it is about this one, so a settling
+  that gets back to 40 ms while the alignment step gets worse is a bad trade and should be read as such.
+- `frames kept inside a window` still one per batch and `frames with no window` still 0: waiting for the
+  window must not turn into missing it. `parallel fell back` 0.
+- The `[PRE-CHECK]` line of the second camera now says `frame=1/?` while the hunt is going on (see the
+  correction above) and `pre-checks before the window` stays `N/N`.
+- One way this can fail that is worth naming: if the settling's run of alike frames only ever forms in
+  its very last frame, the waiting camera starts its capture at the same moment the settling finishes, and
+  the batch ends up as slow as the sequential one. `margin` near 0 ms together with an `alignment step`
+  back near 400 ms is that case; it would mean the alike run is too late to aim at, and the aim would
+  have to move to something earlier (the first frame under the threshold rather than the second).
+
+What `log_p.txt` showed, on the same evening:
+
+| | `log_m` | `log_o` | `log_p` |
+|---|---|---|---|
+| grabs per frame kept | 1 | 5.5 | **2.0** |
+| settling frame gap | 11.8 ms | 18.3 ms | **12.3 ms** (14.0 worst) |
+| settling | 34.5 ms | 65.6 ms | **46.9 ms** |
+| settling frames | 5.1 | 4.2 | 3.4 |
+| alignment step | 405 ms | 348 ms | **331 ms** |
+| frames kept inside a window | 8 | 8 | 8 |
+| frames with no window | 0 | 0 | 0 |
+
+The gap is back where the single quick capture of `log_m` left it, so the frames taken next door really
+were the whole of the settling's slowdown. The settling is not quite at `log_m`'s 34.5 ms because it needs
+3-4 frames where `log_m` needed 5 of 11.8 ms each - the mechanics, not the camera. The margin of the kept
+frame shrank to 23-29 ms as expected, and it is still positive in all eight batches. The alignment step is
+the best it has ever been on this machine.
+
+One thing in the log is worth naming, and it is not ours:
+
+- **`SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder"` and the two lines after it**, at the
+  first camera capture of a session. Not new and not ours: `lib/slf4j-api-1.7.2.jar` is on the classpath
+  because `webcam-capture` pulls it in, and there is no SLF4J binding next to it, so the first time any
+  class asks SLF4J for a logger it prints those three lines to stderr - which the `SystemLogger` then
+  dutifully files as ERROR - and falls back to a logger that discards everything. Nothing OpenPnP logs is
+  affected, because OpenPnP logs through `java.util.logging`; what is affected is any library that would
+  have logged through SLF4J, which now says nothing at all. The fix is to put a matching binding
+  (`slf4j-jdk14` 1.7.2, which hands SLF4J to the same `java.util.logging`) next to it, and that needs a
+  download: this machine's local repository only has `slf4j-jdk14` 1.5.6, which is too old to bind to a
+  1.7.2 API. It is in `log_l` and in every session since, and in none of `log_c`..`log_j`. The dependency
+  has been in the pom unchanged across all of those, so what changed is the assembling of `target/lib`
+  rather than the code, and nothing in this design is involved either way.
