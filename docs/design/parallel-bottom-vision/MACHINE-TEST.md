@@ -971,3 +971,60 @@ So the honest summary for Stage 2 is narrower than it was yesterday: an early de
 angle seen on the ringing frame, must not rely on its size, and cannot rely on its position at all - and
 in any case the still window that has to be waited for opens only 27 to 58 ms after the head stops being
 commanded to move.
+
+## The armed run: the head leaves before the numbers are in (`log_t.txt`)
+
+Build: the jar of commit `2467a0cebd` plus the javadoc tidy that followed it, `target/openpnp-gui-0.0.1-alpha-SNAPSHOT.jar`.
+
+One setting turns this on, and it has no GUI control yet. In `~/.openpnp2/machine.xml`, on the
+`<machine class="org.openpnp.machine.reference.ReferenceMachine" ...>` element:
+
+```xml
+early-alignment-departure="true"
+```
+
+Restart, and check it survived: `Machine` → `Save` and the attribute must still be there. Everything
+else about the job stays exactly as in `log_r.txt` / `log_s.txt` — the same 8 placements, the same
+speed, the same frame dumps — because the only comparison worth making is this attribute against its
+absence.
+
+### What the log has to say
+
+Both lines are `DEBUG`, so `logging.properties` needs `org.openpnp` at `DEBUG` as in the previous runs.
+
+| line | meaning |
+|---|---|
+| `[EARLY-DEPARTURE] head released with 2 alignments still being computed` | the alignment step ended over the cameras without waiting |
+| `[EARLY-DEPARTURE] nozzle N1 travelled to ... while its alignment was still being computed, NN ms` | the journey to the board, taken without the offsets |
+| `[EARLY-DEPARTURE] 2 alignments were still being computed when the head left the cameras and are complete NN ms later` | the wait, at the placement; `NN` is what the journey bought |
+| `Parallel alignment fell back to sequential for all nozzles (N of M in this job) : ...` | the abort path, entered from the placement rather than from over the cameras |
+
+The number worth having is the last `NN ms` on the third line. If the head's journey is longer than the
+vision's work, that number is `0` and the whole vision time was hidden. If it is several hundred
+milliseconds, the vision is the slower of the two and the journey did not cover it — which is not a
+failure, it is the size of the remaining gap.
+
+Compare against the same job's total time in `log_r.txt`, and say which jar and which setting produced
+each number.
+
+### The abort, on real hardware
+
+The abort path cannot be provoked on demand from the operator's side, and it has been tested where it
+can be — `EarlyDepartureAbortTest` refuses one pre-captured picture during a real job on the simulated
+machine and shows the refused placement going back over the camera, being aligned the ordinary way, and
+both parts going down. Two things can still be watched for on the real machine, and neither needs
+anything invented:
+
+1. **Let it happen on its own.** The `C0402` that measured a quarter of itself (`log_s.txt`,
+   requirements §4) fails its size check *inside* a deferred pipeline. If it does so again with the
+   setting on, the abort path runs for real: the head will be seen going back to the cameras. Say so in
+   the run notes, with the timestamps — that is the hardware version of the harness test, and it costs
+   nothing to record.
+2. **Stop it mid-flight.** Press `Stop` while the head is between the cameras and the board. The job
+   ends with an alignment still owed, and the `Cleanup` step has to release the pictures nobody will
+   ever read. The camera batch must end and the lights go out, the same as any other abort (§5). This
+   is the real-hardware half of the machinery that the harness cannot see, because it is the abort of
+   the *job*, not of the alignment.
+
+Neither of these is required to pass. They are the two chances the physical machine gets to say
+something the simulation cannot.

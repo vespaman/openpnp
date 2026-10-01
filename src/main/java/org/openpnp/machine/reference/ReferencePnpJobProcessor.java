@@ -284,16 +284,6 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     }
 
     /**
-     * Wait for an alignment that was left running when the head departed, and make sure the parts are
-     * still on their nozzles. Does nothing when there is none, which is the normal case, and the case
-     * whenever the machine has not been armed for an early departure.
-     *
-     * <p>If the computation failed, the batch is aligned the ordinary way, which sends the head back to
-     * the cameras by itself: that is the abort path this feature is required to have, and it is the
-     * same fallback the parallel path already used, only now entered from above the placement instead
-     * of from over the cameras.</p>
-     */
-    /**
      * Send a nozzle towards its board while its alignment is still being computed, as far as it can go
      * without knowing the offsets: to the placement location as it would be with no alignment at all,
      * at safe Z. A part that came out of the feeder crooked is off by a fraction of a millimetre and a
@@ -331,6 +321,16 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
         }
     }
 
+    /**
+     * Wait for an alignment that was left running when the head departed, and make sure the parts are
+     * still on their nozzles. Does nothing when there is none, which is the normal case, and the case
+     * whenever the machine has not been armed for an early departure.
+     *
+     * <p>If the computation failed, the batch is aligned the ordinary way, which sends the head back to
+     * the cameras by itself: that is the abort path this feature is required to have, and it is the
+     * same fallback the parallel path already used, only now entered from above the placement instead
+     * of from over the cameras.</p>
+     */
     protected void awaitDeferredAlignment() throws JobProcessorException {
         DeferredAlignment deferred = deferredAlignment;
         if (deferred == null) {
