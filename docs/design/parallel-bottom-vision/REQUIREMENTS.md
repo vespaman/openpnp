@@ -455,3 +455,27 @@ gap of the settling is 12.3 ms where `log_o` measured 18.3 and `log_m` 11.8, the
 settling needs are what is left of it: 3-4 frames of 12 ms, which is the mechanics coming to rest and not
 the camera being asked twice. What was paid for before is paid for once now.
 
+### Which side of a rectangle is the part's width
+
+`log_p` had one `[PRE-CHECK] SizeOut` left in it, on the part the test job deliberately places a quarter
+turn off: `size=0.45x0.97 expected=1.00x0.50`, `width too small: nominal 1.000, limit 0.620, measured
+0.448`. The part was the right part. A rectangle fitted to a contour has no notion of which of its sides
+is the part's width - `17x37 at 0°` and `37x17 at 90°` are the same rectangle, and OpenCV hands out either
+one, depending on where the contour starts - and the size check compares width with width. The alignment
+proper does exactly the same, which makes its verdict on a turned part a coin toss as well; in this batch
+the alignment got `37x17` for the very same part 26 ms later and said nothing.
+
+The check is the one that has to be careful, because it is the one that is not allowed to cry wolf: a
+warning that a legitimately turned part provokes is a warning that gets read as noise the next time it
+matters. So `checkPartSizeEitherWay` asks both ways and keeps what the second way says, because *sides
+exchanged* is a fact about the part - it is lying a quarter turn from its footprint - and it is the one
+thing a frame may honestly say about the rotation of a part this design refuses to judge:
+
+```
+[TEST] size check read both ways: 148x93 fits, 93x148 fits turned, 93x66 refused (Part R0805-1K width too small: nominal 2.000, limit 1.800, measured 1.250)
+```
+
+What is deliberately *not* done here is changing what the alignment itself accepts. The coin toss upstream
+is a real one and it will occasionally throw a job error on a turned part; making that a warning instead
+is a change of behaviour on the gate, and this design's rule about the gate is that it does not move it.
+Full suite with this: 322 tests, no failures.

@@ -20,6 +20,9 @@ import org.openpnp.spi.Nozzle;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.VisionUtils;
 
+import org.opencv.core.Point;
+import org.opencv.core.RotatedRect;
+import org.opencv.core.Size;
 
 import com.google.common.io.Files;
 
@@ -243,4 +246,78 @@ public class PreCheckReportTest {
         assert shot.getPreCheckResult() == null : "a disabled pre-check still produced "+shot.getPreCheckResult();
     }
 
+    /**
+     * A rectangle that OpenCV hands over as 17x37 at 0° and the same rectangle handed over as 37x17 at
+     * 90° are the same rectangle, and which of the two a frame gets depends on where the contour starts.
+     * The size check compares width with width, so on a part that is a quarter turn off it is a coin
+     * toss: on the machine the turned 0402 measured 0.985x0.448 on the frame the alignment looked at and
+     * 0.45x0.97 on the frame the pre-check looked at, 26 ms apart, and the pre-check warned.
+     *
+     * Asserted here without a camera, because the two readings are the whole question and a stopwatch
+     * would only make them harder to read.
+     */
+    @Test
+    public void testTheSizeCheckReadsARectangleBothWays() throws Exception {
+        setUp();
+
+        visionSettings.setCheckPartSizeMethod(PartSizeCheckMethod.BodySize);
+        part.getPackage().getFootprint().setBodyWidth(2.0);
+        part.getPackage().getFootprint().setBodyHeight(1.25);
+        // Tight enough that the short side cannot pass for the long one: at 50 % the swap is inside the
+        // tolerance and the question never gets asked.
+        visionSettings.setCheckSizeTolerancePercent(10);
+
+        RotatedRect asReported = new RotatedRect(new Point(100, 100),
+                new Size(px(2.0), px(1.25)), 0);
+        RotatedRect theOtherWayRound = new RotatedRect(new Point(100, 100),
+                new Size(px(1.25), px(2.0)), 0);
+        RotatedRect anotherPart = new RotatedRect(new Point(100, 100),
+                new Size(px(1.25), px(0.9)), 0);
+
+        ReferenceBottomVision.SizeFit straight = ReferenceBottomVision.checkPartSizeEitherWay(part,
+                visionSettings, asReported, camera);
+        assert straight.fits() && !straight.isTurned() : "the part as it is drawn is now not the part: "+straight.getMessage();
+
+        ReferenceBottomVision.SizeFit turned = ReferenceBottomVision.checkPartSizeEitherWay(part,
+                visionSettings, theOtherWayRound, camera);
+        assert turned.fits() : "a part that is the right size a quarter turn off was refused: "+turned.getMessage();
+        assert turned.isTurned() : "the check does not say it had to read the rectangle the other way round";
+
+        ReferenceBottomVision.SizeFit wrong = ReferenceBottomVision.checkPartSizeEitherWay(part,
+                visionSettings, anotherPart, camera);
+        assert !wrong.fits() : "a part that is neither of the two expected sides is now accepted as well: "+wrong.getMessage();
+
+        System.out.println("[TEST] size check read both ways: "+asReported.size+" fits, "+theOtherWayRound.size
+                +" fits turned, "+anotherPart.size+" refused ("+wrong.getMessage()+")");
+    }
+
+    /**
+     * The same thing end to end: the simulated camera draws the part at the rotation of the nozzle, so
+     * a nozzle turned through 90° holds a part whose two sides reach the check in the other order.
+     */
+    @Test
+    public void testATurnedPartIsNotReportedAsTheWrongPart() throws Exception {
+        setUp();
+
+        visionSettings.setPreCheckAction(PreCheckAction.Report);
+        visionSettings.setCheckPartSizeMethod(PartSizeCheckMethod.BodySize);
+        part.getPackage().getFootprint().setBodyWidth(2.0);
+        part.getPackage().getFootprint().setBodyHeight(1.25);
+        visionSettings.setCheckSizeTolerancePercent(10);
+
+        PreCheckResult result = awaitVerdict(captureWithSettle(null, 90.0));
+
+        assert result != null : "the pre-check was not attached to the shot at all";
+        assert result.getMeasuredWidth() < result.getMeasuredHeight()
+                : "the part was not drawn a quarter turn off, so nothing was tested: "+result;
+        assert result.getVerdict() == Verdict.Ok
+                : "a part of the right size and a quarter turn off is the right part, was "+result
+                        +" ("+result.getMessage()+")";
+        assert result.getMessage().contains("turned") : "the check accepted it without saying why: "+result;
+        System.out.println("[TEST] pre-check on a part a quarter turn off: "+result);
+    }
+
+    private double px(double millimetres) {
+        return VisionUtils.toPixels(new Length(millimetres, LengthUnit.Millimeters), camera);
+    }
 }

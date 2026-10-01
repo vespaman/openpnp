@@ -496,7 +496,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
     }
 
-    private boolean partSizeCheck(Part part, BottomVisionSettings bottomVisionSettings, RotatedRect partRect, Camera camera) throws Exception {
+    protected static boolean partSizeCheck(Part part, BottomVisionSettings bottomVisionSettings, RotatedRect partRect, Camera camera) throws Exception {
         // Check if this test needs to be done
         Location partSize = bottomVisionSettings.getPartCheckSize(part, false);
         if (partSize == null) {
@@ -557,6 +557,94 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             throw new Exception(msg);
         }
         return true;
+    }
+
+    /**
+     * The same rectangle reported with its two sides exchanged.
+     *
+     * A rectangle fitted to a contour has no notion of which of its sides is the part's width:
+     * 17x37 at 0° and 37x17 at 90° are one and the same rectangle, and OpenCV hands out either of
+     * them, depending on where the contour it was fitted to happens to start.
+     */
+    public static RotatedRect withSidesExchanged(RotatedRect rect) {
+        return new RotatedRect(new Point(rect.center.x, rect.center.y), 
+                new Size(rect.size.height, rect.size.width), rect.angle);
+    }
+
+    /**
+     * The answer of {@link #checkPartSizeEitherWay}: whether the rectangle is the part at all, and if
+     * it is, whether it had to be read the other way round to say so.
+     *
+     * Public, and so are its methods, so that a test can look at the answer without having to go
+     * through a camera and a pipeline to get one.
+     */
+    public static class SizeFit {
+        private final boolean fits;
+        private final boolean turned;
+        private final String message;
+
+        private SizeFit(boolean fits, boolean turned, String message) {
+            this.fits = fits;
+            this.turned = turned;
+            this.message = message;
+        }
+
+        static SizeFit fitsAsReported() {
+            return new SizeFit(true, false, null);
+        }
+
+        static SizeFit fitsTurned(String reasonItDidNotFitAsReported) {
+            return new SizeFit(true, true, reasonItDidNotFitAsReported);
+        }
+
+        static SizeFit doesNotFit(String reason) {
+            return new SizeFit(false, false, reason);
+        }
+
+        public boolean fits() {
+            return fits;
+        }
+
+        public boolean isTurned() {
+            return turned;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+    }
+
+    /**
+     * Does this rectangle show a part of the size the package describes, in either of the two ways
+     * that size can be laid down on a rectangle?
+     *
+     * The alignment proper compares width with width and length with length, which is a coin toss on
+     * a part that is a quarter turn off: on the machine the two sides of a turned 0402 came out as
+     * 37x17 on the frame the alignment measured and as 17x37 on the frame the check measured, the two
+     * frames 26 ms apart, and the alignment was the one that happened to land well. A check that is
+     * only allowed to speak when it is sure must not inherit a coin toss; and it must not be the one
+     * that cries wolf either, because a warning that a legitimately turned part provokes is a warning
+     * that will be read as noise the next time it matters. So the pre-check asks both ways.
+     *
+     * What it found in the second way is worth keeping rather than swallowing: sides exchanged is a
+     * part lying a quarter turn from the orientation its footprint was written down in, which is the
+     * one thing this frame can say about the rotation of a part it is not allowed to judge.
+     */
+    public static SizeFit checkPartSizeEitherWay(Part part, BottomVisionSettings bottomVisionSettings,
+            RotatedRect rect, Camera camera) {
+        try {
+            partSizeCheck(part, bottomVisionSettings, rect, camera);
+            return SizeFit.fitsAsReported();
+        }
+        catch (Exception asReported) {
+            try {
+                partSizeCheck(part, bottomVisionSettings, withSidesExchanged(rect), camera);
+                return SizeFit.fitsTurned(asReported.getMessage());
+            }
+            catch (Exception neitherWay) {
+                return SizeFit.doesNotFit(asReported.getMessage());
+            }
+        }
     }
 
     @Override
@@ -2305,9 +2393,19 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     return;
                 }
                 try {
-                    partSizeCheck(part, bottomVisionSettings, rect, camera);
-                    result.finish(Verdict.Ok, (nominal == null 
-                            ? "part found, no size configured to compare with" : "part found within size tolerance"));
+                    SizeFit fit = checkPartSizeEitherWay(part, bottomVisionSettings, rect, camera);
+                    if (fit.fits() && fit.isTurned()) {
+                        // The part is the part. It is lying a quarter turn from its footprint, which is
+                        // not this check's business to gate on and is its business to say out loud.
+                        result.finish(Verdict.Ok, "part found within size tolerance, turned: "+fit.getMessage());
+                    }
+                    else if (fit.fits()) {
+                        result.finish(Verdict.Ok, (nominal == null 
+                                ? "part found, no size configured to compare with" : "part found within size tolerance"));
+                    }
+                    else {
+                        result.finish(Verdict.SizeOut, fit.getMessage());
+                    }
                 }
                 catch (Exception e) {
                     result.finish(Verdict.SizeOut, e.getMessage());
@@ -2344,29 +2442,50 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     /**
      * One line per pre-check, with capture, settle and check as three separate numbers and never as
      * a sum of each other.
+     *
+     * A number the check has not produced is left out rather than written as -1.0: a line that says
+     * check=-1.0 size=-1.00x-1.00 reads as a measurement of nothing in particular, and the one line
+     * where that happens - the hunt ending before the check reported - is exactly the line nobody
+     * should have to decode.
      */
     protected void logPreCheck(PreCheckResult result, Part part, Camera camera, Nozzle nozzle,
             PreCheckAction action, boolean late) {
+        boolean pending = result.getVerdict() == Verdict.Pending;
         String line = String.format(
-                "[PRE-CHECK%s] nozzle=%s camera=%s part=%s frame=1/%s capture=%.1f settle=%.1f check=%.1f"
-                        + " clone=%.1f queue=%.1f pipeline=%.1f prep=%.1f pipe=%.1f judge=%.1f"
-                        + " size=%.2fx%.2f expected=%.2fx%.2f rot=%.1f offset=%.2f verdict=%s action=%s",
+                "[PRE-CHECK%s] nozzle=%s camera=%s part=%s frame=1/%s capture=%s settle=%s check=%s"
+                        + " clone=%s queue=%s pipeline=%s prep=%s pipe=%s judge=%s"
+                        + " size=%s expected=%s rot=%s offset=%s verdict=%s action=%s",
                 late ? "-LATE" : "", nozzle.getId(), camera.getName(), part.getId(),
                 result.getFrameCount() < 0 ? "?" : String.valueOf(result.getFrameCount()),
-                result.getCaptureMs(), result.getSettleMs(), result.getCheckMs(),
-                result.getCloneMs(), result.getQueueMs(), result.getPipelineMs(),
-                result.getPrepMs(),
-                result.getProcessMs(), result.getJudgeMs(),
-                result.getMeasuredWidth(), result.getMeasuredHeight(),
-                result.getNominalWidth(), result.getNominalHeight(),
-                result.getRotation(), result.getOffsets(),
+                ms(result.getCaptureMs()), ms(result.getSettleMs()), ms(result.getCheckMs()),
+                ms(result.getCloneMs()), ms(result.getQueueMs()), ms(result.getPipelineMs()),
+                ms(result.getPrepMs()),
+                ms(result.getProcessMs()), ms(result.getJudgeMs()),
+                size(result.getMeasuredWidth(), result.getMeasuredHeight()),
+                size(result.getNominalWidth(), result.getNominalHeight()),
+                pending ? "?" : String.format("%.1f", result.getRotation()),
+                pending ? "?" : String.format("%.2f", result.getOffsets()),
                 result.getVerdict().name(), action.name());
-        if (result.getVerdict() == Verdict.Ok) {
+        if (pending) {
+            // Not a finding but the absence of one, and a normal one: the check is on the vision
+            // executor and the head does not wait for it. The verdict arrives on its own line, marked
+            // -LATE, when it arrives.
+            Logger.debug(line+" : the check has not reported yet, it is still on the vision executor");
+        }
+        else if (result.getVerdict() == Verdict.Ok) {
             Logger.debug(line);
         }
         else {
             Logger.warn(line+(result.getMessage().isEmpty() ? "" : " : "+result.getMessage()));
         }
+    }
+
+    protected static String ms(double milliseconds) {
+        return milliseconds < 0.0 ? "-" : String.format("%.1f", milliseconds);
+    }
+
+    protected static String size(double width, double height) {
+        return (width < 0.0 && height < 0.0) ? "-" : String.format("%.2fx%.2f", width, height);
     }
 
     public static ReferenceBottomVision getDefault() { 

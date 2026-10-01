@@ -684,7 +684,7 @@ were the whole of the settling's slowdown. The settling is not quite at `log_m`'
 frame shrank to 23-29 ms as expected, and it is still positive in all eight batches. The alignment step is
 the best it has ever been on this machine.
 
-One thing in the log is worth naming, and it is not ours:
+Three things in the log are worth naming, of which one is not ours:
 
 - **`SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder"` and the two lines after it**, at the
   first camera capture of a session. Not new and not ours: `lib/slf4j-api-1.7.2.jar` is on the classpath
@@ -698,3 +698,28 @@ One thing in the log is worth naming, and it is not ours:
   1.7.2 API. It is in `log_l` and in every session since, and in none of `log_c`..`log_j`. The dependency
   has been in the pom unchanged across all of those, so what changed is the assembling of `target/lib`
   rather than the code, and nothing in this design is involved either way.
+
+
+- **one `verdict=SizeOut` on a turned part.** `[PRE-CHECK] ... size=0.45x0.97 expected=1.00x0.50 ...
+  width too small: nominal 1.000, limit 0.620, measured 0.448`, twice in `log_n`/`log_o` and once in
+  `log_p`, always for the part that is deliberately placed a quarter turn off. The rectangle the pipeline
+  returns has no notion of which of its sides is the part's width: `17x37 at 0°` and `37x17 at 90°` are
+  the same rectangle and OpenCV hands out either. The alignment's own size check compares width with
+  width too - it is upstream, and it is a coin toss on a turned part - and in this batch the alignment
+  happened to get `37x17` for the same part 26 ms later while the check got `17x37`. The check now asks
+  both ways and says so (`verdict=Ok ... turned: ...`); the alignment is left alone, because changing what
+  the alignment accepts is not this design's call to make. Expect `verdict=Ok` sixteen times a job and the
+  word `turned` twice.
+- **`check=-1.0 size=-1.00x-1.00 rot=0.0 offset=-1.00` on the one line that goes out before the check
+  reports.** Those are not measurements, they are the absence of one, and they read as measurements of
+  nothing. A field that was not filled in is now left out (`check=- size=- rot=? offset=?`), the line is
+  logged at debug rather than warning - it is not a finding - and it says the check is still on the vision
+  executor. The `[PRE-CHECK-LATE]` line that follows it 2 ms later in `log_p` is the verdict arriving as
+  designed; one per job is normal. The analyzer's `pre-checks before the window` now pairs the two lines
+  within one alignment step rather than anywhere later in the log - the pre-check of the next placement is
+  not the verdict of this one - and it says 8/8 for `log_p`.
+
+The two fixes are tested (`PreCheckReportTest`: a part drawn a quarter turn off must be `Ok` and must say
+`turned`; a rectangle measured the other way round must fit, and one that is neither expected side must
+still be refused), and with the second reading removed both tests fail with exactly the machine's message,
+`width too small: nominal 2.000, limit 1.800, measured 1.250`.
