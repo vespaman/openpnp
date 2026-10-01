@@ -723,3 +723,57 @@ The two fixes are tested (`PreCheckReportTest`: a part drawn a quarter turn off 
 `turned`; a rectangle measured the other way round must fit, and one that is neither expected side must
 still be refused), and with the second reading removed both tests fail with exactly the machine's message,
 `width too small: nominal 2.000, limit 1.800, measured 1.250`.
+
+## The run that produces the frames themselves (`-DframeDump`)
+
+Everything so far has been read out of the log, which says what the machine concluded but not what it
+looked at. The next step (departing before the analysis is finished) is only defensible if the analysis
+can be shown, away from the machine, to reach the same conclusion twice on the same pixels - so the
+frames have to be kept, and a PNG of a bottom camera says nothing by itself. The pipeline's own debug
+stage writes `bv_source_<nsec>.png`, which cannot be replayed as evidence: no part, no camera, no claim
+about the motion, and pairs that can only be matched by guessing from adjacent nanoseconds.
+
+`FrameDump`, built for this in step 1, writes the frame and puts the whole claim in the name:
+
+```
+bv__Settled__C2__N1__R0805-1K__f4__a+1000.0__c+1082.0__w+1061.0__r+0.0.png
+```
+
+settled by agreement, camera `C2`, nozzle `N1`, part `R0805-1K`, the fourth frame the camera was asked
+for, the head came to rest at 1000 ms, the frame was integrated until 1082 ms, the still window opened at
+1061 ms, the placement wanted rotation 0. `FrameDump.parse()` reads a name back and refuses anything it
+did not write, so a frame cannot quietly arrive with a shuffled history.
+
+Start the run with the dump on:
+
+```
+./openpnp.sh "-DframeDump=$HOME/bv-corpus"
+```
+
+The property turns it on for every Bottom Vision setting at once, which is the point: this machine has
+five of them, and a corpus taken with three ticked boxes is not a corpus but a mystery. `-DframeDumpMax`
+caps it (4000 frames by default) so a session left running cannot fill the disk. The PNG encoding and
+write happen on a thread of its own, and a queue that fills up drops frames and says how many, because a
+machine that cannot write frames as fast as it takes them should lose frames rather than hold the head
+over the camera. The copy of the pixels into memory stays on the capturing thread, since the frame stops
+existing when that thread returns - so **the timings of a corpus run are not the timings to compare
+against `log_p`**. One ordinary warm job is enough: about two frames per placement.
+
+Say it worked by looking for `[FRAME-DUMP] frames go to /home/.../bv-corpus because -DframeDump is set`
+at the first capture and one line per frame after it. Those lines were not in any earlier log for a
+reason of its own: `FrameDump` logged through SLF4J, which on this machine has no binding and discards
+everything (the three warning lines at the start of `log_l` onwards). It now logs the way the rest of
+OpenPnP does, so the dump announces itself.
+
+Copy away, together, when the job is done:
+
+```
+cp -r ~/bv-corpus tests_2026-10-01/framedump
+cp ~/.openpnp2/machine.xml ~/.openpnp2/packages.xml ~/.openpnp2/parts.xml \
+   ~/.openpnp2/boards.xml ~/.openpnp2/vision-settings.xml tests_2026-10-01/framedump/
+cp <the log of that session> tests_2026-10-01/log_q.txt
+```
+
+The config files belong with the frames because replaying a frame means running *that part's* pipeline
+over it, and the pipeline lives in the settings of the moment. A frame without the settings that made it
+is a picture, not an experiment.

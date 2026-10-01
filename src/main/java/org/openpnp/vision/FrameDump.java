@@ -3,6 +3,11 @@ package org.openpnp.vision;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.imageio.ImageIO;
 
@@ -14,8 +19,7 @@ import org.openpnp.model.Part;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Nozzle;
 import org.openpnp.util.OpenCvUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.pmw.tinylog.Logger;
 
 /**
  * Writes captured frames to disk with their provenance in the file name.
@@ -38,12 +42,74 @@ import org.slf4j.LoggerFactory;
  * {@code -}, because part ids are full of slashes. {@link #parse(String)} reads a name back.</p>
  *
  * <p>Turning this on is not free: encoding and writing a frame takes tens of milliseconds, which is
- * of the same order as the settling it is meant to observe. It exists to produce evidence for
+ * of the same order as the settling it is meant to observe. The encoding of the pixels into a
+ * {@code BufferedImage} is kept on the capturing thread, because the frame belongs to that thread and
+ * stops existing when it returns, but the PNG encoding and the write happen on a thread of their own,
+ * so that the dump does not lengthen the thing it is watching. It exists to produce evidence for
  * offline analysis, not to be left enabled while timings are being measured.</p>
+ *
+ * <p>{@code -DframeDump=<directory>} turns it on for every vision setting at once, which is what a
+ * run meant to produce a corpus needs: the alternative is to open every Bottom Vision setting in the
+ * GUI and tick a box, and a corpus missing three of its five parts is not a corpus.
+ * {@code -DframeDumpMax=<frames>} stops it after that many frames.</p>
  */
 public class FrameDump {
 
-    private static final Logger logger = LoggerFactory.getLogger(FrameDump.class);
+    /**
+     * The system property that turns the dump on, and to where. Named like the others the launcher
+     * passes ({@code configDir}, {@code backups}), because it is passed on the same command line.
+     */
+    public static final String PROPERTY = "frameDump";
+
+    /**
+     * How many frames one session writes at most, so that a run left running with the dump on cannot
+     * fill the disk.
+     */
+    public static final String MAX_PROPERTY = "frameDumpMax";
+
+    public static final int DEFAULT_MAX_FRAMES = 4000;
+
+    /**
+     * Frames waiting to be encoded. Small on purpose: a machine that cannot write frames as fast as it
+     * takes them is better off losing frames than queues.
+     */
+    private static final int QUEUE_DEPTH = 64;
+
+    private static final BlockingQueue<Job> queue = new ArrayBlockingQueue<>(QUEUE_DEPTH);
+
+    /**
+     * Frames handed to the dump, whether or not they were written.
+     */
+    private static final AtomicLong offered = new AtomicLong();
+
+    private static final AtomicLong written = new AtomicLong();
+
+    private static final AtomicLong dropped = new AtomicLong();
+
+    private static final AtomicBoolean capSaid = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * The frames that have been handed over and have not been written yet, counted from the moment a
+     * frame is queued rather than from the moment a writer picks it up, so that waiting for zero really
+     * means the corpus is complete and not merely that no writer is holding a frame this instant.
+     */
+    private static final AtomicInteger pending = new AtomicInteger();
+
+    private static final Object idleMonitor = new Object();
+
+    private static Thread writerThread;
+
+    private static class Job {
+        final File file;
+        final BufferedImage image;
+        final boolean still;
+
+        Job(File file, BufferedImage image, boolean still) {
+            this.file = file;
+            this.image = image;
+            this.still = still;
+        }
+    }
 
     public static final String PREFIX = "bv";
     /**
@@ -172,10 +238,15 @@ public class FrameDump {
     }
 
     /**
-     * The directory frames go to: what the settings say, or a directory of the configuration if the
-     * settings give nothing.
+     * The directory frames go to: what {@value #PROPERTY} says, because a command line beats a tick
+     * box that has to be found five times, then what the settings say, then a directory of the
+     * configuration.
      */
     public static File directory(BottomVisionSettings settings) {
+        String override = overrideDirectory();
+        if (override != null) {
+            return new File(override);
+        }
         String configured = settings == null ? null : settings.getFrameDumpDirectory();
         if (configured != null && !configured.trim().isEmpty()) {
             return new File(configured.trim());
@@ -184,30 +255,167 @@ public class FrameDump {
     }
 
     /**
+     * The directory named on the command line, or {@code null} if the command line says nothing.
+     */
+    public static String overrideDirectory() {
+        String property = System.getProperty(PROPERTY);
+        if (property == null || property.trim().isEmpty()) {
+            return null;
+        }
+        return property.trim();
+    }
+
+    /**
+     * Whether frames are being dumped at all: either the command line asked for it, or the vision
+     * settings did.
+     */
+    public static boolean isEnabled(BottomVisionSettings settings) {
+        return overrideDirectory() != null || (settings != null && settings.isFrameDumpEnabled());
+    }
+
+    public static int maxFrames() {
+        String property = System.getProperty(MAX_PROPERTY);
+        if (property == null || property.trim().isEmpty()) {
+            return DEFAULT_MAX_FRAMES;
+        }
+        try {
+            return Integer.parseInt(property.trim());
+        }
+        catch (NumberFormatException e) {
+            Logger.warn("[FRAME-DUMP] -D{} is \"{}\", which is not a number; using {}", MAX_PROPERTY,
+                    property, DEFAULT_MAX_FRAMES);
+            return DEFAULT_MAX_FRAMES;
+        }
+    }
+
+    /**
+     * How many frames were asked for, how many were written and how many were lost, for whoever wants
+     * to know whether the corpus they are about to analyse is the corpus that was taken. Only complete
+     * after {@link #awaitIdle(long)}.
+     */
+    public static long getFramesOffered() {
+        return offered.get();
+    }
+
+    public static long getFramesWritten() {
+        return written.get();
+    }
+
+    public static long getFramesDropped() {
+        return dropped.get();
+    }
+
+    /**
      * Write one frame if the settings ask for it. Never throws and never fails a capture: a dump that
      * cannot be written is a lost piece of evidence, not a reason to stop placing parts. The reason is
      * said once, because a machine that cannot write a dump will not fail on one frame alone.
+     *
+     * <p>The pixels are copied here rather than on the writing thread, because the {@code Mat} is the
+     * capture's and is released when this returns; the expensive part, which is the PNG encoding, goes
+     * to the writing thread.</p>
      */
     public static void writeIfNeeded(BottomVisionSettings settings, Mat frame,
             FrameProvenance provenance, Camera camera, Nozzle nozzle, Part part, double rotation) {
-        if (settings == null || !settings.isFrameDumpEnabled() || frame == null || frame.empty()) {
+        if (!isEnabled(settings) || frame == null || frame.empty()) {
             return;
         }
-        File file = new File(directory(settings), fileName(provenance, camera, nozzle, part,
-                rotation));
+        if (offered.incrementAndGet() > maxFrames()) {
+            if (capSaid.compareAndSet(false, true)) {
+                Logger.warn("[FRAME-DUMP] stopped after {} frames; -D{}={} if that was not enough",
+                        maxFrames(), MAX_PROPERTY, maxFrames());
+            }
+            return;
+        }
+        File directory = directory(settings);
+        File file = new File(directory, fileName(provenance, camera, nozzle, part, rotation));
         try {
-            if (!file.getParentFile().isDirectory() && !file.getParentFile().mkdirs()) {
-                throw new IOException("cannot create "+file.getParentFile());
+            if (!directory.isDirectory() && !directory.mkdirs()) {
+                throw new IOException("cannot create "+directory);
             }
             BufferedImage image = OpenCvUtils.toBufferedImage(frame);
-            if (!ImageIO.write(image, "png", file)) {
-                throw new IOException("no png writer available");
+            if (!queue.offer(new Job(file, image, provenance != null && provenance.isStill()))) {
+                long lost = dropped.incrementAndGet();
+                if (lost == 1 || lost % 100 == 0) {
+                    Logger.warn("[FRAME-DUMP] the writer is {} frames behind, {} frames have been "
+                            + "dropped", QUEUE_DEPTH, lost);
+                }
+                return;
             }
-            logger.info("[FRAME-DUMP] {} still={}", file.getName(), provenance != null
-                    && provenance.isStill());
+            if (offered.get() == 1) {
+                Logger.info("[FRAME-DUMP] frames go to {}{}", directory.getAbsolutePath(),
+                        overrideDirectory() == null ? "" : " because -D"+PROPERTY+" is set");
+            }
+            pending.incrementAndGet();
+            ensureWriter();
         }
         catch (Exception e) {
-            logger.warn("[FRAME-DUMP] cannot write {}: {}", file.getName(), e.getMessage());
+            Logger.warn("[FRAME-DUMP] cannot write {}: {}", file.getName(), e.getMessage());
+        }
+    }
+
+    private static void ensureWriter() {
+        synchronized (FrameDump.class) {
+            if (writerThread == null) {
+                writerThread = new Thread(FrameDump::drain, "frame-dump");
+                writerThread.setDaemon(true);
+                writerThread.setPriority(Thread.MIN_PRIORITY);
+                writerThread.start();
+            }
+        }
+    }
+
+    private static void drain() {
+        while (true) {
+            Job job;
+            try {
+                job = queue.take();
+            }
+            catch (InterruptedException e) {
+                return;
+            }
+            try {
+                if (!ImageIO.write(job.image, "png", job.file)) {
+                    throw new IOException("no png writer available");
+                }
+                written.incrementAndGet();
+                Logger.info("[FRAME-DUMP] {} still={}", job.file.getName(), job.still);
+            }
+            catch (Exception e) {
+                Logger.warn("[FRAME-DUMP] cannot write {}: {}", job.file.getName(), e.getMessage());
+            }
+            finally {
+                if (pending.decrementAndGet() <= 0) {
+                    synchronized (idleMonitor) {
+                        idleMonitor.notifyAll();
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Wait until every frame handed over has been written. Only a corpus that is known to be complete
+     * can be copied away, and a directory being written to says nothing about whether it is finished.
+     *
+     * @return {@code false} if the timeout passed with frames still to write.
+     */
+    public static boolean awaitIdle(long timeoutMs) {
+        long deadline = System.currentTimeMillis()+timeoutMs;
+        synchronized (idleMonitor) {
+            while (pending.get() > 0) {
+                long left = deadline-System.currentTimeMillis();
+                if (left <= 0) {
+                    return false;
+                }
+                try {
+                    idleMonitor.wait(left);
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
         }
     }
 

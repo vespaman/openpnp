@@ -2,6 +2,7 @@ import java.io.File;
 
 import org.junit.jupiter.api.Test;
 import org.opencv.core.CvType;
+import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.core.Mat;
 import org.opencv.core.Scalar;
 import org.opencv.core.Size;
@@ -342,17 +343,21 @@ public class FrameProvenanceTest {
         try {
             FrameDump.writeIfNeeded(visionSettings, frame,
                     FrameProvenance.settled(1000, 1082, 1061, 4), camera, nozzle, part, 0.);
+            FrameDump.awaitIdle(2000);
             assert dumpDirectory.list().length == 0
                     : "frames were written that nobody asked for: "
                     +java.util.Arrays.toString(dumpDirectory.list());
 
+            long offered = FrameDump.getFramesOffered();
             visionSettings.setFrameDumpEnabled(true);
             FrameDump.writeIfNeeded(visionSettings, frame,
                     FrameProvenance.settled(1000, 1082, 1061, 4), camera, nozzle, part, 0.);
+            assert FrameDump.awaitIdle(5000) : "the writer never came up";
             String[] written = dumpDirectory.list();
             assert written.length == 1 : "one frame was asked for, "+java.util.Arrays
                     .toString(written)+" came out";
             assert new File(dumpDirectory, written[0]).length() > 0 : "the frame is empty";
+            assert FrameDump.getFramesOffered()-offered == 1 && FrameDump.getFramesDropped() == 0;
 
             // The name of the thing on disk is the name the code wrote, and it still tells the truth
             // about the frame after the round trip through the filesystem.
@@ -362,6 +367,120 @@ public class FrameProvenanceTest {
             assert name.capturedAtMs == 1082;
         }
         finally {
+            frame.release();
+        }
+    }
+
+    /**
+     * A corpus run has to be started by one word on the command line: there are five Bottom Vision
+     * settings on this machine and a corpus taken with three of them ticked is not a corpus, it is a
+     * mystery. So the property wins over the settings, in both directions.
+     */
+    @Test
+    public void testTheCommandLineTurnsTheDumpOnForEverySettingAtOnce() throws Exception {
+        setUp();
+
+        File dumpDirectory = Files.createTempDir();
+        Mat frame = new Mat(new Size(64, 48), CvType.CV_8UC3, new Scalar(30, 40, 50));
+        System.setProperty(FrameDump.PROPERTY, dumpDirectory.getAbsolutePath());
+        try {
+            assert FrameDump.isEnabled(visionSettings) : "the command line did not turn the dump on";
+            assert FrameDump.directory(visionSettings).equals(dumpDirectory)
+                    : "the command line did not say where: "+FrameDump.directory(visionSettings);
+
+            visionSettings.setFrameDumpEnabled(true);
+            visionSettings.setFrameDumpDirectory(Files.createTempDir().getAbsolutePath());
+            assert FrameDump.directory(visionSettings).equals(dumpDirectory)
+                    : "a directory ticked once in the GUI overrode the run that was asked for";
+
+            long offered = FrameDump.getFramesOffered();
+            FrameDump.writeIfNeeded(visionSettings, frame,
+                    FrameProvenance.settled(1000, 1082, 1061, 4), camera, nozzle, part, 12.5);
+            assert FrameDump.awaitIdle(5000) : "the writer never came up";
+            String[] written = dumpDirectory.list();
+            assert written.length == 1 : "the dump asked for on the command line wrote "
+                    +java.util.Arrays.toString(written);
+            FrameDump.Name name = FrameDump.parse(written[0]);
+            assert name.partId.equals(part.getId().replaceAll("[^A-Za-z0-9.-]", "-")) : name.partId;
+            assert Math.abs(name.rotation-12.5) < 0.001 : name.rotation;
+
+            // And when the property is gone the settings are the whole story again, including "off".
+            System.clearProperty(FrameDump.PROPERTY);
+            visionSettings.setFrameDumpEnabled(false);
+            assert !FrameDump.isEnabled(visionSettings) : "the dump outlived the property that asked "
+                    + "for it";
+            FrameDump.writeIfNeeded(visionSettings, frame,
+                    FrameProvenance.settled(1000, 1082, 1061, 4), camera, nozzle, part, 12.5);
+            FrameDump.awaitIdle(2000);
+            assert dumpDirectory.list().length == 1 : "a run nobody asked for wrote frames: "
+                    +java.util.Arrays.toString(dumpDirectory.list());
+            assert FrameDump.getFramesOffered() == offered+1
+                    : "a refused frame still counts as one that was asked for";
+        }
+        finally {
+            System.clearProperty(FrameDump.PROPERTY);
+            System.clearProperty(FrameDump.MAX_PROPERTY);
+            frame.release();
+        }
+    }
+
+    /**
+     * The writing of a corpus must not be allowed to decide how the run it is watching goes: a queue
+     * that fills up loses frames and says so, rather than making the head wait over the camera. The
+     * count of what was lost is as important as the frames themselves, because a corpus with holes in
+     * it has to be read as one.
+     */
+    @Test
+    public void testABurstOfFramesIsWrittenWithoutLosingTheOnesThatFit() throws Exception {
+        setUp();
+
+        File dumpDirectory = Files.createTempDir();
+        System.setProperty(FrameDump.PROPERTY, dumpDirectory.getAbsolutePath());
+        Mat frame = new Mat(new Size(64, 48), CvType.CV_8UC3, new Scalar(30, 40, 50));
+        try {
+            int asked = 40;
+            long offered = FrameDump.getFramesOffered();
+            long writtenBefore = FrameDump.getFramesWritten();
+            for (int i = 0; i < asked; i++) {
+                FrameDump.writeIfNeeded(visionSettings, frame,
+                        FrameProvenance.settled(1000, 1082+i, 1061, i+1), camera, nozzle, part, 0.);
+            }
+            assert FrameDump.awaitIdle(20000) : "the queue never drained";
+            assert FrameDump.getFramesOffered()-offered == asked;
+            assert FrameDump.getFramesWritten()-writtenBefore == asked
+                    : asked+" frames were asked for, "+(FrameDump.getFramesWritten()-writtenBefore)
+                            +" arrived";
+            String[] files = dumpDirectory.list();
+            assert files.length == asked : java.util.Arrays.toString(files);
+
+            // Every frame is itself: the pixels that went in are the pixels that come out, because a
+            // replay that disagrees with the machine has to be able to prove it looked at the same
+            // picture and not at a corrupted one.
+            Mat read = Imgcodecs.imread(new File(dumpDirectory, files[0]).getAbsolutePath());
+            assert !read.empty() : "the frame on disk cannot be read";
+            assert read.width() == 64 && read.height() == 48 : read.size().toString();
+            double[] pixel = read.get(0, 0);
+            double[] sent = frame.get(0, 0);
+            assert pixel[0] == sent[0] && pixel[1] == sent[1] && pixel[2] == sent[2]
+                    : "the frame came back with different pixels: "+java.util.Arrays.toString(pixel)
+                            +" against "+java.util.Arrays.toString(sent);
+            read.release();
+
+            // A run left running with the dump on cannot fill the disk.
+            System.setProperty(FrameDump.MAX_PROPERTY, "5");
+            int before = dumpDirectory.list().length;
+            for (int i = 0; i < 30; i++) {
+                FrameDump.writeIfNeeded(visionSettings, frame,
+                        FrameProvenance.settled(1000, 2082+i, 1061, i+1), camera, nozzle, part, 0.);
+            }
+            FrameDump.awaitIdle(5000);
+            assert dumpDirectory.list().length == before
+                    : "the cap did not hold: "+(dumpDirectory.list().length-before)+" frames written "
+                            +"past it";
+        }
+        finally {
+            System.clearProperty(FrameDump.PROPERTY);
+            System.clearProperty(FrameDump.MAX_PROPERTY);
             frame.release();
         }
     }
