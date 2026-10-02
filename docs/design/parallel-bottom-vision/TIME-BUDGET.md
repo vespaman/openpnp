@@ -42,7 +42,7 @@ of a flattening tail you insist on. Raising the threshold buys back one frame (~
 8 fiducials, ~230 ms per job. That is real but it is a gamble on accuracy, and the accuracy figure below
 says the accuracy is not what the settling is protecting.
 
-**The fiducial measurement scatters by 30-110 µm and the tolerance is 200 µm.** Grouping every
+**The fiducial measurement varies by 30-110 µm between jobs.** Grouping every
 `FIDUCIAL-FIDUCIAL located at (x, y, ...)` of the four logs of this session by fiducial:
 
 | log | spread of the located coordinate, per fiducial |
@@ -52,15 +52,32 @@ says the accuracy is not what the settling is protecting.
 | `log_w.txt` (4 each) | x 0.033-0.071 mm, y 0.061-0.117 mm |
 | `log_x.txt` (4 each) | x 0.005-0.061 mm, y 0.009-0.056 mm |
 
-The board does not move between jobs, so that spread is measurement error, and the whole board transform
-is built from these numbers. The locator itself is happy with it: `less than max. linear offset 0.062mm <
-0.200mm, locator satisfied`. Which means: 990 ms a job is being spent on a settling that ends when the
-vibration score happens to dip, while the result is off by up to a tenth of a millimetre anyway. The
-settling is not the thing protecting the fiducial accuracy on this machine, and one should not tune its
-threshold before knowing what the 50-110 µm actually is - vibration during the exposure, the fiducial
-pipeline (blur, mask, threshold, `settleContrastEnhance`), the lighting, or the axis backlash after a
-direction reversal. That is a separate piece of work from the parallel vision, and it is 25 times the size
-of the async join.
+**The claim above about measurement error was wrong, and here is the corrected number.** The table above
+compared the located coordinate of the same fiducial *across jobs*. The board is placed by hand and is not
+in the same place from job to job - the first home-in pass of every job lands about 0.78 mm off the nominal
+for exactly that reason - so that spread was board placement and measurement error added together and it
+should not be quoted.
+
+The measurement that is valid is the same fiducial measured twice inside one job. The locator runs
+`getMaxVisionPasses()` home-in passes and only stops early when the offset is under `getMaxLinearOffset()`,
+so every fiducial in these jobs was measured twice back to back. The two measurements differ by:
+
+| log, job | the four fiducials, first pass against second pass |
+|---|---|
+| `log_x` job 1 | 0.014, 0.015, 0.062, 0.010 mm |
+| `log_x` job 2 | 0.017, 0.019, 0.051, 0.014 mm |
+| `log_y` job 1 | 0.005, 0.019, 0.065, 0.020 mm |
+| `log_y` job 2 | 0.024, 0.033, 0.017, 0.049 mm |
+
+Repeatability is therefore 5-65 µm against a 200 µm tolerance, and the board transform is built from
+measurements of that quality. The locator itself agrees: `less than max. linear offset 0.062mm < 0.200mm,
+locator satisfied`. So 990 ms a job is still being spent on a settling that ends when the vibration score
+happens to dip, while the result varies by up to a tenth of a millimetre for other reasons, and the
+settling is still not the thing protecting fiducial accuracy. What those other 5-65 µm are - vibration
+still present inside the exposure, the fiducial pipeline (blur, mask, threshold, `settleContrastEnhance`),
+the lighting, or axis backlash after a direction reversal - is a separate piece of work from the parallel
+vision. The exposure is 5 ms inside a 33 ms frame interval, so it can be lengthened without costing job
+time, and that is the cheapest experiment to run first. See `CAPTURE-COST.md` for the frame-level budget.
 
 ## The async join, which was the question
 
@@ -89,8 +106,8 @@ If it is done, the safe shape is to stop making the light-off depend on the batc
    outside the window fails the deferred path exactly as a refused frame does today, which is the abort
    path that is now proven on hardware.
 
-Expected gain: 38 ms in 10.8 s, 0.35 %, and it needs the light sequencing to change. It is not the lowest
-hanging fruit; the fiducial settling is, and it is 25 times bigger. It is also the last item in the
+Expected gain: 38 ms in 10.8 s, 0.35 %, and it needs the light sequencing to change. It is not the largest
+item; the fiducial settling is, 1204-1543 ms a job against these 38 ms. It is also the last item in the
 parallel-vision pipeline that is still standing between the head and leaving the cameras, so it may be
 worth doing for that reason rather than for the milliseconds.
 
