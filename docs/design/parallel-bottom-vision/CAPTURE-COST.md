@@ -184,29 +184,43 @@ join is worth tens.
 The frame rates are measured now, so the list is short and each item says how to check it from the lines
 the log already prints (`autoSettleAndCapture t=... score: ... compute time:`).
 
-1. **Fewer frames per settling.** The down camera cannot be made faster than 30 fps, so its look costs
-   frames × 33 ms. `settle-debounce` is already 1 and the threshold is 0.48 down / 0.40 up. Replaying the
-   score series of the clean job of each log through the settling's own rule - same frames, same debounce,
-   only the threshold moved, the verdict taken at the first frame that would have passed - gives:
+1. **Raising the settle threshold: measured, and it does not pay.** What the score means came out of the
+   code: with `settle-method="Motion"` (all three cameras) `computeDifference()` does a template match of
+   one frame inside the next and returns the shift **in pixels**, with a sub-pixel term from the match value.
+   So the threshold is already a distance, not an abstract score:
 
-   | threshold | `log_x` job (1204 ms settling) | `log_y` job (1543 ms settling) |
-   |---|---|---|
-   | 0.30 | 167 ms, 7 of 12 end sooner | 435 ms, 10 of 12 |
-   | 0.40 | 235 ms, 9 of 12 | 643 ms, 12 of 12 |
-   | 0.45 | 359 ms, 11 of 12 | 667 ms, 12 of 12 |
-   | 0.55 | 411 ms, 11 of 12 | 748 ms, 12 of 12 |
+   | camera | threshold | frame scaling | what it accepts | debounce |
+   |---|---|---|---|---|
+   | `Down Locking` (fiducial) | 1.0 | 0.01754 mm/px x 3 (blur 15 rescales by 3) | 53 µm of motion between two frames | 2 |
+   | `Upp1` | 0.48 | 0.0386/0.0341 mm/px x 3 | 53 µm | 1 |
+   | `Upp2` | 0.40 | 0.0345 mm/px x 3 | 41 µm | 1 |
 
-   (An earlier version of this table read "537 ms at 0.45" because it summed the two jobs contained in each
-   log and divided nothing; per job it is 359-667 ms.)
+   Replaying the score series of the clean job of each log through the settling's own rule reproduces the
+   recorded end of every settling in both logs (8 of 8, 4 of 4, 9 of 9, 3 of 3), so the replay can be
+   trusted to price a different threshold. It says the saving is small and the price is not:
 
-   That is a real half second, and it is also a direct trade of residual vibration against time, and at
-   12 of 12 settlings it is no longer a tweak but a different rule - which is why it must not be set by
-   feel. Two things the replay cannot see and the corpus can: whether the frame the earlier verdict would
-   have landed on is actually a good measurement in millimetres, and whether the real capture taken after
-   the verdict still sits inside the stillness it is claiming. `FrameReplayTest` with `bv-corpus/` already
-   reproduces the recorded rectangle to the last digit, so "what does 0.45 cost in millimetres" is
-   answerable offline once enough grabs are dumped. The score is a difference of a blurred 960x1080 frame,
-   not a distance, so the first job is to correlate one against the other.
+   | camera | threshold | between frames | saved per job | worst distance of a frame after the earlier verdict to the kept frame |
+   |---|---|---|---|---|
+   | fiducial | 1.5 | 79 µm | 36 ms (`log_x`) / 228 ms (`log_y`) | 0.019 mm / 0.125 mm |
+   | fiducial | 2.0 | 105 µm | 74 ms / 325 ms | 0.019 mm / 0.201 mm |
+   | bottom | 0.6-1.2 | 66-131 µm | 0-24 ms | up to 0.054 mm |
+
+   The reason it is so cheap is that at the configured thresholds the settling already stops at the first
+   frame that can stop it: the vibration decays inside two or three frames and the rest is the debounce
+   waiting for proof, which a threshold cannot buy back. Accepting 0.2 mm of motion between two frames, in a
+   machine whose whole placement tolerance is 0.2 mm, to get a third of a second is not a trade. **This item
+   is closed, and two earlier versions of this document were wrong about it** - the "537 ms at 0.45" figure
+   summed the two jobs contained in `log_y.txt`, and the "359-667 ms at 0.45" figure that replaced it
+   ignored the debounce and used thresholds that are not in `machine.xml` (there is no 0.45 threshold
+   anywhere on this machine).
+
+   The same arithmetic does answer the question the still-window rule was built for, without a machine run:
+   summing the scores (which are distances) from the first agreeing pair to the kept frame bounds how far a
+   frame taken at that earlier instant could be from the frame the settling kept. Across both clean jobs that
+   bound is 0.012-0.021 mm in the median case and 0.221 mm in the worst settling. So a frame chosen inside
+   the still window, which is what the second bottom camera does, is about 20 µm from the frame the settling
+   would have kept, and the rule is worth keeping as it stands.
+
 2. **Stop asking for frames on demand.** One background consumer per camera, taking every frame the stream
    produces into a short ring with the driver's own timestamps, so the settling and the pre-capture ask for
    "the newest frame at or after T" and get it out of memory. This is the item that removes the cold first
@@ -275,12 +289,13 @@ angles. Stated so they can be added:
 | - one frame interval per settling that a ring would remove | ~210 ms | ~210 ms | the cold first frame: 51 vs 31 ms fiducial, 28 vs 15 ms bottom |
 | - compute that a ring thread would overlap | ~190 ms | ~220 ms | `compute time:` x frames |
 | - the async join | 38-80 ms | 38-80 ms | one extra exposure on the second bottom camera |
-| - whole frame intervals a higher threshold skips | 359 ms at 0.45 | 667 ms at 0.45 | modelled, costs accuracy, corpus must defend it |
+| - whole frame intervals a higher threshold would skip | 36-74 ms | 228-325 ms | measured in item 1, and it costs up to 0.2 mm |
 
-Item 2 is therefore about 450-500 ms a job (4 % of it) and item 1 about 350-670 ms more, for a combined
-800-1100 ms of the 1.4-1.9 s pool. Nothing in this is over 1.9 s, because nothing can save time the machine
-is not spending: the sum of the settling loops is the ceiling, and the earlier "over 1000 ms" figure in this
-document's first draft was two jobs of one log file read as one job, plus item 2 and item 3 counted twice.
+Item 2 is therefore about 450-500 ms a job (4 % of it) and is the only camera item that does not trade
+accuracy away. Item 1 adds at most 250 ms and is rejected. Nothing here is over 1.9 s, because nothing can
+save time the machine is not spending: the sum of the settling loops is the ceiling, and the earlier "over
+1000 ms" figure in this document was two jobs of one log file read as one job, plus item 2 and item 3
+counted twice.
 
 A Rust or C++ rewrite of the vision is not on this list, and the reason is in the numbers above: the
 arithmetic is already native, the Java around it costs 2-5 ms a frame and some garbage, and the rest of the
@@ -296,10 +311,22 @@ above) and by a stream that cannot exceed 30 fps, so every frame of every settli
 
 - Item 2 applies unchanged, and per frame interval it gains more there than at the bottom cameras, because
   a fiducial frame interval is 33 ms against 8.3 ms. The compute is also twice as large there (5.4 ms).
-- Item 1 applies unchanged: 8 of the 12 settlings in the fiducial phase are the second home-in pass, whose
-  frames all score low, and shortening them is the same trade.
-- Two things are specific to the fiducial camera and are not settling matters at all: whether the second
-  home-in pass is needed at all when the first pass lands inside the placement tolerance by a wide margin,
-  and whether the exposure can be lengthened. Exposure there is 5 ms inside a 33 ms frame interval, so
-  10-20 ms of exposure is available without costing a millisecond of job time, and more light is the direct
-  way to reduce the 5-65 µm repeatability if that repeatability is shot noise rather than vibration.
+- Item 1 is closed here too, and it is worth saying why it looks tempting and is not: 8 of the 12 settlings
+  in the fiducial phase are the second home-in pass, whose scores are low from the first frame, so the
+  settling there is nearly all debounce. That is 2 extra frames at 26-31 ms in eight places, which item 1's
+  measured 36-228 ms is - and it buys that by declaring the head still while the score says it moved
+  0.1-0.2 mm between two frames.
+- Two things are specific to the fiducial camera and are not settling matters at all: the second home-in
+  pass itself (`settle-threshold="1.0"` and `settle-debounce="2"` are not what decides it -
+  `max-linear-offset` in the fiducial vision settings does, and the first pass lands ~0.78 mm off because
+  the board is placed by hand, so a second pass is normally unavoidable), and the exposure. Exposure there
+  is 5 ms inside a 33 ms frame interval, so 10-20 ms of exposure is available without costing a millisecond
+  of job time, and more light is the direct way to reduce the 5-65 µm repeatability if that repeatability
+  is shot noise rather than vibration.
+- One thing ruled out, because the configuration looks alarming: `machine.xml` carries `fps="6.0"` on the
+  down camera and `fps="3.0"` on both up cameras. That attribute is `AbstractBroadcastingCamera.fps`, which
+  only paces the **preview** loop (`captureNotifier.wait(1000./fps)`, line 355) - it is not a frame-rate
+  request to the device. The device rates measured with `v4l2-ctl` (30 and 120 fps) and the frame intervals
+  in the log (26-31 and 12 ms) agree with each other and not with those numbers, which is the expected
+  result. `suspend-preview-in-tasks="true"` on all three cameras also means the preview is not competing for
+  frames during a job.
