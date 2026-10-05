@@ -43,6 +43,7 @@ import org.opencv.imgproc.Imgproc;
 import org.openpnp.gui.MainFrame;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.FrameProvenance;
+import org.openpnp.spi.BufferedFrames;
 import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.spi.base.AbstractCamera;
 import org.openpnp.util.NanosecondTime;
@@ -299,6 +300,22 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      * before it believes any of them.
      */
     private volatile long settleEpoch = 0;
+    /**
+     * Guards {@link #settleWatchVersion}. Another camera waits on this monitor instead of polling the
+     * recorded numbers, so that it is running the millisecond the settling has something to say rather
+     * than the millisecond its next poll happens to come round.
+     */
+    private final Object settleWatchMonitor = new Object();
+    /**
+     * Bumped whenever anything a watcher looks at has moved: the epoch, the candidate window, the
+     * certified window. See {@link #awaitSettleWatchChange(long, long)}.
+     */
+    private volatile long settleWatchVersion = 0;
+    /**
+     * A missed notification must cost a poll interval and not a hung head, so a wait on
+     * {@link #settleWatchMonitor} is capped at this even when nothing announces itself.
+     */
+    private static final long SETTLE_WATCH_CAP_MS = 5;
 
     private SimpleGraph startDiagnostics() {
         if (settleDiagnostics) {
@@ -357,7 +374,12 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 long tCapture0 = NanosecondTime.getRuntimeMilliseconds();
                 BufferedImage image = capture();
 
-                long t1 = NanosecondTime.getRuntimeMilliseconds();
+                long tReturn = NanosecondTime.getRuntimeMilliseconds();
+                // When this frame was looking at the head, which is not the same instant as when the
+                // capture returned it. A camera that grabs its frames ahead of being asked knows, and says
+                // so; a capture on demand knows only that the frame is no younger than the moment it came
+                // back, which is what has always been recorded here.
+                long t1 = frameCapturedAtMs(tReturn);
                 recordedFrameCount++;
                 final boolean firstFrame = (lastSettleMat == null);
                 // The frame this one will be compared against, i.e. the one taken just before it. When
@@ -367,10 +389,12 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 final long previousFrameAtMs = recordedPreviousFrameAtMs;
                 recordedPreviousFrameAtMs = t1;
                 if (firstFrame) {
-                    // What the pre-check is judged against, so what it costs has to be known too.
-                    recordedFirstCaptureMilliseconds = t1 - tCapture0;
+                    // What the pre-check is judged against, so what it costs has to be known too. Note the
+                    // two different quantities: the cost is how long the call took, the stamp is when the
+                    // pixels were taken. They are the same instant only for a capture on demand.
+                    recordedFirstCaptureMilliseconds = tReturn - tCapture0;
                     recordedFirstCaptureAtMs = t1;
-                    recordedFirstFrameMilliseconds = t1 - t0;
+                    recordedFirstFrameMilliseconds = tReturn - t0;
                 }
                 double tCapture = 0.0; 
                 if (settleGraph != null) {
@@ -502,8 +526,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                     // No good, reset the debounce count, as we crossed over the limit (again).
                     debounceCount = 0;
                     // The run of alike frames is broken, so nothing before this frame can be called
-                    // still. Whoever was watching for a window has to start over as well.
+                    //                     still. Whoever was watching for a window has to start over as well.
                     candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+                    announceSettleWatchChange();
                 }
                 else if (result > 0.0) {
                     // Register one "bounce" under the limit.
@@ -514,6 +539,7 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                         // has any prospect of taking a still frame. The verdict itself only comes when
                         // the debounce is full; until then this is a promise that can still be broken.
                         candidateStillWindowStartAtMs = previousFrameAtMs;
+                        announceSettleWatchChange();
                     }
                 }
                 if (t > timeout || debounceCount > settleDebounce) {
@@ -531,6 +557,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                         // once looked alike is worth exactly as much as the settling that produced it.
                         candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
                     }
+                    // The verdict is what a camera holding a frame inside the candidate window has been
+                    // waiting for, so it is announced whether or not the promise was kept.
+                    announceSettleWatchChange();
                     // Cleanup.
                     lastSettleMat.release();
                     lastSettleMat = null;
@@ -568,6 +597,27 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 lastSettleMat.release();
             }
         }
+    }
+
+    /**
+     * When the frame that this thread has just captured was taken, as far as the camera can say, or
+     * {@code ifUnknown} when it cannot say anything.
+     *
+     * Only a camera that grabs its frames ahead of being asked can say: see
+     * {@link ReferenceCamera#getRawFrameCapturedAtMs()}. Everything else is asked and then waits, and the
+     * best it can offer is the instant the wait ended, which is later than the exposure by exactly the
+     * amount nobody can predict.
+     */
+    protected long frameCapturedAtMs(long ifUnknown) {
+        // The answer belongs to ReferenceCamera, which is where capture() is turned into an
+        // internalCapture(); AbstractSettlingCamera itself sits above that in the class hierarchy.
+        if (this instanceof ReferenceCamera) {
+            long capturedAtMs = ((ReferenceCamera) this).getRawFrameCapturedAtMs();
+            if (capturedAtMs != FrameProvenance.UNKNOWN) {
+                return capturedAtMs;
+            }
+        }
+        return ifUnknown;
     }
 
     /**
@@ -806,12 +856,14 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
         recordedPreviousFrameAtMs = FrameProvenance.UNKNOWN;
         candidateStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+        announceSettleWatchChange();
         long tStart = NanosecondTime.getRuntimeMilliseconds();
         if (settleOption == SettleOption.Skip) {
             // Skip settling.
             BufferedImage image = capture();
-            recordedFirstCaptureAtMs = NanosecondTime.getRuntimeMilliseconds();
-            recordedFirstCaptureMilliseconds = recordedFirstCaptureAtMs - tStart;
+            long tSkipReturn = NanosecondTime.getRuntimeMilliseconds();
+            recordedFirstCaptureAtMs = frameCapturedAtMs(tSkipReturn);
+            recordedFirstCaptureMilliseconds = tSkipReturn - tStart;
             recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
             recordedFrameCount = 1;
             if (firstFrameConsumer != null) {
@@ -825,7 +877,18 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
         globals.put("camera", this);
         Configuration.get().getScripting().on("Camera.BeforeSettle", globals);
 
+        // Ask this camera to have frames ready, so that the frames the settling compares are ones it took
+        // while we were getting here rather than ones we now wait an exposure for. Whoever sent the head
+        // here should have asked already, in which case this only extends what is already running; asking
+        // here too covers the settlings that nobody announced, and it costs one call either way. Ended
+        // below, so that a camera that nothing is measuring does not go on being drained.
+        final BufferedFrames buffered = this instanceof BufferedFrames ? (BufferedFrames) this : null;
+        final boolean startedBuffering = buffered != null && !buffered.isFrameBuffering();
+
         try {
+            if (startedBuffering) {
+                buffered.beginFrameBufferSession("settling " + getName(), settleTimeoutMs + 1000);
+            }
             // Make sure the camera (or its subject) stands still.
             waitForCompletion(CompletionType.WaitForStillstand);
 
@@ -842,8 +905,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
 
                 }
                 BufferedImage image = capture();
-                recordedFirstCaptureAtMs = NanosecondTime.getRuntimeMilliseconds();
-                recordedFirstCaptureMilliseconds = recordedFirstCaptureAtMs - tStart;
+                long tFixedReturn = NanosecondTime.getRuntimeMilliseconds();
+                recordedFirstCaptureAtMs = frameCapturedAtMs(tFixedReturn);
+                recordedFirstCaptureMilliseconds = tFixedReturn - tStart;
                 recordedFirstFrameMilliseconds = recordedFirstCaptureMilliseconds;
                 recordedFrameCount = 1;
                 recordedSettleMilliseconds = (long) recordedFirstCaptureMilliseconds;
@@ -851,8 +915,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
                 // so there is no still window that another camera's frame could be placed inside; the
                 // frame is nevertheless the frame this machine's settings asked for.
                 recordedSettleResult = SettleResult.FixedTime;
-                recordedSettledFrameAtMs = NanosecondTime.getRuntimeMilliseconds();
+                recordedSettledFrameAtMs = frameCapturedAtMs(tFixedReturn);
                 recordedStillWindowStartAtMs = FrameProvenance.UNKNOWN;
+                announceSettleWatchChange();
                 if (firstFrameConsumer != null) {
                     // There is only this one frame, so it is also the first one.
                     Mat mat = OpenCvUtils.toMat(image);
@@ -867,7 +932,9 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
             }
         }
         finally {
-
+            if (startedBuffering) {
+                buffered.endFrameBufferSession("settled " + getName());
+            }
             Configuration.get().getScripting().on("Camera.AfterSettle", globals);
         }
     }
@@ -1054,6 +1121,45 @@ public abstract class AbstractSettlingCamera extends AbstractCamera {
      */
     public long getSettleEpoch() {
         return settleEpoch;
+    }
+
+    /**
+     * Take this before looking at anything the settling records, and hand it to
+     * {@link #awaitSettleWatchChange(long, long)} when there is nothing to act on yet.
+     */
+    public long getSettleWatchVersion() {
+        return settleWatchVersion;
+    }
+
+    /**
+     * Sleep until the settling has changed something a watching camera acts on - the epoch, the
+     * candidate window, the certified window - or until the deadline. Returns sooner than the deadline
+     * whenever anything moved, which is the whole point: a camera that holds a frame it cannot use until
+     * the verdict is certified should be handed that verdict, not go and enquire about it every
+     * millisecond. The wait is capped regardless, so that a settling which records something without
+     * saying so costs a poll rather than the batch.
+     */
+    public void awaitSettleWatchChange(long version, long deadlineMs) throws InterruptedException {
+        synchronized (settleWatchMonitor) {
+            while (settleWatchVersion == version) {
+                long remaining = deadlineMs - NanosecondTime.getRuntimeMilliseconds();
+                if (remaining <= 0) {
+                    return;
+                }
+                settleWatchMonitor.wait(Math.min(remaining, SETTLE_WATCH_CAP_MS));
+            }
+        }
+    }
+
+    /**
+     * Say that the recorded numbers have moved and wake whoever is waiting for them. Called with the
+     * new numbers already in place, so that a watcher woken by it cannot read the old ones.
+     */
+    private void announceSettleWatchChange() {
+        synchronized (settleWatchMonitor) {
+            settleWatchVersion++;
+            settleWatchMonitor.notifyAll();
+        }
     }
 
     public SimpleGraph getSettleGraph() {

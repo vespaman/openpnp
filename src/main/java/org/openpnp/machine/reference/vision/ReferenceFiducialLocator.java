@@ -41,6 +41,7 @@ import org.openpnp.model.Placement.Type;
 import org.openpnp.model.PlacementsHolder;
 import org.openpnp.model.PlacementsHolderLocation;
 import org.openpnp.model.Point;
+import org.openpnp.spi.BufferedFrames;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.CameraBatchOperation;
 import org.openpnp.spi.FiducialLocator;
@@ -567,11 +568,24 @@ public class ReferenceFiducialLocator extends AbstractPartSettingsHolder impleme
             parallaxDisplacement = parallaxDisplacement.multiply(-1);
         }
         Location viewPointLocation = location.add(parallaxDisplacement);
+        // Ask the camera to be taking frames before the head is sent to the fiducial, so that the
+        // settling of every vision pass below compares frames it already has instead of waiting an
+        // exposure and a driver round-trip for each one. Frames taken while the head travels are not
+        // wasted: they are the ones that show the ringing, which is what a settling has to sit out
+        // anyway. Ended below; self-expiring if anything throws on the way out. See BufferedFrames.
+        if (camera instanceof BufferedFrames) {
+            ((BufferedFrames) camera).beginFrameBufferSession("fiducial "
+                    + partSettingsHolder.getShortName(), 2000);
+        }
+
         MovableUtils.moveToLocationAtSafeZ(camera, viewPointLocation);
 
         List<Location> matchedLocations = new ArrayList<Location>();
 
-        try(CvPipeline pipeline = getFiducialPipeline(camera, partSettingsHolder, nominalLocation)) {
+        try(CvPipeline pipeline = getFiducialPipeline(camera, partSettingsHolder, nominalLocation);
+                // Closed with the pipeline, however this method leaves it, because a camera that goes on
+                // filling a ring that nobody is looking at is bus bandwidth and memory thrown away.
+                AutoCloseable grabAhead = endGrabAheadOnClose(camera)) {
             int repeatFiducialRecognition = visionSettings.getMaxVisionPasses();
             for (int i = 0; i < repeatFiducialRecognition; i++) {
                 Location newLocation = detectFiducialFromViewpoint(camera, nominalLocation, pipeline,
@@ -623,6 +637,20 @@ public class ReferenceFiducialLocator extends AbstractPartSettingsHolder impleme
             Logger.debug("{} averaged location is at {}", partSettingsHolder.getId(), location);
         }
         return location;
+    }
+
+    /**
+     * Something to hand to a try-with-resources that stops the camera grabbing ahead of being asked for
+     * its frames, whatever way the block is left. Does nothing at all for a camera that cannot do this, or
+     * is not configured to; see {@link BufferedFrames#endFrameBufferSession(String)}.
+     */
+    private static AutoCloseable endGrabAheadOnClose(Camera camera) {
+        if (!(camera instanceof BufferedFrames)) {
+            return () -> {
+            };
+        }
+        BufferedFrames buffered = (BufferedFrames) camera;
+        return () -> buffered.endFrameBufferSession("fiducial done");
     }
 
     private Location detectFiducialFromViewpoint(Camera camera, Location location,

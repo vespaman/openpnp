@@ -258,6 +258,11 @@ the log already prints (`autoSettleAndCapture t=... score: ... compute time:`).
     The risk is a new class of bug rather than a saving: the ring must refuse frames exposed before the
     claimed window start exactly as the current code refuses them, and the grabber must not become a second
     owner of the stream that fights the preview. Both are testable offline against a dumped corpus.
+
+    **Status: built, off by default, and narrower than the sketch above.** `GRAB-AHEAD.md` is the
+    documentation of what was built - the settings, the invariants, the costs, the log lines to read. See
+    also "Item 2 as built" at the end of this document for what it does and does not buy; the compute
+    overlap described in the last two bullets is not part of it.
 3. **Make each frame of a settling cheaper**: settle on `captureRaw()` downscaled rather than the fully
    transformed frame (white balance and the undistort remap do not belong in a motion test), and turn
    `settle-diagnostics` off unless a diagnostics run is wanted - today it converts and keeps a copy of
@@ -330,3 +335,78 @@ above) and by a stream that cannot exceed 30 fps, so every frame of every settli
   in the log (26-31 and 12 ms) agree with each other and not with those numbers, which is the expected
   result. `suspend-preview-in-tasks="true"` on all three cameras also means the preview is not competing for
   frames during a job.
+
+## Item 2 as built: the ring, and what it does not buy
+
+The grabber is in the code as `FrameBuffer`, behind a setting, and off until a camera is told to use it.
+What got built is narrower than the sketch above, and the narrowness is the honest part of it.
+
+| part | file | what it is |
+|---|---|---|
+| the ring | `machine/reference/camera/FrameBuffer.java` | a fixed array of frames, each with the instant it was taken, filled by one thread of its own, running only while a session does |
+| the ask | `spi/BufferedFrames.java` | what a camera may be asked: is the ring running, give me a frame not older than T, give me the *earliest* frame not older than T, begin a session, end one |
+| the owner | `machine/reference/camera/OpenPnpCaptureCamera.java` | `grab-ahead-enabled` (off), `grab-ahead-depth` (8 frames), `grab-ahead-session-ms` (1500). While a session runs, this camera's grabber thread is the only consumer of the stream |
+| the customers | `AbstractSettlingCamera`, `ReferenceBottomVision`, `ReferencePnpJobProcessor`, `ReferenceFiducialLocator` | the settling scores buffered frames and records their instants; the hunt takes the buffered frame nearest the window opening; the job processor and the fiducial locator say when frames are worth grabbing and when to stop |
+
+Three decisions in it matter more than the code.
+
+**A session, not a stream that is always drained.** A 960x1080 frame is 3.1 MB once it is a
+`TYPE_3BYTE_BGR` `BufferedImage`, so eight of them are 25 MB per camera, and draining a 120 fps stream
+continuously moves some 370 MB/s through the JVM to keep pictures nobody is looking at. The ring is
+therefore filled only between a begin and an end, and the one who sent the head to the camera is the one
+who calls both. A caller that forgets costs `grab-ahead-session-ms` of grabbing and nothing afterwards,
+because the session expires by itself; `open()` and `close()` of the stream throw the ring away, since a
+frame of the old video format must not be handed out as if it were of the new one.
+
+**Two questions rather than one.** `capture()` means "a frame of now", and out of a ring that is the newest
+frame taken at or after the instant of the call. A camera with the ring on and a camera with it off answer
+that question the same way to code that knows nothing about rings, which is why the settling and everything
+else could be left calling `capture()`. The hunt asks the other question - the *earliest* frame taken at or
+after the window opened - because the frame nearest the opening has been still longest, and because the
+newest frame, while legal, is the frame that has had most time to drift. Both bounds are inclusive and
+neither is ever relaxed: frames taken while the head was still travelling stay in the ring, which is what
+`GrabAheadCaptureTest` is largely about.
+
+**The timestamp is the grabber's clock, and the interface says where it came from.** The source is asked
+when its frame was taken; the openpnp-capture driver cannot say, returns 0, and the instant the grabbing
+thread got the frame is used instead. That is at most one frame interval later than the exposure, and unlike
+the return time of a waiting consumer it does not depend on how long the consumer's own path happened to be,
+which is the difference between "this frame was looking at the head after the window opened" and "this frame
+was handed over after the window opened". Only the former is the claim the still-window rule needs. When the
+capture API does report exposure times, a driver answers `getCapturedAtMs()` and nothing else changes.
+
+What it does not buy, so that it is not counted twice:
+
+- **The transforms.** `capture()` is `captureRaw()` plus white balance, the undistort remap, the rotation and
+  the conversion to a `Mat`, and every one of those is still done by whoever takes a frame out of the ring.
+  The ring's thread grabs; it does not prepare. The "compute that a ring thread would overlap, 190-220 ms"
+  line in the budget above is therefore *not* bought by this change, and item 3 (settle on a downscaled raw
+  frame) remains the place where that compute lives.
+- **The vibration.** A settling still waits for the machine to stop moving; buffered frames let it look at
+  what already happened sooner, which is one frame interval per settling and not the ringing itself.
+
+What a job should get from it, from the same two logs as before: the cold first frame, ~210 ms a job, and
+the second bottom camera's join, 38-80 ms. That is 250-290 ms of an 11 s job, not 500. The line to read in a
+machine log is the session summary:
+
+```
+Frame buffer Upp1 session parallel-align-precapture in 214 ms: grabbed 26, dropped 0, interval 8 ms, worst frame 9 ms old when taken
+```
+
+`grabbed 0` means the setting is off or the stream failed (the grabber gives up after five consecutive
+failures and says so at WARN); `dropped` growing means the ring is shallower than the consumers need;
+`worst frame` is how stale a handed-out frame was, which should sit near one interval.
+
+Offline the semantics are covered by `FrameBufferTest` (13 tests: bounds inclusive, nothing before the bound,
+eviction, session expiry, the giving up, the interval estimate) and `GrabAheadCaptureTest` (4 tests: the
+settling quotes the producing thread's instants, the hunt takes the frame nearest the window opening, frames
+taken before the head arrived do not leave the ring, a camera without a ring loses nothing). Neither can say
+anything about the two things that actually need pn52: how long the first frame of a settling really is cold,
+and what the frames do to the garbage collector at 120 fps on a machine that is also moving. To try it, add
+to each `OpenPnpCaptureCamera` in `~/.openpnp2/machine.xml`:
+
+```xml
+grab-ahead-enabled="true" grab-ahead-depth="8" grab-ahead-session-ms="1500"
+```
+
+and compare the settling durations and the session summaries against `tests_2026-10-01/log_x.txt`.

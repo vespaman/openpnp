@@ -45,6 +45,7 @@ import org.openpnp.spi.NozzleTip;
 import org.openpnp.spi.PropertySheetHolder;
 import org.openpnp.spi.base.AbstractActuator;
 import org.openpnp.spi.base.AbstractNozzle;
+import org.openpnp.util.CycleProfiler;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.SimpleGraph;
 import org.openpnp.util.UiUtils;
@@ -378,7 +379,13 @@ public class ReferenceNozzle extends AbstractNozzle implements HeadMountable {
         }
 
         // wait for the Dwell Time and/or make sure the vacuum level builds up to the desired range (with timeout)
-        establishPickVacuumLevel(this.getPickDwellMilliseconds() + nozzleTip.getPickDwellMilliseconds());
+        CycleProfiler.Handle vacuumTime = CycleProfiler.begin("pick vacuum");
+        try {
+            establishPickVacuumLevel(this.getPickDwellMilliseconds() + nozzleTip.getPickDwellMilliseconds());
+        }
+        finally {
+            CycleProfiler.end(vacuumTime);
+        }
 
         getMachine().fireMachineHeadActivity(head);
 
@@ -426,7 +433,13 @@ public class ReferenceNozzle extends AbstractNozzle implements HeadMountable {
         }
 
         // wait for the Dwell Time and/or make sure the vacuum level decays to the desired range (with timeout)
-        establishPlaceVacuumLevel(this.getPlaceDwellMilliseconds() + nozzleTip.getPlaceDwellMilliseconds());
+        CycleProfiler.Handle vacuumTime = CycleProfiler.begin("place vacuum");
+        try {
+            establishPlaceVacuumLevel(this.getPlaceDwellMilliseconds() + nozzleTip.getPlaceDwellMilliseconds());
+        }
+        finally {
+            CycleProfiler.end(vacuumTime);
+        }
 
         setPart(null);
         setPartsFeeder(null);
@@ -1070,7 +1083,13 @@ public class ReferenceNozzle extends AbstractNozzle implements HeadMountable {
     }
 
     public double readVacuumLevel() throws Exception {
-        return Double.parseDouble(getExpectedVacuumSenseActuator().read());
+        CycleProfiler.Handle read = CycleProfiler.begin("vacuum read");
+        try {
+            return Double.parseDouble(getExpectedVacuumSenseActuator().read());
+        }
+        finally {
+            CycleProfiler.end(read);
+        }
     }
 
     protected boolean isPartOnGraphEnabled() {

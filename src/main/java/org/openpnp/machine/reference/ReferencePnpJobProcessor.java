@@ -49,6 +49,7 @@ import org.openpnp.gui.JobPanel;
 import org.openpnp.gui.MainFrame;
 import org.openpnp.gui.support.Wizard;
 import org.openpnp.machine.reference.camera.AbstractSettlingCamera;
+import org.openpnp.machine.reference.driver.GcodeDriver;
 import org.openpnp.machine.reference.vision.AbstractPartAlignment;
 import org.openpnp.machine.reference.vision.ReferenceBottomVision;
 import org.openpnp.machine.reference.wizards.ReferencePnpJobProcessorConfigurationWizard;
@@ -70,6 +71,7 @@ import org.openpnp.model.Placement;
 import org.openpnp.model.PlacementsHolderLocation;
 import org.openpnp.model.PreCapturedPlacement;
 import org.openpnp.spi.CameraBatchOperation;
+import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.FiducialLocator;
@@ -87,6 +89,7 @@ import org.openpnp.spi.PnpJobProcessor.JobPlacement.Status;
 import org.openpnp.spi.base.AbstractJobProcessor;
 import org.openpnp.spi.base.AbstractPnpJobProcessor;
 import org.openpnp.spi.MotionPlanner.CompletionType;
+import org.openpnp.util.CycleProfiler;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.TravelCost;
@@ -98,6 +101,7 @@ import org.openpnp.vision.pipeline.CvPipeline;
 import org.openpnp.model.VisionCompositing;
 import org.openpnp.util.FeederUtils;
 import org.openpnp.model.BottomVisionSettings;
+import org.openpnp.spi.BufferedFrames;
 import org.openpnp.spi.Camera;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
@@ -240,7 +244,19 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     private static class DeferredAlignment {
         final Align aligner;
         final List<PlannedPlacement> placements;
-        final List<CompletableFuture<Void>> futures;
+        /**
+         * The pipelines, and the threads they are to run on. They are not started by the constructor: the
+         * head is released before they are, and what the head has to do first is get its own moves into
+         * the driver, which wants the very same cores the pipelines would take. Measured on pn52
+         * (log_H.txt), the two start at the same instant and each takes about 8 ms, so the machine cannot
+         * tell which of them it is waiting for. Handed over after the departure is committed
+         * ({@link #submit()}), the computation costs the machine nothing: it belongs to the several
+         * hundred milliseconds the head is already spending on its way to the board, and the numbers are
+         * in by the time the head is over the placement.
+         */
+        final List<Runnable> tasks;
+        final ExecutorService executor;
+        final List<CompletableFuture<Void>> futures = new ArrayList<>();
         /**
          * The captured pixels, which the pipelines below are reading. They cannot be released when the
          * alignment step ends, because the alignment step ends before they do.
@@ -252,21 +268,43 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
          * once; the placements behind it are placed from where it stands.
          */
         final Set<Nozzle> travelling = new HashSet<>();
+        private boolean submitted;
+        private boolean released;
 
         boolean covers(PlannedPlacement plannedPlacement) {
             return placements.contains(plannedPlacement);
         }
 
-        DeferredAlignment(Align aligner, List<PlannedPlacement> placements,
-                List<CompletableFuture<Void>> futures, ImageBuffer imageBuffer) {
+        DeferredAlignment(Align aligner, List<PlannedPlacement> placements, List<Runnable> tasks,
+                ExecutorService executor, ImageBuffer imageBuffer) {
             this.aligner = aligner;
             this.placements = placements;
-            this.futures = futures;
+            this.tasks = tasks;
+            this.executor = executor;
             this.imageBuffer = imageBuffer;
             this.releasedAtMs = System.currentTimeMillis();
         }
 
+        /**
+         * Start the pipelines, once, if the pictures they read have not already been given back.
+         *
+         * Called by the departure, as soon as its moves are the driver's problem, and again by whoever
+         * waits for the numbers, so that a job which never reached a departure still computes them.
+         */
+        void submit() {
+            if (submitted || released) {
+                return;
+            }
+            submitted = true;
+            for (Runnable task : tasks) {
+                futures.add(CompletableFuture.runAsync(task, executor));
+            }
+            Logger.debug("[EARLY-DEPARTURE] {} alignments handed to the vision threads {} ms after the"
+                    +" head was released", tasks.size(), System.currentTimeMillis()-releasedAtMs);
+        }
+
         void release() {
+            released = true;
             if (imageBuffer != null) {
                 imageBuffer.release();
                 imageBuffer = null;
@@ -315,11 +353,58 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
         if (deferred == null) {
             return;
         }
-        for (PlannedPlacement plannedPlacement : inOrder) {
-            if (deferred.covers(plannedPlacement)
-                    && !deferred.travelling.contains(plannedPlacement.nozzle)) {
-                travelWhileAligning(plannedPlacement);
-                return;
+        try {
+            for (PlannedPlacement plannedPlacement : inOrder) {
+                if (deferred.covers(plannedPlacement)
+                        && !deferred.travelling.contains(plannedPlacement.nozzle)) {
+                    travelWhileAligning(plannedPlacement);
+                    return;
+                }
+            }
+        }
+        finally {
+            // The head is on its way, or there was nothing to send. Either way the queues are the
+            // driver's problem now and the cores are free for the pipelines, which is precisely why they
+            // were not started before the move. See DeferredAlignment#tasks.
+            commitToTheMachine(deferred);
+            deferred.submit();
+        }
+    }
+
+    /**
+     * Give the controller the last thing it needs to start moving, before the vision cores are given
+     * theirs.
+     *
+     * <p>A move that has been handed to an asynchronous driver is only in the controller's input buffer;
+     * what the controller treats as the end of a motion, and therefore as its leave to go, is the
+     * completion command, and OpenPnP writes that only when it wants to stop and know where it is. Until
+     * then the head stands at the cameras while the pipelines run - which is the whole overlap, thrown
+     * away. Measured on pn52 (log_J.txt): the two departure G1s at +8 and +10 ms, the vision threads
+     * started at +13 ms, their numbers at +34 ms, and the M400 that finally sent the head on its way at
+     * +39 ms.</p>
+     *
+     * <p>Done for the whole batch in one go and after every departure of that batch, so that two heads
+     * leaving together still blend into one journey instead of being stopped apart.</p>
+     */
+    protected void commitToTheMachine(DeferredAlignment deferred) throws JobProcessorException {
+        if (deferred.travelling.isEmpty()) {
+            return;
+        }
+        Machine machine = Configuration.get().getMachine();
+        Set<Driver> drivers = new HashSet<>();
+        for (Nozzle nozzle : deferred.travelling) {
+            drivers.addAll(nozzle.getMappedAxes(machine).getAxesDrivers(machine));
+        }
+        for (Driver driver : drivers) {
+            if (driver instanceof GcodeDriver) {
+                try {
+                    ((GcodeDriver)driver).commitQueuedMotion();
+                    Logger.debug("[EARLY-DEPARTURE] queue committed on {}, {} ms after the head was released",
+                            driver.getName(), System.currentTimeMillis()-deferred.releasedAtMs);
+                }
+                catch (Exception e) {
+                    throw new JobProcessorException(driver, e);
+                }
             }
         }
     }
@@ -378,6 +463,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             return;
         }
         deferredAlignment = null;
+        // Whoever waits for the numbers starts them if the departure never got round to it, so that the
+        // wait is never waiting on a task that was never handed to a thread.
+        deferred.submit();
         try {
             CompletableFuture.allOf(deferred.futures.toArray(new CompletableFuture[0])).join();
             for (PlannedPlacement p : deferred.placements) {
@@ -1746,7 +1834,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     fireTextStatus("Feed %s on %s.", feeder.getName(), feeder.getPart().getId());
                     
                     Configuration.get().getScripting().on("Feeder.BeforeFeed", globals);
-                    feeder.feed(nozzle);
+                    CycleProfiler.Handle feedTime = CycleProfiler.begin("feed");
+                    try {
+                        feeder.feed(nozzle);
+                    }
+                    finally {
+                        CycleProfiler.end(feedTime);
+                    }
                     Configuration.get().getScripting().on("Feeder.AfterFeed", globals);
                     return;
                 }
@@ -2151,11 +2245,13 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     }
                 }
                 
-                // STEP 3: All shots captured - submit ALL to background threads
-                List<CompletableFuture<Void>> futures = new ArrayList<>();
+                // STEP 3: All shots captured - make the work that turns them into numbers. Whether that
+                // work is started here depends on whether the head is going to be let go: see STEP 4 and
+                // DeferredAlignment#tasks.
+                List<Runnable> tasks = new ArrayList<>();
                 for (PlannedPlacement placement : plannedPlacements) {
                     CapturedShot shot = imageBuffer.getShot(placement.nozzle);
-                    futures.add(CompletableFuture.runAsync(() -> {
+                    tasks.add(() -> {
                         try {
                             processPreCapturedImage(placement, shot);
                         }
@@ -2166,21 +2262,27 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                             throw new CompletionException(
                                 new JobProcessorException(placement.nozzle, e));
                         }
-                    }, getVisionExecutor()));
+                    });
                 }
                 
                 // STEP 4: Wait for all background threads - unless the machine lets the head go while
                 // they run. Then the wait, the pixels they are reading and the reckoning of what was
-                // refused all belong to the placing of the parts, and this step is finished.
+                // refused all belong to the placing of the parts, and this step is finished. The threads
+                // themselves are left to the departure, which starts them once the head's moves are in
+                // the driver's hands; starting them here made the head's own departure wait for a core.
                 if (machine.isEarlyAlignmentDepartureEnabled()) {
-                    deferredAlignment = new DeferredAlignment(this, plannedPlacements, futures,
-                            imageBuffer);
+                    deferredAlignment = new DeferredAlignment(this, plannedPlacements, tasks,
+                            getVisionExecutor(), imageBuffer);
                     // The finally below must not release what the worker threads have not finished
                     // reading; it now owns nothing.
                     imageBuffer = null;
-                    Logger.debug("[EARLY-DEPARTURE] head released with {} alignments still being "
-                            +"computed", futures.size());
+                    Logger.debug("[EARLY-DEPARTURE] head released with {} alignments not yet computed",
+                            tasks.size());
                     return;
+                }
+                List<CompletableFuture<Void>> futures = new ArrayList<>();
+                for (Runnable task : tasks) {
+                    futures.add(CompletableFuture.runAsync(task, getVisionExecutor()));
                 }
                 try {
                     CompletableFuture.allOf(futures.toArray(
@@ -2209,6 +2311,76 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             }
         }
         
+        /**
+         * Ask the cameras that can to be grabbing frames into a ring before the head gets to them, so
+         * that the frames the settling and the second camera's hunt want are already taken by the time
+         * they are asked for. See {@link BufferedFrames} and
+         * docs/design/parallel-bottom-vision/CAPTURE-COST.md.
+         *
+         * Cameras that cannot do this, or that are not configured to, answer nothing and are not asked
+         * again: the whole thing is off unless a camera says it is on.
+         */
+        private void beginGrabAhead(Iterable<Camera> cameras, String reason) {
+            for (Camera camera : cameras) {
+                if (camera instanceof BufferedFrames) {
+                    ((BufferedFrames) camera).beginFrameBufferSession(reason, 2000);
+                }
+            }
+        }
+
+        /**
+         * The cameras of this batch that are to be handed buffered frames, which is all of them except
+         * the one that has to demonstrate that the head has come to rest.
+         *
+         * <p>For that one the ring is not merely useless, it costs a frame interval. A frame is delivered
+         * some three intervals after it was exposed, so the earliest frame the settling can be handed from
+         * a ring that has been filling during the approach shows the head still on its way, and the
+         * settling has to compare one further pair before two frames taken after the rest agree. Measured
+         * on pn52 with two nozzles: two frames and 49 ms from the rest to the verdict with the settling
+         * capturing on demand (log_E.txt), three frames and 61 ms with it reading the ring
+         * (log_H.txt).</p>
+         *
+         * <p>The other cameras are only too glad of the ring: they take their frame out of the still
+         * window the settling opened, and a frame that is already inside a demonstrated stillness costs
+         * nothing at all, however old it is. What the settling must not do is buy the same nothing with
+         * the one thing it is being paid for, which is the moment it can say the head is not moving.</p>
+         */
+        private List<Camera> bufferedCamerasOf(Iterable<Camera> cameras, Camera settleCamera) {
+            List<Camera> out = new ArrayList<>();
+            for (Camera camera : cameras) {
+                if (settleCamera == null || !settleCamera.equals(camera)) {
+                    out.add(camera);
+                }
+            }
+            return out;
+        }
+
+        /**
+         * The other half of {@link #beginGrabAhead(Iterable, String)}. Safe to call on cameras that were
+         * never begun: ending a session that is not running does nothing.
+         */
+        private void endGrabAhead(Iterable<Camera> cameras, String reason) {
+            for (Camera camera : cameras) {
+                if (camera instanceof BufferedFrames) {
+                    ((BufferedFrames) camera).endFrameBufferSession(reason);
+                }
+            }
+        }
+
+        /**
+         * Tell the cameras of this batch the earliest instant their frames may come from, so that frames
+         * already taken are handed out instead of waited for. See
+         * {@link BufferedFrames#setBufferedFrameNotBeforeMs(long)}. Cameras that cannot do this, or are
+         * not configured to, answer nothing.
+         */
+        private void setFrameNotBefore(Iterable<Camera> cameras, long notBeforeMs) {
+            for (Camera camera : cameras) {
+                if (camera instanceof BufferedFrames) {
+                    ((BufferedFrames) camera).setBufferedFrameNotBeforeMs(notBeforeMs);
+                }
+            }
+        }
+
         private void moveNozzlesToAlignmentPosition(List<PlannedPlacement> placements) throws JobProcessorException {
             if (placements.isEmpty()) {
                 return;
@@ -2266,6 +2438,11 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
 
                 Logger.debug("Head moved to alignment position for nozzle {}, camera {}, at rest {} ms",
                     nozzle.getId(), camera.getId(), arrivedAtMs);
+
+                // The head standing still under the cameras is the one moment in the cycle that is
+                // certain to come around once per cycle, so it is what the time account is closed
+                // and printed on.
+                CycleProfiler.cycle("the cameras");
             }
             catch (Exception e) {
                 throw new JobProcessorException(placements.get(0).jobPlacement.getPlacement(), 
@@ -2376,9 +2553,30 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 Logger.debug("Camera batch operation started for parallel alignment pre-capture");
             }
             
+            // Ask every camera of this batch to have frames ready while the head is still on its way.
+            // This is the whole of the point of grabbing ahead: a frame that is being taken during the
+            // move is in the ring when the head arrives, whereas a frame asked for after the arrival is
+            // one exposure and one driver round-trip late, which is what the first frame of a settling has
+            // always cost. Ended with the batch below; if this method ever throws between the two, the
+            // session expires by itself and costs the grabbing for a bounded time and nothing more.
+            beginGrabAhead(bufferedCamerasOf(cameras, settleCamera), "parallel-align-precapture");
+
             // Move to the first camera's position (compromise position for all cameras)
             moveNozzlesToAlignmentPosition(settleCameraPlacements);
-            
+
+            // From here to the end of the batch, a frame handed to a capture on these cameras has to show
+            // the head where it was put rather than on its way there. That instant, and not the instant of
+            // each individual capture, is what makes a buffered frame usable: the ring has been filling
+            // during the move, so its newest frame answers a capture in a millisecond or two instead of an
+            // exposure, and it is from after the arrival because the arrival is some way behind the frames
+            // the camera has taken since it stopped. Demanding a frame of the instant of the ask instead
+            // cannot be answered from a buffer at all - see
+            // {@link BufferedFrames#setBufferedFrameNotBeforeMs(long)}. Cleared with the batch below.
+            // The content bound belongs to the cameras that read their frames out of the ring, i.e. not
+            // to the settling camera, which is not reading a ring at all. See
+            // #bufferedCamerasOf(Iterable, Camera).
+            setFrameNotBefore(bufferedCamerasOf(cameras, settleCamera), arrivedAtMs);
+
             ImageBuffer imageBuffer = new ImageBuffer();
             // Track async capture futures for secondary cameras (single-shot parts only)
             List<CompletableFuture<PreCapturedPlacement>> asyncFutures = 
@@ -2647,6 +2845,12 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 throw e;
             }
             finally {
+                // Stop the frames being grabbed ahead: the head has left the cameras, and a ring that is
+                // filled with pictures of an empty field of view is memory and bus bandwidth thrown away.
+                // With them goes the claim about what those frames have to show, so that no later capture
+                // is answered out of a bound this batch set for itself.
+                setFrameNotBefore(cameras, FrameProvenance.UNKNOWN);
+                endGrabAhead(cameras, "parallel-align-precapture done");
                 // End CameraBatchOperation - this will turn off all camera lights
                 if (batchStarted && cbo != null) {
                     try {
@@ -3662,7 +3866,14 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     .findFirst()
                     .orElse(null);
             try {
-                Step result = stepImpl(plannedPlacement);
+                CycleProfiler.Handle stepTime = CycleProfiler.begin(getClass().getSimpleName());
+                Step result;
+                try {
+                    result = stepImpl(plannedPlacement);
+                }
+                finally {
+                    CycleProfiler.end(stepTime);
+                }
                 completed.add(plannedPlacement);
                 return result;
             }

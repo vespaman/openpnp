@@ -60,6 +60,7 @@ import org.openpnp.spi.Locatable.LocationOption;
 import org.openpnp.spi.MotionPlanner;
 import org.openpnp.spi.PropertySheetHolder;
 import org.openpnp.spi.base.AbstractActuator;
+import org.openpnp.util.CycleProfiler;
 import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.Utils2D;
 import org.pmw.tinylog.Logger;
@@ -334,6 +335,19 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
 
     @Override
     public void moveTo(HeadMountable hm, AxesLocation axesLocation, double speed, MotionOption... options) throws Exception {
+        // The planning of a move happens on whichever thread asked for it, so it is invisible unless
+        // it is accounted where it happens: it is either work the job thread could have used for
+        // something else, or it is not.
+        CycleProfiler.Handle planning = CycleProfiler.begin("planner");
+        try {
+            moveToImpl(hm, axesLocation, speed, options);
+        }
+        finally {
+            CycleProfiler.end(planning);
+        }
+    }
+
+    protected void moveToImpl(HeadMountable hm, AxesLocation axesLocation, double speed, MotionOption... options) throws Exception {
         int optionFlags = Motion.optionFlags(options);
 
         if (speed <= 0) {
@@ -344,30 +358,42 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         }
 
         // Handle soft limits and rotation axes limiting and wrap-around.
-        axesLocation = limitAxesLocation(hm, axesLocation, false);
+        CycleProfiler.Handle limits = CycleProfiler.begin("plan limits");
+        try {
+            axesLocation = limitAxesLocation(hm, axesLocation, false);
+        }
+        finally {
+            CycleProfiler.end(limits);
+        }
 
         // If this is a subordinate motion, queue it now
-        AxesLocation subordinateMotionAxes = new AxesLocation();
-        if (Motion.MotionOption.SubordinateX.isSetIn(optionFlags)) {
-            subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.X));
+        CycleProfiler.Handle subordinate = CycleProfiler.begin("plan subordinate");
+        try {
+            AxesLocation subordinateMotionAxes = new AxesLocation();
+            if (Motion.MotionOption.SubordinateX.isSetIn(optionFlags)) {
+                subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.X));
+            }
+            if (Motion.MotionOption.SubordinateY.isSetIn(optionFlags)) {
+                subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Y));
+            }
+            if (Motion.MotionOption.SubordinateZ.isSetIn(optionFlags)) {
+                subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Z));
+            }
+            if (Motion.MotionOption.SubordinateRotation.isSetIn(optionFlags)) {
+                subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Rotation));
+            }
+            // if any subordinate as been queued, return now, dropping any remaining axis
+            if (subordinateMotionAxes != null && !subordinateMotionAxes.isEmpty()) {
+                subordinateMotion.queue(subordinateMotionAxes);
+                return;
+            }
+
+            // Merge motion with queued subordinate motion
+            axesLocation = subordinateMotion.merge(axesLocation);        
         }
-        if (Motion.MotionOption.SubordinateY.isSetIn(optionFlags)) {
-            subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Y));
-        }
-        if (Motion.MotionOption.SubordinateZ.isSetIn(optionFlags)) {
-            subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Z));
-        }
-        if (Motion.MotionOption.SubordinateRotation.isSetIn(optionFlags)) {
-            subordinateMotionAxes = subordinateMotionAxes.put(axesLocation.byType(Type.Rotation));
-        }
-        // if any subordinate as been queued, return now, dropping any remaining axis
-        if (subordinateMotionAxes != null && !subordinateMotionAxes.isEmpty()) {
-            subordinateMotion.queue(subordinateMotionAxes);
-            return;
-        }
-        
-        // Merge motion with queued subordinate motion
-        axesLocation = subordinateMotion.merge(axesLocation);                
+        finally {
+            CycleProfiler.end(subordinate);
+        }        
         
         // Get current planned location of all the axes.
         AxesLocation currentLocation = new AxesLocation(getMachine()); 
@@ -397,19 +423,31 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         }
 
         // Make sure we don't collide axes across multiple drivers.
-        interlockMotionAcrossDrivers(hm, currentLocation, newLocation);
-        // Perform InterlockActuator before-move actuations.
-        for (Actuator actuator : hm.getHead().getActuators()) {
-            if (actuator.getInterlockMonitor() != null) {
-                actuator.getInterlockMonitor().interlockActuation(actuator, currentLocation, newLocation, true, speed);
+        CycleProfiler.Handle interlock = CycleProfiler.begin("plan interlock");
+        try {
+            interlockMotionAcrossDrivers(hm, currentLocation, newLocation);
+            // Perform InterlockActuator before-move actuations.
+            for (Actuator actuator : hm.getHead().getActuators()) {
+                if (actuator.getInterlockMonitor() != null) {
+                    actuator.getInterlockMonitor().interlockActuation(actuator, currentLocation, newLocation, true, speed);
+                }
             }
+        }
+        finally {
+            CycleProfiler.end(interlock);
         }
 
         // Note: the driver/actuator interlock can prompt locations changes (through location confirmation, 
         // rotational axes wrap-around etc.). Therefore we need to determine the coordinates again, same as above.
 
         // Again, handle soft limits and rotation axes limiting and wrap-around.
-        axesLocation = limitAxesLocation(hm, axesLocation, false);
+        limits = CycleProfiler.begin("plan limits");
+        try {
+            axesLocation = limitAxesLocation(hm, axesLocation, false);
+        }
+        finally {
+            CycleProfiler.end(limits);
+        }
 
         // Get current planned location of all the axes.
         currentLocation = new AxesLocation(getMachine()); 
@@ -419,7 +457,13 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
                 .put(axesLocation);
 
         // Create the motion commands needed for backlash compensation if enabled.
-        createBacklashCompensatedMotion(hm, speed, currentLocation, newLocation, options);
+        CycleProfiler.Handle backlash = CycleProfiler.begin("plan backlash");
+        try {
+            createBacklashCompensatedMotion(hm, speed, currentLocation, newLocation, options);
+        }
+        finally {
+            CycleProfiler.end(backlash);
+        }
 
         // Set all the axes (including virtual ones) to their new coordinates.
         for (Axis axis : axesLocation.getAxes()) {
@@ -429,10 +473,16 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         }
 
         // Perform InterlockActuator after-move actuations.
-        for (Actuator actuator : hm.getHead().getActuators()) {
-            if (actuator.getInterlockMonitor() != null) {
-                actuator.getInterlockMonitor().interlockActuation(actuator, currentLocation, newLocation, false, speed);
+        interlock = CycleProfiler.begin("plan interlock");
+        try {
+            for (Actuator actuator : hm.getHead().getActuators()) {
+                if (actuator.getInterlockMonitor() != null) {
+                    actuator.getInterlockMonitor().interlockActuation(actuator, currentLocation, newLocation, false, speed);
+                }
             }
+        }
+        finally {
+            CycleProfiler.end(interlock);
         }
     }
 
@@ -649,7 +699,13 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         motionCommands = new LinkedList<>();
 
         // Apply any optimization to the execution plan. This is where advanced MotionPlanner sub-classes will shine.
-        optimizeExecutionPlan(executionPlan, completionType);
+        CycleProfiler.Handle optimize = CycleProfiler.begin("plan optimize");
+        try {
+            optimizeExecutionPlan(executionPlan, completionType);
+        }
+        finally {
+            CycleProfiler.end(optimize);
+        }
 
         // Now execute the plan against the drivers.
         // We also record it into the real-time motionPlan to enable motion prediction and simulation. 
@@ -661,27 +717,39 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         ReferenceMachine machine = (ReferenceMachine) Configuration.get().getMachine();
         List<Head> movedHeads = new ArrayList<>();
         boolean first = true;
-        for (Motion plannedMotion : executionPlan) {
-            if (!plannedMotion.hasOption(MotionOption.Stillstand)) {
-                // Put into timed plan.
-                double dt = plannedMotion.getTime();
-                // Note, all-virtual moves can have dt == 0.0, so we take a nano-second, to make sure a new Map entry is created 
-                // in the motionPlan.
-                t += Math.max(dt, 1e-9);  
-                plannedMotion.setPlannedTime1(t);
-                motionPlan.put(t, plannedMotion);
-                // Execute across drivers.
-                HeadMountable  hm = plannedMotion.getHeadMountable();
-                if (hm != null) {
-                    movedHeads.add(hm.getHead());
-                    if (executeMoveTo(machine, hm, plannedMotion, first)) {
-                        first = false;
+        CycleProfiler.Handle emit = CycleProfiler.begin("plan emit");
+        try {
+            for (Motion plannedMotion : executionPlan) {
+                if (!plannedMotion.hasOption(MotionOption.Stillstand)) {
+                    // Put into timed plan.
+                    double dt = plannedMotion.getTime();
+                    // Note, all-virtual moves can have dt == 0.0, so we take a nano-second, to make sure a new Map entry is created 
+                    // in the motionPlan.
+                    t += Math.max(dt, 1e-9);  
+                    plannedMotion.setPlannedTime1(t);
+                    motionPlan.put(t, plannedMotion);
+                    // Execute across drivers.
+                    HeadMountable  hm = plannedMotion.getHeadMountable();
+                    if (hm != null) {
+                        movedHeads.add(hm.getHead());
+                        if (executeMoveTo(machine, hm, plannedMotion, first)) {
+                            first = false;
+                        }
                     }
                 }
             }
         }
+        finally {
+            CycleProfiler.end(emit);
+        }
         // Publish recorded Diagnostics
-        publishDiagnostics();
+        CycleProfiler.Handle diagnostics = CycleProfiler.begin("plan diagnostics");
+        try {
+            publishDiagnostics();
+        }
+        finally {
+            CycleProfiler.end(diagnostics);
+        }
         // Notify heads.
         for (Head movedHead : movedHeads) {
             machine.fireMachineHeadActivity(movedHead);
@@ -714,11 +782,31 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
         // Note, this loop will be empty if the motion is empty, i.e. if it only contains VirtualAxis movement.
         boolean firstDriver = true;
         for (Driver driver : motionSegment.getAxesDrivers(machine)) {
-            for (Motion.MoveToCommand moveToCommand : plannedMotion
-                    .interpolatedMoveToCommands(driver, isInterpolationRetiming())) {
-                driver.moveTo(hm, moveToCommand);
+            List<Motion.MoveToCommand> moveToCommands;
+            CycleProfiler.Handle interpolate = CycleProfiler.begin("plan interpolate");
+            try {
+                moveToCommands = plannedMotion.interpolatedMoveToCommands(driver, isInterpolationRetiming());
+            }
+            finally {
+                CycleProfiler.end(interpolate);
+            }
+            for (Motion.MoveToCommand moveToCommand : moveToCommands) {
+                CycleProfiler.Handle send = CycleProfiler.begin("plan send");
                 try {
-                    recordDiagnostics(plannedMotion, moveToCommand, driver, firstAfterCoordination, firstDriver);
+                    driver.moveTo(hm, moveToCommand);
+                }
+                finally {
+                    CycleProfiler.end(send);
+                }
+                CycleProfiler.count("gcode lines", 1);
+                try {
+                    CycleProfiler.Handle diagnostics = CycleProfiler.begin("plan diagnostics");
+                    try {
+                        recordDiagnostics(plannedMotion, moveToCommand, driver, firstAfterCoordination, firstDriver);
+                    }
+                    finally {
+                        CycleProfiler.end(diagnostics);
+                    }
                 }
                 catch (Exception e) {
                     Logger.error(driver.getName()+" diagnostics failed: {}", e);
@@ -974,39 +1062,53 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
     @Override
     public void waitForCompletion(HeadMountable hm, CompletionType completionType)
             throws Exception {
-        // Now is high time to plan and execute the queued motion commands. 
-        executeMotionPlan(completionType);
+        // A lot of the planning actually happens here rather than in moveTo(), so this is accounted
+        // as its own phase; the machine wait inside it is a child and therefore not counted twice.
+        CycleProfiler.Handle wait = CycleProfiler.begin("plan wait");
+        try {
+            // Now is high time to plan and execute the queued motion commands. 
+            executeMotionPlan(completionType);
 
-        // detect if there are any pending subordinate motion and remove it
-        subordinateMotion.drain();
-        
-        if (completionType.isEnforcingStillstand()) {
-            // Wait for the drivers.
-            waitForDriverCompletion(hm, completionType);
-            // The drivers might have reported new coordinates back. Propagate to planned axis coordinates, 
-            // applying the backlash offset in reverse.
-            AxesLocation reportedLocation = new AxesLocation(getMachine().getAxes(), 
-                (axis) -> ((axis instanceof ControllerAxis) ?
-                    ((ControllerAxis) axis).getDriverLengthCoordinate()
-                        .subtract(lastDirectionalBacklashOffset.getLengthCoordinate(axis)) :
-                        null));
-            AxesLocation currentLocation = new AxesLocation(reportedLocation.getControllerAxes(),
-                    (axis) -> axis.getLengthCoordinate());
-            AxesLocation diff = reportedLocation.motionSegmentTo(currentLocation);
-            if (!diff.matches(AxesLocation.zero)) {
-                Logger.debug("Reported location changes current location from "+currentLocation+" to "+reportedLocation);
-                // Reported position has in deed changed.
-                reportedLocation.setToCoordinates();
-                // Notify heads.
-                for (Head movedHead : getMachine().getHeads()) {
-                    getMachine().fireMachineHeadActivity(movedHead);
+            // detect if there are any pending subordinate motion and remove it
+            subordinateMotion.drain();
+
+            if (completionType.isEnforcingStillstand()) {
+                // Wait for the drivers.
+                waitForDriverCompletion(hm, completionType);
+                // The drivers might have reported new coordinates back. Propagate to planned axis coordinates, 
+                // applying the backlash offset in reverse.
+                AxesLocation reportedLocation = new AxesLocation(getMachine().getAxes(), 
+                    (axis) -> ((axis instanceof ControllerAxis) ?
+                        ((ControllerAxis) axis).getDriverLengthCoordinate()
+                            .subtract(lastDirectionalBacklashOffset.getLengthCoordinate(axis)) :
+                            null));
+                AxesLocation currentLocation = new AxesLocation(reportedLocation.getControllerAxes(),
+                        (axis) -> axis.getLengthCoordinate());
+                AxesLocation diff = reportedLocation.motionSegmentTo(currentLocation);
+                if (!diff.matches(AxesLocation.zero)) {
+                    Logger.debug("Reported location changes current location from "+currentLocation+" to "+reportedLocation);
+                    // Reported position has in deed changed.
+                    reportedLocation.setToCoordinates();
+                    // Notify heads.
+                    for (Head movedHead : getMachine().getHeads()) {
+                        getMachine().fireMachineHeadActivity(movedHead);
+                    }
                 }
             }
+            // Apply the rotation axes wrap-around handling.
+            wrapUpCoordinates(hm);
         }
-        // Apply the rotation axes wrap-around handling.
-        wrapUpCoordinates(hm);
+        finally {
+            CycleProfiler.end(wait);
+        }
         // Remove old stuff.
-        clearMotionPlanOlderThan(NanosecondTime.getRuntimeSeconds() - maximumPlanHistory);
+        CycleProfiler.Handle history = CycleProfiler.begin("plan history");
+        try {
+            clearMotionPlanOlderThan(NanosecondTime.getRuntimeSeconds() - maximumPlanHistory);
+        }
+        finally {
+            CycleProfiler.end(history);
+        }
     }
 
     /**

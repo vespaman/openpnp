@@ -1070,6 +1070,33 @@ public class GcodeDriver extends AbstractReferenceDriver implements Named {
         }
     }
 
+    /**
+     * Queue the completion command for the motion that has already been handed to the driver, without
+     * waiting for it and without declaring the machine at a standstill.
+     * 
+     * <p>OpenPnP normally only issues the completion command when it actually wants to stop and know where
+     * it is. A move that was made to overlap other work therefore often sits in the controller's input
+     * buffer with nothing behind it, and on controllers that do not start a queued move until the
+     * completion command arrives, the machine stands still for the whole time the overlap was supposed to
+     * be earning. Committing the move costs one line on the wire and gives the controller the earliest
+     * possible reason to go.</p>
+     * 
+     * <p>Unlike {@link #waitForCompletion(HeadMountable, CompletionType)} this leaves the motion pending,
+     * so any later wait for still-stand still issues its own completion command and waits for it as it
+     * always has.</p>
+     * 
+     * @throws Exception
+     */
+    public void commitQueuedMotion() throws Exception {
+        if (!isMotionPending()) {
+            return;
+        }
+        String command = getCommand(null, CommandType.MOVE_TO_COMPLETE_COMMAND);
+        if (command != null) {
+            sendGcode(command, getTimeoutAtMachineSpeed());
+        }
+    }
+
     private boolean containsMatch(List<Line> responses, String regex) {
         for (Line response : responses) {
             if (response.line.matches(regex)) {

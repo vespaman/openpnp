@@ -52,6 +52,7 @@ import org.openpnp.spi.NozzleTip;
 import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.PartAlignment;
 import org.openpnp.spi.PropertySheetHolder;
+import org.openpnp.spi.BufferedFrames;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Machine;
 import org.openpnp.util.LogUtils;
@@ -1646,6 +1647,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             long tCapture = NanosecondTime.getRuntimeMilliseconds();
             BufferedImage capturedBufferedImage = camera.capture();
             long capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+            if (camera instanceof ReferenceCamera) {
+                long rawAtMs = ((ReferenceCamera) camera).getRawFrameCapturedAtMs();
+                if (rawAtMs != FrameProvenance.UNKNOWN) {
+                    // The frame can say when it was taken after all, which makes its age a fact rather
+                    // than an upper bound. It is still a frame nobody proved anything about.
+                    capturedAtMs = rawAtMs;
+                }
+            }
             // Stamped as what it is: a frame nobody proved anything about. The alignment will refuse
             // it, which is the point - see the requirements.
             return new GrabbedFrame(capturedBufferedImage,
@@ -1901,6 +1910,57 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      *    and the alignment refuses it, without waiting for a deadline that cannot help;
      *  - the deadline: same refusal, and the head leaves the cameras a bounded time after the rest.
      */
+    /**
+     * One frame from a camera, taken at or after {@code notBeforeMs} if that can be had, out of the
+     * camera's own buffer of frames it grabbed ahead if it has such a thing, and otherwise out of a fresh
+     * exposure. Either way it is the transformed picture, which matters more than it sounds: the pipeline
+     * searches where the camera's rotation and flip put the part, and a frame from the buffer that had
+     * not been through them shows a part the pipeline cannot find.
+     *
+     * The buffer is asked first because it is cheaper in every currency that matters here: no exposure, so
+     * nothing on the bus the settling camera is sharing with us and nothing in the light; no wait, because
+     * the frame was taken while the head was still on its way; and an honest timestamp, because a frame
+     * that was buffered knows when it was taken, whereas a frame that was waited for only knows that it
+     * was taken at some point before it came back.
+     *
+     * The wait put on the buffer is a few frame intervals, no more. Nothing in it is ever *late* - a frame
+     * at or after the bound either exists or will be exposed within a frame or two - and when the bound is
+     * not met, the ring is not being filled at all, which is the moment to fall back to the camera rather
+     * than to discover it at the end of the settling's deadline.
+     *
+     * @param notBeforeMs the earliest instant the frame may have been taken; {@link
+     *            FrameProvenance#UNKNOWN} to ask for nothing in particular.
+     * @param tAsk the instant this frame-taking began, on the same clock, for the duration reported back.
+     * @param capturedAtMsOut one element, set to when the frame returned was taken.
+     */
+    private BufferedImage takeFrame(Camera camera, BufferedFrames buffered, long notBeforeMs,
+            long tAsk, long[] capturedAtMsOut) throws Exception {
+        if (buffered != null && notBeforeMs != FrameProvenance.UNKNOWN) {
+            try {
+                long interval = Math.max(4, buffered.getBufferedFrameIntervalMs());
+                BufferedFrames.Frame frame = buffered.awaitEarliestBufferedFrameAtOrAfter(notBeforeMs,
+                        tAsk + Math.min(Math.max(25, 3*interval), 250));
+                if (frame != null) {
+                    capturedAtMsOut[0] = frame.getCapturedAtMs();
+                    return frame.getImage();
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        BufferedImage image = camera.capture();
+        // When was that exposed? A camera that grabs ahead has been saying so all along, and even a
+        // capture on demand that was served from the ring knows. Only a capture that really did wait for
+        // an exposure has nothing to say for itself but the instant it returned.
+        long capturedAtMs = camera instanceof ReferenceCamera 
+                ? ((ReferenceCamera) camera).getRawFrameCapturedAtMs() 
+                : FrameProvenance.UNKNOWN;
+        capturedAtMsOut[0] = capturedAtMs == FrameProvenance.UNKNOWN 
+                ? NanosecondTime.getRuntimeMilliseconds() : capturedAtMs;
+        return image;
+    }
+
     private GrabbedFrame grabUntilTheStillWindow(Camera camera,
             AbstractSettlingCamera settlingCamera, long settleEpochBefore, long arrivalAtMs,
             long deadlineAtMs, Consumer<GrabbedFrame> earliestFrameHandedTo) throws Exception {
@@ -1908,6 +1968,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         BufferedImage image = null;
         long capturedAtMs = 0;
         int grabs = 0;
+        // This camera may already have the frames that are wanted. A camera that grabs its frames ahead of
+        // being asked has been taking them while the head travelled here, and picking one out of what it
+        // has taken costs no exposure, costs the settling nothing on the shared bus, and comes with a
+        // timestamp that says when the pixels were taken rather than when somebody got round to asking.
+        // A camera that does not do this answers nothing at once and everything below is exactly as it was.
+        final BufferedFrames buffered = camera instanceof BufferedFrames 
+                ? (BufferedFrames) camera : null;
 
         while (true) {
             if (grabs == 0) {
@@ -1916,8 +1983,13 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 // rings. It is also the frame the alignment gets if the settling had already made up its
                 // mind before we arrived, which is why nothing is waited for here.
                 tCapture = NanosecondTime.getRuntimeMilliseconds();
-                image = camera.capture();
-                capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+                long[] stamp = new long[1];
+                // The frame nearest the arrival, which is the earliest there is to look at and therefore
+                // the one the ringing window can be spent on. A frame from before the arrival is not asked
+                // for: the head was somewhere else in it, and the pre-check would judge an empty field of
+                // view and report a missing part.
+                image = takeFrame(camera, buffered, arrivalAtMs, tCapture, stamp);
+                capturedAtMs = stamp[0];
                 grabs = 1;
                 // Stamped as the ringing it is, with the instant it happened: the pre-check can only
                 // judge the head while the head is still moving, and a dump of that frame is worthless
@@ -1947,9 +2019,26 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 awaitWindowOpening(settlingCamera, settleEpochBefore, deadlineAtMs);
 
                 tCapture = NanosecondTime.getRuntimeMilliseconds();
-                image = camera.capture();
-                capturedAtMs = NanosecondTime.getRuntimeMilliseconds();
+                long[] stamp = new long[1];
+                // Aim at the opening rather than at the verdict: the earliest instant the settling has
+                // already claimed is known now, and a frame taken at or after it is a frame inside the
+                // stillness whichever way the verdict goes.
+                image = takeFrame(camera, buffered, windowOpening(settlingCamera, settleEpochBefore),
+                        tCapture, stamp);
+                capturedAtMs = stamp[0];
                 grabs++;
+                // What this grab was aimed at and what it got, because the difference between the two is
+                // the difference between a frame that was waiting in a buffer and an exposure that had
+                // still to happen, and the head cannot be blamed for waiting on either without saying
+                // which one it waited on.
+                Logger.trace("[WINDOW-HUNT] {} grab {} asked at +{} ms after the rest, answered by a"
+                                +" frame at +{} ms ({}) while the window of {} opened at +{} ms",
+                        camera.getName(), grabs, elapsed(arrivalAtMs, tCapture),
+                        elapsed(arrivalAtMs, capturedAtMs),
+                        capturedAtMs == FrameProvenance.UNKNOWN ? "no stamp"
+                                : (tCapture-capturedAtMs)+" ms old when asked",
+                        settlingCamera.getName(),
+                        elapsed(arrivalAtMs, windowOpening(settlingCamera, settleEpochBefore)));
             }
 
             AbstractSettlingCamera.SettleResult result =
@@ -1981,14 +2070,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // The frame is either already inside a window that has been announced, or the settling is
             // one frame away from announcing one it belongs to. Asking the settling is cheaper than
             // taking another frame to find out, and the answer is bounded either way.
+            long tVerdict = NanosecondTime.getRuntimeMilliseconds();
             long windowStartAtMs = awaitWindowCovering(settlingCamera, settleEpochBefore,
                     capturedAtMs, deadlineAtMs);
+            long verdictMs = NanosecondTime.getRuntimeMilliseconds()-tVerdict;
             if (windowStartAtMs != FrameProvenance.UNKNOWN) {
                 Logger.debug("[SETTLE-WINDOW] camera {} frame {} at +{} ms after the rest is inside the"
-                        + " window of {} which opened at +{} ms, margin {} ms of {} grabs",
+                        + " window of {} which opened at +{} ms, margin {} ms of {} grabs,"
+                        + " verdict waited {} ms",
                         camera.getName(), grabs, elapsed(arrivalAtMs, capturedAtMs),
                         settlingCamera.getName(), elapsed(arrivalAtMs, windowStartAtMs),
-                        capturedAtMs-windowStartAtMs, grabs);
+                        capturedAtMs-windowStartAtMs, grabs, verdictMs);
                 return new GrabbedFrame(image, FrameProvenance.streamed(arrivalAtMs, capturedAtMs,
                         windowStartAtMs, grabs), capturedAtMs - tCapture);
             }
@@ -2022,6 +2114,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             long deadlineAtMs) throws Exception {
         while (settlingCamera.getSettleEpoch() <= settleEpochBefore
                 && NanosecondTime.getRuntimeMilliseconds() < deadlineAtMs) {
+            // Polled rather than woken, and there is no hurry: what follows this wait is another frame
+            // taken off the same bus the settling wants, so arriving the instant the settling starts
+            // would only cost it a frame.
             Thread.sleep(SETTLE_POLL_MS);
         }
     }
@@ -2045,6 +2140,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                                     != FrameProvenance.UNKNOWN)) {
                 return;
             }
+            // Polled rather than woken: this wait ends in a frame taken off the bus the settling is
+            // using, so it is deliberately no more prompt than it has to be.
             Thread.sleep(SETTLE_POLL_MS);
         }
     }
@@ -2094,6 +2191,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     private static long awaitWindowCovering(AbstractSettlingCamera settlingCamera,
             long settleEpochBefore, long capturedAtMs, long deadlineAtMs) throws Exception {
         while (true) {
+            long watchVersion = settlingCamera.getSettleWatchVersion();
             AbstractSettlingCamera.SettleResult result =
                     recordedResult(settlingCamera, settleEpochBefore);
             long windowStartAtMs = stillWindowOf(result, settlingCamera);
@@ -2107,7 +2205,11 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     || NanosecondTime.getRuntimeMilliseconds() >= deadlineAtMs) {
                 return FrameProvenance.UNKNOWN;
             }
-            Thread.sleep(SETTLE_POLL_MS);
+            // A frame is being held here, and this wait is the last thing between it and the alignment
+            // that wants it, so it is woken by the settling instead of enquiring on a timer: on pn52
+            // (log_F.txt) the verdict and this frame being handed over were 9 ms apart, and a poll can
+            // only ever be as prompt as its interval and as the CPU lets it be.
+            settlingCamera.awaitSettleWatchChange(watchVersion, deadlineAtMs);
         }
     }
 

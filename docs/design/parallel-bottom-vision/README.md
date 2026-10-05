@@ -60,3 +60,7 @@ sorts them below the documents written in this fork.
 | `PRE-ALIGNMENT-CHECK.md` | the unimplemented pre-alignment check, as a requirement note |
 | `PRE-CHECK-ASSESSMENT.md` | whether the pre-check and an earlier departure from the vision position are worth doing, measured on the machine on 2026-09-28, including what has already been ruled out; supersedes the timing requirements of `PRE-ALIGNMENT-CHECK.md` |
 | `DISPLACEMENT-VERIFICATION.md` | assessment of letting the machine measure its own displacement data instead of re-calibrating by hand |
+| `TIME-BUDGET.md` | where the time of a job goes, stage by stage, and what the cameras own in it |
+| `CAPTURE-COST.md` | what a frame costs, measured on pn52 in 2026-10, and what to do about it ranked by saving per job |
+| `GRAB-AHEAD.md` | the frame ring that implements item 2 of `CAPTURE-COST.md`: the settings, the design, the invariants, what it costs, what the tests prove, and what to read in a machine log |
+| `MOTION-BUDGET.md` | where the two seconds of a placement cycle go on the machine side, measured on pn52 in 2026-10: the head is busy 99.9 % of the cycle (2-4 ms idle) so neither Java nor the wire is the prize, the 13 forced stillstands and the ~156 ms drag block are, and the dragpin interlock belongs to safety rather than to speed |

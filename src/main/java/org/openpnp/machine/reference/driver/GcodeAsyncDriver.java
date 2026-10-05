@@ -34,6 +34,7 @@ import org.openpnp.spi.Machine;
 import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.Translations;
 import org.openpnp.util.Collect;
+import org.openpnp.util.CycleProfiler;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
@@ -226,6 +227,17 @@ public class GcodeAsyncDriver extends GcodeDriver {
         super.disconnectThreads();
     }
 
+    protected static String commandWord(String command) {
+        if (command == null) {
+            return "?";
+        }
+        int end = 0;
+        while (end < command.length() && !Character.isWhitespace(command.charAt(end))) {
+            end++;
+        }
+        return command.substring(0, end);
+    }
+
     protected class WriterThread extends Thread {
 
         @Override
@@ -250,11 +262,15 @@ public class GcodeAsyncDriver extends GcodeDriver {
                 }
                 try {
                     if (confirmationFlowControl && lastCommand != null) {
+                        // The line cannot be written until the controller has acknowledged the one before it, so
+                        // however long a status request takes to answer, that is how long the next move is held up.
+                        CycleProfiler.Handle wire = CycleProfiler.begin("wire "+commandWord(lastCommand.line));
                         try {
                             // Before we can send the new command, make sure the wanted confirmation count of the last command was received.
                             waitForConfirmation(lastCommand.toString(), lastCommand.getTimeout());
                         }
                         finally {
+                            CycleProfiler.end(wire);
                             // Whatever happens, never wait for this one again.
                             lastCommand = null;
                         }
@@ -378,13 +394,19 @@ public class GcodeAsyncDriver extends GcodeDriver {
             // Explicitly wait for the controller's acknowledgment here.
             long timeout = (completionType == CompletionType.WaitForStillstandIndefinitely ?
                     infinityTimeoutMilliseconds : getTimeoutAtMachineSpeed());
-            if (reportedLocationConfirmation) {
-                // Then make sure we get a uniquely recognizable confirmation. 
-                // Confirmation is signaled with a position report.
-                getReportedLocation(timeout);
+            CycleProfiler.Handle machineWait = CycleProfiler.begin("machine wait");
+            try {
+                if (reportedLocationConfirmation) {
+                    // Then make sure we get a uniquely recognizable confirmation. 
+                    // Confirmation is signaled with a position report.
+                    getReportedLocation(timeout);
+                }
+                else {
+                    drainCommandQueue(timeout);
+                }
             }
-            else {
-                drainCommandQueue(timeout);
+            finally {
+                CycleProfiler.end(machineWait);
             }
             Logger.trace("{} confirmation complete.", getName());
         }

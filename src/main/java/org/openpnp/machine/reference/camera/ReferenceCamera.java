@@ -58,6 +58,7 @@ import org.openpnp.machine.reference.wizards.ReferenceCameraCalibrationWizard;
 import org.openpnp.machine.reference.wizards.ReferenceCameraPositionConfigurationWizard;
 import org.openpnp.machine.reference.wizards.ReferenceCameraTransformsConfigurationWizard;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.FrameProvenance;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
@@ -69,6 +70,7 @@ import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.Machine;
 import org.openpnp.util.Collect;
 import org.openpnp.util.OpenCvUtils;
+import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.SimpleGraph;
 import org.openpnp.util.VisionUtils;
 import org.openpnp.vision.LensCalibration;
@@ -244,8 +246,41 @@ public abstract class ReferenceCamera extends AbstractBroadcastingCamera impleme
      */
     @Override
     public BufferedImage captureRaw() {
+        // Forget what the last capture said about when its frame was taken. Until internalCapture() says
+        // otherwise, this capture's frame has a time of which nobody can say anything.
+        rawFrameCapturedAtMs.set(FrameProvenance.UNKNOWN);
         return safeInternalCapture();
     }
+
+    /**
+     * The instant at which the raw frame that this thread last captured was taken, on the
+     * {@link NanosecondTime} millisecond scale, or {@link FrameProvenance#UNKNOWN} if the camera cannot
+     * say.
+     *
+     * A capture on demand cannot say: the frame is exposed at some point between the ask and the return,
+     * and the return is all the caller sees, which is why everything else in this area has been stamping
+     * frames with the time they came back. That is a little late, and a frame stamped when it came back
+     * can be shown to be "after the head stopped" while it was in fact exposed while the head was still
+     * moving. A camera that grabs its frames ahead of being asked does know, because its grabbing thread
+     * notes the instant it had each one in hand, and it reports that here.
+     *
+     * Per thread, because a camera is captured from several at once (the preview on its own thread, the
+     * vision on the job thread) and the answer belongs to whoever asked. Read it immediately after the
+     * capture it belongs to, as the settling and the pre-capture do.
+     */
+    public long getRawFrameCapturedAtMs() {
+        Long capturedAtMs = rawFrameCapturedAtMs.get();
+        return capturedAtMs == null ? FrameProvenance.UNKNOWN : capturedAtMs;
+    }
+
+    /**
+     * Called by {@link #internalCapture()} when it knows when the frame it is handing over was taken.
+     */
+    protected void setRawFrameCapturedAtMs(long capturedAtMs) {
+        rawFrameCapturedAtMs.set(capturedAtMs);
+    }
+
+    private final ThreadLocal<Long> rawFrameCapturedAtMs = new ThreadLocal<>();
 
     @Override
     public boolean hasNewFrame() {
