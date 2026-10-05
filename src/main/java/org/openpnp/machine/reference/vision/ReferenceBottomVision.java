@@ -62,6 +62,7 @@ import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
 import org.openpnp.util.VisionUtils;
 import org.openpnp.vision.FrameDump;
+import org.openpnp.vision.VisionEvidence;
 import org.openpnp.vision.pipeline.CvPipeline;
 import org.openpnp.vision.pipeline.CvPipeline.PipelineShot;
 import org.openpnp.vision.pipeline.CvStage;
@@ -427,7 +428,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             displayResult(OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()), part, offsets, camera, nozzle);
             offsetsCheck(part, nozzle, offsets);
 
-            partSizeCheck(part, bottomVisionSettings, rect, camera);
+            partSizeCheckWithEvidence(pipeline, part, bottomVisionSettings, rect, camera, nozzle,
+                    wantedAngle);
 
             return new PartAlignment.PartAlignmentOffset(offsets, true);
         }
@@ -468,7 +470,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 angleOffset = Utils2D.angleNorm(angleOffset, 180);
             }
 
-            partSizeCheck(part, bottomVisionSettings, rect, camera);
+            partSizeCheckWithEvidence(pipeline, part, bottomVisionSettings, rect, camera, nozzle,
+                    wantedLocation.getRotation());
 
             // Set the angle on the offsets.
             offsets = offsets.derive(null, null, null, angleOffset);
@@ -480,6 +483,33 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             offsetsCheck(part, nozzle, offsets);
 
             return new PartAlignmentOffset(offsets, false);
+        }
+    }
+
+    /**
+     * The size check, and when it refuses, what the pipeline itself has to say about the frame it
+     * measured.
+     *
+     * <p>A refusal says the part was too small, which is true of a part that has slid under the nozzle
+     * shoulder and equally true of a part that is sitting exactly where it should be with one of its
+     * terminations too dark for the brightness stage. The remedies are opposite, so the refusal cannot
+     * be the last word: the stage results that are already in the pipeline are reported, and the frames
+     * that were kept in memory - the one the pre-check answered for and the one measured here, if
+     * {@code -DframeDump=onFailure} was given - are written. None of that costs anything until a part
+     * has already been refused, which is the one moment in a cycle nobody is timing.</p>
+     */
+    protected void partSizeCheckWithEvidence(CvPipeline pipeline, Part part,
+            BottomVisionSettings bottomVisionSettings, RotatedRect rect, Camera camera, Nozzle nozzle,
+            double wantedAngle)
+                    throws Exception {
+        try {
+            partSizeCheck(part, bottomVisionSettings, rect, camera);
+        }
+        catch (Exception e) {
+            VisionEvidence.report(pipeline, rect, e.getMessage(), camera.getName(),
+                    nozzle == null ? "?" : nozzle.getName(), part.getId(), wantedAngle);
+            FrameDump.writeRetained(e.getMessage());
+            throw e;
         }
     }
 
@@ -1553,6 +1583,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             }
             
             if (result.model == null) {
+                VisionEvidence.report(pipeline, null, "No result found in pipeline for part "
+                        +part.getId(), camera.getName(), nozzle.getName(), part.getId(),
+                        wantedLocation.getRotation());
+                FrameDump.writeRetained("No result found for part "+part.getId());
                 throw new Exception("No result found in pipeline for part "+part.getId());
             }
             

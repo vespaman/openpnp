@@ -60,6 +60,15 @@ import org.pmw.tinylog.Logger;
  * run meant to produce a corpus needs: the alternative is to open every Bottom Vision setting in the
  * GUI and tick a box, and a corpus missing three of its five parts is not a corpus.
  * {@code -DframeDumpMax=<frames>} stops it after that many frames.</p>
+ *
+ * <p>{@code -DframeDump=onFailure[:<directory>]} is the same evidence without the cost of a corpus:
+ * nothing is written while the parts are being accepted, instead the frames of each alignment are kept
+ * in memory - a clone, which is a memcpy, not a PNG - and they are written only when a part is refused.
+ * A refusal already costs a sequential re-alignment, so the tens of milliseconds it now also costs to
+ * encode four frames cannot be noticed, whereas a corpus written on every cycle touches the disk the
+ * log goes to and lengthens the very cycle it is meant to observe. The frames kept are the two an
+ * alignment holds anyway, so a refusal leaves behind the frame the pre-check answered for and the frame
+ * the alignment measured, which is the before and the after of the settling.</p>
  */
 public class FrameDump {
 
@@ -76,6 +85,41 @@ public class FrameDump {
     public static final String MAX_PROPERTY = "frameDumpMax";
 
     public static final int DEFAULT_MAX_FRAMES = 4000;
+
+    /**
+     * The value of {@value #PROPERTY} that keeps frames in memory instead of writing them, so that only
+     * a refusal produces files.
+     */
+    public static final String ON_FAILURE = "onFailure";
+
+    /**
+     * How many frames are remembered per {@link #ON_FAILURE} run. A frame of an up-looking camera is a
+     * megabyte, so eight of them are eight megabytes, which is a fair price for never losing the
+     * evidence of a failure; the oldest goes when the ninth arrives.
+     */
+    public static final String KEEP_PROPERTY = "frameDumpKeep";
+
+    public static final int DEFAULT_KEEP = 8;
+
+    /**
+     * What the frame dump does with a frame.
+     */
+    public enum Mode {
+        /**
+         * Nothing at all.
+         */
+        Off,
+        /**
+         * Every frame is written as it is captured. What a corpus needs, and what a timing comparison
+         * must not use.
+         */
+        Every,
+        /**
+         * Frames are cloned into memory and written only when {@link #writeRetained(String)} is called,
+         * i.e. when a part is refused. The cost in the accepted case is the clone.
+         */
+        OnFailure
+    }
 
     /**
      * Frames waiting to be encoded. Small on purpose: a machine that cannot write frames as fast as it
@@ -263,9 +307,48 @@ public class FrameDump {
     }
 
     /**
-     * The directory named on the command line, or {@code null} if the command line says nothing.
+     * The directory named on the command line, or {@code null} if the command line says nothing - which
+     * includes saying only {@code onFailure}, because that says how and not where.
      */
     public static String overrideDirectory() {
+        String value = overrideValue();
+        if (value == null) {
+            return null;
+        }
+        if (value.equalsIgnoreCase(ON_FAILURE)) {
+            return null;
+        }
+        if (isOnFailure(value)) {
+            value = value.substring(ON_FAILURE.length()+1).trim();
+            return value.isEmpty() ? null : value;
+        }
+        return value;
+    }
+
+    /**
+     * What the frame dump does with the frames it is offered. The command line wins over the settings,
+     * and a command line that says {@code onFailure} wins even where the settings say nothing, because
+     * the person who wants the evidence of one refusal is exactly the person who does not want to
+     * configure five vision settings.
+     */
+    public static Mode mode(BottomVisionSettings settings) {
+        String value = overrideValue();
+        if (value != null) {
+            return isOnFailure(value) || value.equalsIgnoreCase(ON_FAILURE) ? Mode.OnFailure
+                    : Mode.Every;
+        }
+        return settings != null && settings.isFrameDumpEnabled() ? Mode.Every : Mode.Off;
+    }
+
+    /**
+     * Whether frames are being dumped at all: either the command line asked for it, or the vision
+     * settings did. Also true for {@link Mode#OnFailure}, which does not write until it must.
+     */
+    public static boolean isEnabled(BottomVisionSettings settings) {
+        return mode(settings) != Mode.Off;
+    }
+
+    private static String overrideValue() {
         String property = System.getProperty(PROPERTY);
         if (property == null || property.trim().isEmpty()) {
             return null;
@@ -273,12 +356,8 @@ public class FrameDump {
         return property.trim();
     }
 
-    /**
-     * Whether frames are being dumped at all: either the command line asked for it, or the vision
-     * settings did.
-     */
-    public static boolean isEnabled(BottomVisionSettings settings) {
-        return overrideDirectory() != null || (settings != null && settings.isFrameDumpEnabled());
+    private static boolean isOnFailure(String value) {
+        return value.regionMatches(true, 0, ON_FAILURE+":", 0, ON_FAILURE.length()+1);
     }
 
     public static int maxFrames() {
@@ -324,7 +403,12 @@ public class FrameDump {
      */
     public static void writeIfNeeded(BottomVisionSettings settings, Mat frame,
             FrameProvenance provenance, Camera camera, Nozzle nozzle, Part part, double rotation) {
-        if (!isEnabled(settings) || frame == null || frame.empty()) {
+        Mode mode = isEnabled(settings) ? mode(settings) : Mode.Off;
+        if (mode == Mode.Off || frame == null || frame.empty()) {
+            return;
+        }
+        if (mode == Mode.OnFailure) {
+            retain(settings, frame, provenance, camera, nozzle, part, rotation);
             return;
         }
         if (offered.incrementAndGet() > maxFrames()) {
@@ -358,6 +442,147 @@ public class FrameDump {
         }
         catch (Exception e) {
             Logger.warn("[FRAME-DUMP] cannot write {}: {}", file.getName(), e.getMessage());
+        }
+    }
+
+    /**
+     * A frame that has been remembered rather than written.
+     */
+    private static class Retained {
+        final Mat image;
+        final File file;
+
+        Retained(Mat image, File file) {
+            this.image = image;
+            this.file = file;
+        }
+    }
+
+    private static final java.util.Deque<Retained> retained = new java.util.ArrayDeque<>();
+
+    private static boolean keepSaid;
+
+    /**
+     * Remember one frame in memory, in case it turns out to have been the last picture of a part that
+     * was later refused. Only the clone is paid for here - a megabyte copied, not a PNG encoded - which
+     * is what makes it affordable to do on every alignment instead of only on the ones that fail.
+     *
+     * <p>Never throws: a dump that cannot be remembered is a lost piece of evidence, not a reason to
+     * stop placing parts.</p>
+     */
+    public static void retain(BottomVisionSettings settings, Mat frame, FrameProvenance provenance,
+            Camera camera, Nozzle nozzle, Part part, double rotation) {
+        if (frame == null || frame.empty()) {
+            return;
+        }
+        try {
+            File directory = directory(settings);
+            File file = new File(directory,
+                    fileName(provenance, camera, nozzle, part, rotation));
+            int max = keepMax();
+            synchronized (retained) {
+                while (retained.size() >= max) {
+                    Retained oldest = retained.removeFirst();
+                    oldest.image.release();
+                    if (!keepSaid) {
+                        keepSaid = true;
+                        Logger.info("[FRAME-DUMP] remembering only the last {} frames; -D{}=<n> for more",
+                                max, KEEP_PROPERTY);
+                    }
+                }
+                retained.addLast(new Retained(frame.clone(), file));
+            }
+            if (!keepSaid) {
+                Logger.info("[FRAME-DUMP] keeping frames in memory, nothing written unless a part is "
+                        + "refused; would go to {}", directory.getAbsolutePath());
+            }
+        }
+        catch (Exception e) {
+            Logger.warn("[FRAME-DUMP] cannot keep a frame: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Write every remembered frame and forget it. Called when a part has been refused, because that is
+     * the moment the frames become evidence - and the moment when the cycle has already been lost to
+     * the re-alignment, so paying for the encoding costs nothing anybody can notice.
+     *
+     * @param reason what the refusal said, so that the log line that wrote the frames can be found again
+     *            from the files and the other way round.
+     * @return how many frames were written.
+     */
+    public static int writeRetained(String reason) {
+        java.util.List<Retained> frames = new java.util.ArrayList<>();
+        synchronized (retained) {
+            Retained frame;
+            while ((frame = retained.pollFirst()) != null) {
+                frames.add(frame);
+            }
+        }
+        if (frames.isEmpty()) {
+            return 0;
+        }
+        int queued = 0;
+        for (Retained frame : frames) {
+            try {
+                if (offered.incrementAndGet() > maxFrames()) {
+                    break;
+                }
+                File directory = frame.file.getParentFile();
+                if (!directory.isDirectory() && !directory.mkdirs()) {
+                    throw new IOException("cannot create "+directory);
+                }
+                BufferedImage image = OpenCvUtils.toBufferedImage(frame.image);
+                if (!queue.offer(new Job(frame.file, image, false))) {
+                    dropped.incrementAndGet();
+                    continue;
+                }
+                pending.incrementAndGet();
+                queued++;
+                ensureWriter();
+            }
+            catch (Exception e) {
+                Logger.warn("[FRAME-DUMP] cannot write {}: {}", frame.file.getName(), e.getMessage());
+            }
+            finally {
+                frame.image.release();
+            }
+        }
+        Logger.info("[FRAME-DUMP] wrote {} remembered frame(s) to {} because: {}", queued,
+                frames.get(0).file.getParentFile().getAbsolutePath(), reason);
+        return queued;
+    }
+
+    /**
+     * Forget the remembered frames without writing them, e.g. when a run is over.
+     */
+    public static void releaseRetained() {
+        synchronized (retained) {
+            Retained frame;
+            while ((frame = retained.pollFirst()) != null) {
+                frame.image.release();
+            }
+        }
+    }
+
+    public static int getFramesRetained() {
+        synchronized (retained) {
+            return retained.size();
+        }
+    }
+
+    public static int keepMax() {
+        String property = System.getProperty(KEEP_PROPERTY);
+        if (property == null || property.trim().isEmpty()) {
+            return DEFAULT_KEEP;
+        }
+        try {
+            return Math.max(1, Integer.parseInt(property.trim()));
+        }
+        catch (NumberFormatException e) {
+            Logger.warn("[FRAME-DUMP] -D{} is \"{}\", which is not a number; using {}", KEEP_PROPERTY,
+                    property, DEFAULT_KEEP);
+            return DEFAULT_KEEP;
         }
     }
 

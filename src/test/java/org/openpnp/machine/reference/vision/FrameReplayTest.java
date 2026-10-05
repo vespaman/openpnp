@@ -104,6 +104,19 @@ public class FrameReplayTest {
     /** A centre coordinate is 17 significant digits in the log; anything looser is not the same point. */
     private static final double PIXEL_TOLERANCE = 1e-6;
 
+    /**
+     * The name the brightness threshold is assigned under in the vision settings of the parts that have
+     * one. Named here rather than discovered, because a pipeline without it should say so rather than be
+     * silently measured at the wrong threshold.
+     */
+    private static final String THRESHOLD_PARAMETER = "pThreshold";
+
+    /**
+     * Whether a frame that the part's own size check refuses is also asked what it has to say for
+     * itself ({@code -Dreplay.evidence=1}). Off by default, because it prints a paragraph per refusal.
+     */
+    private boolean describeRefusals = System.getProperty("replay.evidence") != null;
+
     /** A frame as it lies on disk, and what its name says about it. */
     private static class Kept {
         File file;
@@ -312,6 +325,11 @@ public class FrameReplayTest {
      * parent holds the configuration of the run that took it.
      */
     private void measureEveryFrame(File corpus) throws Exception {
+        List<Integer> thresholds = thresholdsToSweep();
+        if (!thresholds.isEmpty()) {
+            sweepEveryFrame(corpus, thresholds);
+            return;
+        }
         File directory = corpus.getParentFile();
         Assumptions.assumeTrue(directory != null && new File(directory, "machine.xml").isFile()
                 && corpus.isDirectory(), "-Dreplay.measure="+corpus+" has no machine.xml beside it");
@@ -340,6 +358,103 @@ public class FrameReplayTest {
                         frame.name.origin, frame.name.nozzleId, frame.name.frameIndex,
                         "+"+(frame.name.capturedAtMs-frame.name.arrivalAtMs)+" ms",
                         why.replaceAll("\\s+", " "));
+            }
+        }
+    }
+
+    /**
+     * The thresholds to re-measure every frame at, from {@code -Dreplay.threshold=120,140,164}. Empty
+     * when the property is absent, which is the ordinary replay.
+     */
+    private List<Integer> thresholdsToSweep() {
+        String property = System.getProperty("replay.threshold");
+        List<Integer> thresholds = new ArrayList<>();
+        if (property == null || property.trim().isEmpty()) {
+            return thresholds;
+        }
+        for (String value : property.split(",")) {
+            if (!value.trim().isEmpty()) {
+                thresholds.add(Integer.parseInt(value.trim()));
+            }
+        }
+        return thresholds;
+    }
+
+    /**
+     * Every frame of the corpus, measured once per threshold, with the machine's own verdict on each
+     * measurement.
+     *
+     * <p>This answers the one question a refusal leaves open: whether the frame showed too little of a
+     * part, or showed the part and was read at a threshold that threw most of it away. A frame whose
+     * measurement grows into a part as soon as the threshold comes down was the second kind, and a frame
+     * that stays a quarter of a part at every threshold was the first. The tally counts them per origin,
+     * because the claim being tested is about the difference between the frame the pre-check measured and
+     * the frame the hunt kept - the two are in the same corpus and must be counted apart or the answer
+     * says nothing.</p>
+     *
+     * <p>Deliberately prints rather than asserts: what threshold a part needs is a property of the light
+     * and the part, not of the code, and a test that fails because somebody's lamp is dimmer teaches
+     * nobody anything.</p>
+     */
+    private void sweepEveryFrame(File corpus, List<Integer> thresholds) throws Exception {
+        List<Kept> frames = readFrames(corpus);
+        assertFalse(frames.isEmpty(), "no frame dump in "+corpus);
+        Configuration.initialize(corpus.getParentFile());
+        Configuration.get().load();
+        System.out.println();
+        System.out.println("threshold sweep "+thresholds+" over "+frames.size()+" frames of "+corpus);
+        StringBuilder heading = new StringBuilder(String.format("%-9s %-4s %-4s %-8s",
+                "origin", "noz", "f", "after"));
+        for (Integer threshold : thresholds) {
+            heading.append(String.format(" %14s", threshold));
+        }
+        System.out.println(heading);
+
+        Map<String, int[]> tally = new LinkedHashMap<>();
+        for (Kept frame : frames) {
+            System.out.printf("%-9s %-4s %-4s %-8s", frame.name.origin, frame.name.nozzleId,
+                    frame.name.frameIndex,
+                    "+"+(frame.name.capturedAtMs-frame.name.arrivalAtMs)+" ms");
+            for (Integer threshold : thresholds) {
+                String cell;
+                boolean fits = false;
+                try {
+                    Measuring measuring = measure(frame, threshold);
+                    double width = measuring.unitsPerPixel.getLengthX().multiply(
+                            measuring.rect.size.width).convertToUnits(LengthUnit.Millimeters).getValue();
+                    double height = measuring.unitsPerPixel.getLengthY().multiply(
+                            measuring.rect.size.height).convertToUnits(LengthUnit.Millimeters).getValue();
+                    try {
+                        ReferenceBottomVision.partSizeCheck(measuring.part, measuring.settings,
+                                measuring.rect, measuring.camera);
+                        fits = true;
+                    }
+                    catch (Exception refused) {
+                        fits = false;
+                    }
+                    cell = String.format("%.2fx%.2f %s", width, height, fits ? "ok" : "REFUSED");
+                }
+                catch (Throwable e) {
+                    cell = "nothing";
+                }
+                System.out.printf(" %14s", cell);
+                String key = threshold+" "+frame.name.origin;
+                int[] counts = tally.computeIfAbsent(key, k -> new int[2]);
+                counts[fits ? 0 : 1]++;
+            }
+            System.out.println();
+        }
+
+        System.out.println();
+        System.out.println(String.format("%-6s %-9s %6s %6s", "t", "frame", "ok", "refused"));
+        for (Integer threshold : thresholds) {
+            for (FrameProvenance.Origin origin : FrameProvenance.Origin.values()) {
+                int[] counts = tally.get(threshold+" "+origin);
+                if (counts == null) {
+                    continue;
+                }
+                System.out.println(String.format("%-6d %-9s %6d %6d", threshold, origin, counts[0],
+                        counts[1]));
             }
         }
     }
@@ -385,6 +500,43 @@ public class FrameReplayTest {
      * @return the size in millimetres, then the rectangle in pixels, exactly as the pipeline returned it.
      */
     private double[] replay(Kept frame) throws Exception {
+        return toMillimetres(frame, measure(frame, null));
+    }
+
+    /**
+     * The same, with the brightness threshold of the pipeline replaced by another one, which is how a
+     * frame that was refused is asked whether it would have been accepted at a different threshold - and
+     * whether the frames that were accepted would have survived being measured that way too.
+     */
+    private double[] replay(Kept frame, Integer threshold) throws Exception {
+        return toMillimetres(frame, measure(frame, threshold));
+    }
+
+    private double[] toMillimetres(Kept frame, Measuring measuring) {
+        Location upp = measuring.unitsPerPixel;
+        RotatedRect rect = measuring.rect;
+        return new double[] {
+                upp.getLengthX().multiply(rect.size.width)
+                        .convertToUnits(LengthUnit.Millimeters).getValue(),
+                upp.getLengthY().multiply(rect.size.height)
+                        .convertToUnits(LengthUnit.Millimeters).getValue(),
+                0, 0, rect.center.x, rect.center.y, rect.size.width, rect.size.height, rect.angle,
+        };
+    }
+
+    /**
+     * What the pipeline made of one frame: the rectangle and the scale it has to be read in, plus the
+     * part and its settings, because the verdict about a size belongs to the part and not to the frame.
+     */
+    private static class Measuring {
+        RotatedRect rect;
+        Location unitsPerPixel;
+        Part part;
+        BottomVisionSettings settings;
+        Camera camera;
+    }
+
+    private Measuring measure(Kept frame, Integer threshold) throws Exception {
         Machine machine = Configuration.get().getMachine();
         Camera camera = null;
         for (Camera candidate : machine.getCameras()) {
@@ -416,8 +568,15 @@ public class FrameReplayTest {
         // what the background analysis of the alignment itself passes.
         Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle, 0.,
                 true);
+        Map<String, Object> assignments = new java.util.HashMap<>(
+                settings.getPipelineParameterAssignments());
+        if (threshold != null) {
+            assertTrue(assignments.containsKey(THRESHOLD_PARAMETER),
+                    "the pipeline of "+part.getId()+" has no "+THRESHOLD_PARAMETER+" to sweep");
+            assignments.put(THRESHOLD_PARAMETER, threshold);
+        }
         try (CvPipeline pipeline = ReferenceBottomVision.getThreadLocalPipeline(settings)) {
-            bottomVision.preparePipeline(pipeline, settings.getPipelineParameterAssignments(), camera,
+            bottomVision.preparePipeline(pipeline, assignments, camera,
                     part.getPackage(), nozzle, nozzle.getNozzleTip(), wantedLocation, wantedLocation,
                     settings, true);
             String name = frame.file.getName();
@@ -437,16 +596,25 @@ public class FrameReplayTest {
             assertNotNull(result, "the pipeline of "+part.getId()+" found nothing in "+name);
             assertTrue(result.model instanceof RotatedRect,
                     name+": the pipeline returned "+result.model+", not a rectangle");
-            RotatedRect rect = (RotatedRect) result.model;
-
-            Location upp = camera.getUnitsPerPixelAtZ();
-            return new double[] {
-                    upp.getLengthX().multiply(rect.size.width)
-                            .convertToUnits(LengthUnit.Millimeters).getValue(),
-                    upp.getLengthY().multiply(rect.size.height)
-                            .convertToUnits(LengthUnit.Millimeters).getValue(),
-                    0, 0, rect.center.x, rect.center.y, rect.size.width, rect.size.height, rect.angle,
-            };
+            Measuring measuring = new Measuring();
+            measuring.rect = (RotatedRect) result.model;
+            if (describeRefusals) {
+                // The pipeline is still open here, which is the only moment its own account of the
+                // frame can be read out of it, so the evidence is taken now rather than by the caller.
+                try {
+                    ReferenceBottomVision.partSizeCheck(part, settings, measuring.rect, camera);
+                }
+                catch (Exception refused) {
+                    org.openpnp.vision.VisionEvidence.report(pipeline, measuring.rect,
+                            refused.getMessage(), camera.getName(), nozzle.getName(), part.getId(),
+                            wantedLocation.getRotation());
+                }
+            }
+            measuring.unitsPerPixel = camera.getUnitsPerPixelAtZ();
+            measuring.part = part;
+            measuring.settings = settings;
+            measuring.camera = camera;
+            return measuring;
         }
     }
 
