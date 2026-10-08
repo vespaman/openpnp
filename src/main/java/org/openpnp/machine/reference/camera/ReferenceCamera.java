@@ -152,6 +152,32 @@ public abstract class ReferenceCamera extends AbstractBroadcastingCamera impleme
     @Element(required = false)
     private AdvancedCalibration advancedCalibration = new AdvancedCalibration();
 
+    /**
+     * The camera displacement: how far this camera is really mounted from where the head offsets
+     * (plus the advanced calibration) claim it is, as measured by
+     * {@link org.openpnp.machine.reference.vision.DisplacementCheck}. Applied on top of the advanced
+     * calibration term in {@link #getCalibratedHeadOffsets(LocationOption...)}, so that it stacks on
+     * the physical mount instead of competing with the fit. See
+     * docs/design/parallel-bottom-vision/DISPLACEMENT-VERIFICATION.md §6.
+     */
+    @Element(required = false)
+    private Location displacement = new Location(LengthUnit.Millimeters);
+
+    /**
+     * When the {@link #displacement} was last measured, empty when it has never been measured. A
+     * displacement that has never been measured is a value the operator typed, and the machine says
+     * so.
+     */
+    @Attribute(required = false)
+    private String displacementVerifiedAt = "";
+
+    /**
+     * The spread of the measurement that produced {@link #displacement}, i.e. the smallest difference
+     * this displacement can honestly be said to be better than.
+     */
+    @Attribute(required = false)
+    private double displacementSpreadMm = 0.;
+
     @Attribute(required = false)
     private String lightActuatorId; 
     @Attribute(required = false)
@@ -369,12 +395,57 @@ public abstract class ReferenceCamera extends AbstractBroadcastingCamera impleme
 
     @Override
     public Location getCalibratedHeadOffsets(LocationOption... options) {
+        Location offsets = getHeadOffsets();
         if (! Arrays.asList(options).contains(LocationOption.SuppressCameraCalibration)) {
-            return getHeadOffsets().add(advancedCalibration.getCalibratedOffsets());
+            offsets = offsets.add(advancedCalibration.getCalibratedOffsets());
         }
-        else {
-            return getHeadOffsets();
+        // The camera displacement is not a fit but a measured value, so unlike the calibration it
+        // stays applied when the calibration is suppressed.
+        return offsets.add(getDisplacement());
+    }
+
+    public Location getDisplacement() {
+        if (displacement == null) {
+            displacement = new Location(LengthUnit.Millimeters);
         }
+        return displacement;
+    }
+
+    public void setDisplacement(Location displacement) {
+        Location oldValue = this.displacement;
+        this.displacement = displacement;
+        firePropertyChange("displacement", oldValue, displacement);
+        viewHasChanged();
+    }
+
+    public String getDisplacementVerifiedAt() {
+        return displacementVerifiedAt == null ? "" : displacementVerifiedAt;
+    }
+
+    public void setDisplacementVerifiedAt(String displacementVerifiedAt) {
+        String oldValue = this.displacementVerifiedAt;
+        this.displacementVerifiedAt = displacementVerifiedAt;
+        firePropertyChange("displacementVerifiedAt", oldValue, displacementVerifiedAt);
+    }
+
+    public double getDisplacementSpreadMm() {
+        return displacementSpreadMm;
+    }
+
+    public void setDisplacementSpreadMm(double displacementSpreadMm) {
+        double oldValue = this.displacementSpreadMm;
+        this.displacementSpreadMm = displacementSpreadMm;
+        firePropertyChange("displacementSpreadMm", oldValue, displacementSpreadMm);
+    }
+
+    /**
+     * True while a camera displacement is stored that the machine did not measure itself, i.e. while
+     * nobody can say how good it is.
+     */
+    public boolean isDisplacementUnverified() {
+        Location d = getDisplacement();
+        return (d.getX() != 0. || d.getY() != 0.)
+                && getDisplacementVerifiedAt().isEmpty();
     }
 
     @Override

@@ -1,0 +1,277 @@
+/*
+ * Camera displacement check.
+ *
+ * Measures how far each up-looking camera's optical axis actually is from the position the machine
+ * claims for it, and where every other nozzle ends up when the head makes the one alignment move
+ * that a parallel batch is positioned with. No parts, no picking, no placing: it measures the bare
+ * nozzle tips, which is exactly what makes it possible to do this at all.
+ *
+ * Why: the nozzles are mounted at a spacing that was assembled independently of the spacing of the
+ * cameras looking at them. The two numbers differ by a few tenths, so when the head is positioned to
+ * centre one tip in its camera, the other tip is off its camera axis by that difference. The analysis
+ * has to remove it, and this is how to find out how much.
+ *
+ * Run it with the machine enabled and homed, the tips clean, and nothing in front of the cameras but
+ * the markers. The head moves to each camera in turn, also to the camera of the other nozzle, which
+ * is the measurement that separates the nozzle spacing error from the camera displacement. Nothing is
+ * written during the run, so a run costs nothing but time and can be repeated until the numbers stop
+ * moving.
+ *
+ * How it measures is set in the text of this script, in the options below, and not in any dialog: the
+ * repeats, the frames per shot, the Z and C sweeps, and the limits a run has to satisfy to call itself
+ * valid. The dialog at the end is only about whether to keep the answer.
+ *
+ * When it finishes it asks whether the measured displacement should be written into machine.xml;
+ * saying no leaves the machine exactly as it was. Saying yes runs the rest of the loop as well: the
+ * displacement is written, the nozzle tips are calibrated again (their runout circles have absorbed
+ * where the cameras used to claim to be), and the whole measurement is taken a second time so that
+ * the two run directories are the machine before and after. The second one is the verdict: its
+ * displacement should be near zero and the tip centres should have come down towards the runout of
+ * the tips themselves.
+ *
+ * The report and the CSV files go to <configurationDirectory>/displacement/<timestamp>/; that
+ * directory also gets the machine.xml as it was when the run started, so a later run can be compared
+ * against an earlier one. Read the report before believing any single number: the fit residual is the
+ * machine's own consistency check, and a large one means the measurement is not measuring what the
+ * model thinks it is.
+ *
+ * The Z sweep tilts nothing but changes the defocus; a real tilt of a camera shows as a displacement
+ * that walks with it. The C sweep only makes sense with applyStoredAxisOffsets off, where the runout
+ * of the tip is not compensated and has to be averaged out over a full cycle.
+ */
+import org.openpnp.machine.reference.ReferenceNozzle;
+import org.openpnp.machine.reference.vision.DisplacementCheck;
+import org.openpnp.model.Configuration;
+import javax.swing.JOptionPane;
+
+/*
+ * Yes or No, with the button to press by default chosen here rather than by Swing. There is no six
+ * argument showConfirmDialog() ending in an initial value - the six argument one takes an Icon - so the
+ * question goes through showOptionDialog() with the buttons given explicitly. That returns the index in
+ * that array, so 0 is yes and anything else, including the window being closed, is no.
+ */
+askYesNo(question, messageType, yesByDefault) {
+    buttons = new String[]{"Yes", "No"};
+    initial = yesByDefault ? "Yes" : "No";
+    answer = JOptionPane.showOptionDialog(null, question, "Camera displacement",
+            JOptionPane.YES_NO_OPTION, messageType, null, buttons, initial);
+    return answer == 0;
+}
+
+options = new DisplacementCheck.Options();
+options.repeats = 2;
+// The camera noise of a single tip silhouette is of the same order as the displacement being
+// measured, so every shot is detected on several frames and averaged. The scatter of those frames
+// is reported on its own, it is the noise floor of the vision.
+options.framesPerShot = 8;
+// The lamps on this machine take a few milliseconds to strike, so the light is switched on once for
+// a whole shot and allowed to burn before the first frame. Without this the vision pipeline switches
+// the light on and off around every single frame and every frame is exposed while the lamp is still
+// coming up, which is a flicker you can see with the eye and which the detector does not report.
+options.lightWarmupMs = 50;
+// A frame with less contrast than this is the light not being up or the lens covered; the shot is
+// retried and then dropped rather than fitted to noise.
+options.minImageStdDev = 5.0;
+options.crossedMatrix = true;
+options.batchCheck = true;
+options.applyStoredAxisOffsets = true;
+options.suppressAdvancedCalibration = false;
+options.saveImages = true;
+// Set to true to write the measured displacement without asking, e.g. from a scheduled check. The
+// script also offers the write in a dialog when the run is through.
+options.writeDisplacement = false;
+// Every frame of every shot, numbered _f0 ... , plus one row per frame in frames.csv with the instant
+// the camera says that frame was taken. The first run had shots whose eight "frames" were the same
+// picture eight times, and only this shows it. Takes a few hundred MB, delete when read.
+options.saveFrames = true;
+// The three limits the report checks itself against. They are not machine settings yet (that is
+// Stage 3 of the plan), so they are here where a run can raise them without a recompile.
+options.maxResidualMm = 0.05;
+// How far the shots of one single repeat may fail to close. Within a repeat the head is one rigid
+// body, so this is geometry and not scatter: it is the number that catches a bad shot.
+options.maxClosureMm = 0.05;
+options.maxSpreadMm = 0.02;
+options.maxTiltMmPerMm = 0.02;
+// The runout of one tip seen by two cameras is only the same object if both cameras see it equally
+// sharp. A defocused camera measures the middle of the tip's penumbra instead of the tip, and that is
+// a systematic no averaging removes. A ratio of 2.5 is a warning, 1.0 would be both cameras equally
+// sharp.
+options.maxFocusRatio = 2.5;
+// Pictures of the tip at known machine offsets, for measuring the true pixel size of every camera
+// afterwards. The commanded move is machine millimetres and has nothing to do with how a camera's own
+// calibration scales its pixels, so if the two advanced calibrations disagree about pixel size then
+// every crossed shot carries that disagreement, and a few percent of an off centre tip distance is
+// exactly the size of the displacement being looked for. Set to 0 to switch off.
+options.pixelScaleProbeMm = 1.0;
+// An up looking camera sees several circles in one nozzle tip: the bright specular ring, the wider
+// penumbra around it, and in the very middle the vacuum hole, whose edge is the tip wall itself. The
+// circle detector locks onto whichever diameter it is handed, so 0 means "measure what the nozzle tip
+// calibration is configured for" while e.g. 0.22 means "measure the vacuum hole". Report which one a
+// run measured under "Detection:". Only worth changing once both cameras are focused, because a hole
+// of a dozen pixels is the first thing a defocused lens erases.
+options.holeDiameterMm = 0.0;
+// BeanShell is picky about array literals into a field, so build them the long way.
+// Measured at three Z levels: the slope of the result over Z is the camera tilt, and a value that
+// does not move with Z is one that was not just a defocus artefact. The report also prints the frame
+// sharpness against these levels, so widen the span (say -0.6 to +0.6) when the question is whether a
+// camera is focused for another height than the one the machine shoots at.
+zOffsets = new double[3];
+zOffsets[0] = -0.3;
+zOffsets[1] = 0.0;
+zOffsets[2] = 0.3;
+options.zOffsetsMm = zOffsets;
+cAngles = new double[1];
+cAngles[0] = 0.0;
+options.cAngles = cAngles;
+options.directory = null;
+
+if (!machine.isEnabled()) {
+    System.out.println("displacement check: enable the machine first, the cameras need their lights.");
+}
+else if (!machine.isHomed()) {
+    System.out.println("displacement check: home the machine first.");
+}
+else {
+    start = System.currentTimeMillis();
+    result = DisplacementCheck.run(options);
+    System.out.println(result.report);
+    System.out.println("displacement check: " + ((System.currentTimeMillis() - start) / 1000)
+            + " s, files in " + result.directory);
+    if (!result.valid) {
+        System.out.println("displacement check: NOT VALID - see the PROBLEM lines above.");
+    }
+
+    // The displacement is a difference between the cameras and can only be measured as one, so what
+    // is worth keeping from a run is that difference. A run does not store it by itself: the machine
+    // goes on claiming where it always claimed the cameras were until somebody says otherwise, here.
+    // Writing it moves the cameras, and the nozzle tip runout calibration has absorbed where the
+    // cameras used to claim to be, so the tips are calibrated again as part of saying yes, and the
+    // measurement is taken once more to show what the write was worth.
+    if (result.conditions.size() > 0) {
+        beforeRunout = DisplacementCheck.describeRunout(result);
+        if (result.valid) {
+            question = "Measured displacement:\n\n"
+                    + DisplacementCheck.describeDisplacement(result)
+                    + "\nWrite that into machine.xml?\n\n"
+                    + "Yes also calibrates the nozzle tips again, because their runout circles have"
+                    + " absorbed where the cameras used to claim to be, and then measures everything a"
+                    + " second time so the two run directories are the machine before and after. That"
+                    + " is a few minutes of head movement.\n\nNo leaves the machine exactly as it was.";
+            answer = askYesNo(question, JOptionPane.QUESTION_MESSAGE, true);
+        }
+        else {
+            // The check has said in as many words that it does not believe its own number, and that
+            // number is what is about to be stored, so this is not a question to answer by default.
+            question = "THIS RUN IS NOT VALID.\n\n"
+                    + DisplacementCheck.describeDisplacement(result)
+                    + "\nThe check does not believe this number, and writing it moves the cameras, so"
+                    + " every part placed afterwards would land further off than the machine thinks."
+                    + "\n\nRead the PROBLEM lines in\n" + result.directory
+                    + "\nbefore deciding. Write it anyway?";
+            answer = askYesNo(question, JOptionPane.WARNING_MESSAGE, false);
+        }
+        if (answer) {
+            try {
+                // Somebody has just been shown the verdict and said write, which is what the flag is
+                // for. An unattended run gets no such confirmation, so the flag stays off there and
+                // an invalid proposal is refused.
+                options.forceWriteDisplacement = true;
+                written = DisplacementCheck.writeDisplacement(result, options);
+                for (i = 0; i < written.size(); i = i + 1) {
+                    System.out.println("displacement written: " + written.get(i));
+                }
+            }
+            catch (w) {
+                System.out.println("displacement check: " + w);
+                written = null;
+            }
+            if (written != null && written.size() > 0) {
+                System.out.println("displacement check: the write itself has now reset the runout"
+                        + " calibration of every nozzle tip on the machine, not only the ones measured"
+                        + " here. The loop calibrates the loaded ones; tips that stay in the rack need"
+                        + " calibrating before a job puts them on a nozzle.");
+                // From here on the machine has moved on paper while the tips still carry where the
+                // cameras used to claim to be, which is the one state worse than either end, so a
+                // failure in it is said out loud rather than left as a stack trace that the operator
+                // has to interpret.
+                try {
+                    // A runout circle is fitted against one camera and its centre therefore carries
+                    // the position that camera claims for itself, which is how a tip whose runout is a
+                    // few hundredths of a millimetre ends up with a centre in the tenths. With the
+                    // displacement stored, the circle can be fitted again without that in it.
+                    calibrated = 0;
+                    nozzles = machine.getHeads().get(0).getNozzles();
+                    for (i = 0; i < nozzles.size(); i = i + 1) {
+                        nozzle = nozzles.get(i);
+                        if (! (nozzle instanceof ReferenceNozzle)) {
+                            continue;
+                        }
+                        nozzleTip = nozzle.getCalibrationNozzleTip();
+                        if (nozzleTip == null || ! nozzleTip.getCalibration().isEnabled()) {
+                            continue;
+                        }
+                        try {
+                            System.out.println("displacement check: calibrating the nozzle tip of "
+                                    + nozzle.getName() + " ...");
+                            nozzleTip.getCalibration().calibrate((ReferenceNozzle) nozzle);
+                            calibrated = calibrated + 1;
+                        }
+                        catch (e1) {
+                            System.out.println("displacement check: nozzle tip calibration of "
+                                    + nozzle.getName() + " failed: " + e1);
+                        }
+                    }
+                    if (calibrated == 0) {
+                        System.out.println("displacement check: no nozzle tip calibrated, calibrate"
+                                + " them by hand before believing the numbers below.");
+                    }
+                    Configuration.get().save();
+                    System.out.println("displacement check: machine.xml saved with the new tips.");
+
+                    after = DisplacementCheck.run(options);
+                    System.out.println(after.report);
+                    System.out.println("displacement check BEFORE the write:\n" + beforeRunout
+                            + "displacement check AFTER write and recalibration:\n"
+                            + DisplacementCheck.describeRunout(after));
+                    System.out.println("displacement check: displacement left over now\n"
+                            + DisplacementCheck.describeDisplacement(after));
+                    // Whatever the second run thinks of itself, it ends with a word to the operator.
+                    // A long loop that falls off the end without a word is indistinguishable from a
+                    // crash, and the one run out of three that is not valid is exactly the run that
+                    // most needs saying something.
+                    question = "Written, tips recalibrated, measured again.\n\n"
+                            + "Before the write:\n" + beforeRunout
+                            + "\nAfter:\n" + DisplacementCheck.describeRunout(after)
+                            + "\nDisplacement:\n" + DisplacementCheck.describeDisplacement(after)
+                            + "\nThe pair residual is how far today's measurement is from what the"
+                            + " tip's runout calibration claims, and it should now be about the model"
+                            + " pk column, which was its error on the day it was fitted. The"
+                            + " displacement should be near zero, since the write took it."
+                            + "\n\nFiles in " + after.directory;
+                    if (after.valid) {
+                        answer = askYesNo(question + "\n\nWrite what is left too?",
+                                JOptionPane.PLAIN_MESSAGE, false);
+                        if (answer) {
+                            options.forceWriteDisplacement = true;
+                            written = DisplacementCheck.writeDisplacement(after, options);
+                            for (i = 0; i < written.size(); i = i + 1) {
+                                System.out.println("displacement written: " + written.get(i));
+                            }
+                        }
+                    }
+                    else {
+                        JOptionPane.showMessageDialog(null, question, "Camera displacement",
+                                JOptionPane.WARNING_MESSAGE);
+                    }
+                }
+                catch (e) {
+                    System.out.println("displacement check: THE DISPLACEMENT IS WRITTEN BUT THE NOZZLE"
+                            + " TIPS ARE NOT CALIBRATED. Until they are, the centre of their runout"
+                            + " circles still carries where the cameras used to claim to be, which is"
+                            + " worse than either state on its own. Calibrate them, then run this"
+                            + " again. The failure was: " + e);
+                }
+            }
+        }
+    }
+}

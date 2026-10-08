@@ -917,6 +917,43 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
     }
 
     /*
+     * The axis offset as stored, for any caller that wants to read it rather than apply it. Unlike
+     * getCalibratedCameraOffset() this does not ask whether the camera is the one paired to the
+     * nozzle, and it does not care whether the compensation is enabled: it is what the calibration
+     * measured, which is exactly what a report comparing against it needs.
+     */
+    public Location getCalibratedAxisOffset(ReferenceNozzle nozzle) {
+        if (! isCalibrated(nozzle)) {
+            return new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
+        }
+        return getRunoutCompensation(nozzle).getAxisOffset().convertToUnits(LengthUnit.Millimeters);
+    }
+
+    /*
+     * How well the stored model fits the tip positions it was fitted to, {peak, rms} in millimetres,
+     * or null when there is nothing to say. This is the error the offset already had on the day it was
+     * calibrated, before any tip wore or reseated, and a caller that applies the offset has to carry it
+     * too. The non-color model based algorithms are the only ones that know; the simple ones answer
+     * null rather than a flattering zero.
+     */
+    public double[] getCalibratedRunoutFitError(ReferenceNozzle nozzle) {
+        RunoutCompensation compensation = getRunoutCompensation(nozzle);
+        if (! (compensation instanceof ModelBasedRunoutCompensation)) {
+            return null;
+        }
+        ModelBasedRunoutCompensation model = (ModelBasedRunoutCompensation) compensation;
+        if (model.getPeakError() == null || model.getRmsError() == null) {
+            return null;
+        }
+        return new double[] {
+                new Length(model.getPeakError(), model.units).convertToUnits(LengthUnit.Millimeters)
+                        .getValue(),
+                new Length(model.getRmsError(), model.units).convertToUnits(LengthUnit.Millimeters)
+                        .getValue(),
+        };
+    }
+
+    /*
      * The axis offset determined in runout calibration can be applied as a tool specific camera offset.
      */
     public Location getCalibratedCameraOffset(ReferenceNozzle nozzle, Camera camera) {
@@ -935,8 +972,52 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
     }
 
     private Location findCircle(ReferenceNozzle nozzle, Location measureLocation, boolean calibrateCamera) throws Exception {
-        Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
+        return findCircle(nozzle, VisionUtils.getBottomVisionCamera(nozzle), measureLocation, calibrateCamera);
+    }
+
+    /**
+     * Measure this nozzle tip with one specific up-looking camera. This is the same measurement the
+     * runout calibration makes, but for any camera and not only for the one paired to the nozzle,
+     * which is how {@link org.openpnp.machine.reference.vision.DisplacementCheck} can see N1 in Cam2
+     * and vice versa. The background calibration bookkeeping is left alone: a foreign camera's
+     * background is not this calibration's business.
+     *
+     * @param measureLocation the location the nozzle has been moved to, without the tool specific
+     *            calibration offset applied.
+     * @return the offset of the tip from the camera's optical axis in machine units, or null when
+     *         nothing (or more than one thing) was detected.
+     */
+    public Location measureTip(ReferenceNozzle nozzle, Camera camera, Location measureLocation) throws Exception {
+        return findCircle(nozzle, camera, measureLocation, true, null);
+    }
+
+    /**
+     * As {@link #measureTip(ReferenceNozzle, Camera, Location)} but looking for a circle of a given
+     * diameter instead of the calibrated tip diameter. What the tip looks like to an up-looking
+     * camera is not one circle but several: the bright specular ring, the penumbra and, at the very
+     * middle, the vacuum hole through the tip. Which of them a circle detector locks onto is decided
+     * by the diameter it is told to expect, so a caller that wants the hole rather than the ring has
+     * to say so. The hole is the one feature whose edge is made by the tip wall itself and not by
+     * where the lamp happens to shine.
+     *
+     * @param diameter the circle to look for, or null for the calibrated tip diameter.
+     */
+    public Location measureTip(ReferenceNozzle nozzle, Camera camera, Location measureLocation,
+            Length diameter) throws Exception {
+        return findCircle(nozzle, camera, measureLocation, true, diameter);
+    }
+
+    private Location findCircle(ReferenceNozzle nozzle, Camera camera, Location measureLocation,
+            boolean calibrateCamera) throws Exception {
+        return findCircle(nozzle, camera, measureLocation, calibrateCamera, null);
+    }
+
+    private Location findCircle(ReferenceNozzle nozzle, Camera camera, Location measureLocation,
+            boolean calibrateCamera, Length diameter) throws Exception {
         try (CvPipeline pipeline = getPreparedPipeline(camera, nozzle, measureLocation)) {
+            if (diameter != null) {
+                pipeline.setProperty("nozzleTip.diameter", diameter);
+            }
             
             pipeline.process();
             List<Location> locations = new ArrayList<>();
