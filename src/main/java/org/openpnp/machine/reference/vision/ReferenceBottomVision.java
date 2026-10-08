@@ -170,8 +170,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         // camera integrated it. Ask the frame, not whoever captured it.
         requireStillFrame(preCapturedShot, camera, part, nozzle);
         PartAlignmentOffset offsets;
-        if ((bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
-                || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn)) {
+        if (usesPreRotate(bottomVisionSettings)) {
             offsets = findOffsetsPreRotate(part, boardLocation, placement, nozzle, camera, bottomVisionSettings, skipMovement, preCapturedShot);
         }
         else {
@@ -227,19 +226,11 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         }
 
         Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
-        double wantedAngle = 0.0;
-        if ((bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
-                || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn)) {
-
-            wantedAngle = placement.getLocation().getRotation();
-            if (boardLocation != null) {
-                wantedAngle = Utils2D.calculateBoardPlacementLocation(boardLocation, placement.getLocation())
-                        .getRotation();
-            }
-            wantedAngle = Utils2D.angleNorm(wantedAngle, 180.);
-        }
-        
-        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, wantedAngle);
+        // The angle the part is photographed at, which is the angle it is held at: its placement angle
+        // when it is aligned pre-rotate and 0 when it is not. See #shotRotationOf(Part, BoardLocation,
+        // Placement).
+        Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle,
+                shotRotationOf(part, boardLocation, placement));
 
         return wantedLocation;
     }
@@ -308,12 +299,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     private PartAlignmentOffset findOffsetsPreRotate(Part part, BoardLocation boardLocation,
             Placement placement, Nozzle nozzle, Camera camera, BottomVisionSettings bottomVisionSettings,
             boolean skipMovement, CapturedShot preCapturedShot) throws Exception {
-        double wantedAngle = placement.getLocation().getRotation();
-        if (boardLocation != null) {
-            wantedAngle = Utils2D.calculateBoardPlacementLocation(boardLocation, placement.getLocation())
-                    .getRotation();
-        }
-        wantedAngle = Utils2D.angleNorm(wantedAngle, 180.);
+        double wantedAngle = wantedRotationOf(boardLocation, placement);
         // Wanted location.
         Location wantedLocation = getCameraLocationAtPartHeight(part, camera, nozzle, wantedAngle, skipMovement);
 
@@ -331,24 +317,25 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                         wantedLocation, nozzleLocation, bottomVisionSettings, skipMovement, preCapturedShot);
                 rect = geometry.rect;
 
-                // For parallel alignment with pre-captured shots, use displacement delta from the shot
-                if (preCapturedShot instanceof PreCapturedPlacement) {
-                    Location displacement = ((PreCapturedPlacement) preCapturedShot).getIntendedDisplacementDelta();
-                    if (displacement != null) {
-                        String cameraName = ((PreCapturedPlacement) preCapturedShot).getCamera().getName();
-                        Logger.debug("{} displacement (parallel), using displacement delta {}", cameraName, displacement);
-                        nozzleLocation = nozzleLocation.subtract(displacement);
-                    }
-                }
-                else {
-                    // The image may have been taken without the nozzle being exactly on the shot
-                    // location, see preparePipeline(). Compensate what is left over.
-                    Location displacement = pipeline.getShotDisplacement(pipeline.getCurrentShotIndex());
-                    if (displacement != null) {
-                        nozzleLocation = nozzleLocation.subtract(displacement);
-                        Logger.debug("Bottom vision part {} displacement (sequential) {} compensated, "
-                                + "nozzle location becomes {}", part.getId(), displacement, nozzleLocation);
-                    }
+                // The image may have been taken without the nozzle being exactly on the shot location:
+                // the sequential path records the difference of the move it skipped, the parallel capture
+                // records the residual of the frame it took. They arrive from different places - the
+                // pipeline for one, the shot for the other - but they are one quantity, wanted minus
+                // actual, and they are subtracted here in one place rather than in two branches that
+                // could disagree.
+                Location displacement = preCapturedShot instanceof PreCapturedPlacement
+                        ? ((PreCapturedPlacement) preCapturedShot).getShotDisplacement()
+                        : pipeline.getShotDisplacement(pipeline.getCurrentShotIndex());
+                if (displacement != null) {
+                    displacement = displacement.convertToUnits(nozzleLocation.getUnits());
+                    nozzleLocation = nozzleLocation.subtract(displacement);
+                    Logger.debug("Bottom vision part {} displacement {} compensated on {}, nozzle location"
+                                    + " becomes {}", part.getId(), displacement,
+                            preCapturedShot instanceof PreCapturedPlacement
+                                    ? ((PreCapturedPlacement) preCapturedShot).getCamera().getName()
+                                            + " (parallel)"
+                                    : "the sequential shot",
+                            nozzleLocation);
                 }
                 Logger.debug("Bottom vision part {} result rect {}", part.getId(), rect);
 
@@ -818,14 +805,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Get the shot location, but adjusted by the adjustedNozzleLocation.
             Location shotLocationTemp = composite.getShotLocation(shot)
                     .addWithRotation(adjustedNozzleLocation.subtractWithRotation(wantedLocation));
-            if (nozzle != null && Configuration.get().getMachine().isDisplacementEnabled()) {
-                // Adjust 'shot Z' to nozzle balance level. Note the Length variant, the plain
-                // double value of the balance level would be interpreted in the units of the shot
-                // location.
-                shotLocationTemp = shotLocationTemp.deriveLengths(null, null,
-                        Configuration.get().getMachine().getBalanceLevel(), null);
-            }
-            final Location shotLocation = shotLocationTemp;
+            final Location shotLocation = nozzle == null ? shotLocationTemp
+                    : withBalanceLevelZ(shotLocationTemp);
             final boolean skipMove = skipMovement;
 
             pipeline.new PipelineShot() {
@@ -1007,7 +988,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
         // A pre-captured image was taken without moving the nozzle onto the shot location, so the
         // remaining displacement must stay within the limits that can be compensated by vision.
         if (preCapturedShot instanceof PreCapturedPlacement) {
-            displacementCheck((PreCapturedPlacement) preCapturedShot);
+            displacementCheck((PreCapturedPlacement) preCapturedShot, bottomVisionSettings);
         }
         
         return new PipelineGeometry(resultRect, geometryResult);
@@ -1047,10 +1028,14 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      * remaining displacement can still be compensated by the vision analysis instead of moving the
      * nozzle.
      *
-     * @param preCapturedPlacement the captured shot including the intended displacement delta.
+     * @param preCapturedPlacement the captured shot, whose displacement is the residual between where it
+     *            wanted to be and where the nozzle was read at the exposure.
+     * @param bottomVisionSettings the part's inherited vision settings, which decide whether the
+     *            part is even aligned in a way that can make use of a displaced shot.
      */
-    protected void displacementCheck(PreCapturedPlacement preCapturedPlacement) {
-        Location displacement = preCapturedPlacement.getIntendedDisplacementDelta();
+    protected void displacementCheck(PreCapturedPlacement preCapturedPlacement,
+            BottomVisionSettings bottomVisionSettings) {
+        Location displacement = preCapturedPlacement.getShotDisplacement();
         if (displacement == null) {
             return;
         }
@@ -1076,13 +1061,17 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                             : preCapturedPlacement.getCamera().getName());
         }
 
-        if (distance.compareTo(new Length(0, distance.getUnits())) != 0 && !isPreRotate()) {
+        if (distance.compareTo(new Length(0, distance.getUnits())) != 0
+                && !usesPreRotate(bottomVisionSettings)) {
             // Only the pre-rotate path applies the displacement delta to the nozzle location, so a
             // displaced shot would be evaluated as if the nozzle had been exactly on the shot
-            // location.
-            Logger.warn("Bottom vision of nozzle {} uses post-rotate but the pre-captured image on "
-                    + "camera {} is displaced by {}. The displacement is not compensated for, "
-                    + "enable Pre-Rotate or check the camera placement.",
+            // location. A parallel batch is meant to send a post-rotate part sequential instead of
+            // capturing this picture at all (D10), so arriving here means a part slipped past that
+            // refusal and is being placed with an uncompensated offset.
+            Logger.error("Bottom vision of nozzle {} uses post-rotate but the pre-captured image on "
+                    + "camera {} is displaced by {}. The displacement cannot be compensated for, so "
+                    + "this part is being placed wrong; the parallel alignment should not have taken "
+                    + "the picture.",
                     preCapturedPlacement.getNozzle() == null ? "?" 
                             : preCapturedPlacement.getNozzle().getId(),
                     preCapturedPlacement.getCamera() == null ? "?" 
@@ -1160,6 +1149,119 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
 
     public void setPreRotate(boolean preRotate) {
         this.preRotate = preRotate;
+    }
+
+    /**
+     * Whether the part is turned to its placement angle before its picture is taken, as decided by
+     * the part's own inherited vision settings on top of the machine default. Everything that has to
+     * know whether a shot can be taken at rotation 0 and straightened out afterwards must ask this
+     * instead of {@link #isPreRotate()}, because a part can override the machine either way.
+     *
+     * @param bottomVisionSettings the part's inherited vision settings.
+     * @return true if the part is aligned pre-rotate.
+     */
+    public boolean usesPreRotate(BottomVisionSettings bottomVisionSettings) {
+        return (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.Default && preRotate)
+                || (bottomVisionSettings.getPreRotateUsage() == PreRotateUsage.AlwaysOn);
+    }
+
+    /**
+     * Whether the part is aligned pre-rotate, looked up from the part itself.
+     *
+     * @param part the part to ask for.
+     * @return true if the part is aligned pre-rotate.
+     */
+    public boolean usesPreRotate(Part part) {
+        BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
+        if (bottomVisionSettings == null) {
+            // Nothing is inherited by a part that cannot be resolved, so fall back to the machine
+            // default rather than invent a decision of its own.
+            return preRotate;
+        }
+        return usesPreRotate(bottomVisionSettings);
+    }
+
+    /**
+     * The angle the nozzle has to be holding the part at for the picture of it to be the one the
+     * placement asks for: the placement angle as its board transforms it, folded into -180..180.
+     *
+     * <p>Three things have to agree on this one number. The alignment that turns the nozzle before it
+     * photographs it needs it to turn to; the head of a parallel batch needs it, because it turns the head
+     * once for the whole job and every frame of that job is then exposed at that angle; and the shot
+     * location recorded with a frame has to carry it, because the analysis reads the angle the part shows
+     * in the picture against this angle, and a recorded rotation of 0 for a head standing at -180 is not a
+     * description of the frame it belongs to but the difference between the two is (E7).</p>
+     *
+     * @param boardLocation the board the placement is on, or null when it is not on one.
+     * @param placement the placement being aligned.
+     * @return the rotation the part is to be held at, in degrees.
+     */
+    public static double wantedRotationOf(BoardLocation boardLocation, Placement placement) {
+        Location placementLocation = placement.getLocation();
+        if (boardLocation != null) {
+            placementLocation = Utils2D.calculateBoardPlacementLocation(boardLocation,
+                    placementLocation);
+        }
+        return Utils2D.angleNorm(placementLocation.getRotation(), 180.);
+    }
+
+    /**
+     * The rotation a shot of this part is taken at: its placement angle as its board transforms it when
+     * it is aligned pre-rotate, and 0 when it is aligned post-rotate, because aligning post-rotate is
+     * exactly the decision to photograph the part unturned and straighten it out afterwards.
+     *
+     * <p>On its own this is a decision and not a measurement, and it is worth being clear about what
+     * makes it true. It is the same number that {@link #getLocation} hands to the nozzle pre-rotation
+     * step, {@code PrerotateAllNozzlesForAlign}, and that step is what actually turns every nozzle of a
+     * parallel batch to its own angle on the way to the cameras; the head move itself turns only the one
+     * nozzle it was made for. Take that step away - {@code preRotateAllNozzles} is switchable - and the
+     * angle is a claim about the other nozzles rather than a measurement of them, which is exactly the
+     * claim E7 was about. It is asked of the shot location for the same reason: the analysis reads the
+     * angle the part shows in the picture against this angle, so the frame and the number recorded with
+     * it have to be talking about the same turn.</p>
+     *
+     * @param part the part to be photographed.
+     * @param boardLocation the board its placement is on, or null when it is not on one.
+     * @param placement the placement it is to be placed at.
+     * @return the rotation the shot is taken at, in degrees.
+     */
+    public double shotRotationOf(Part part, BoardLocation boardLocation, Placement placement) {
+        return usesPreRotate(part) ? wantedRotationOf(boardLocation, placement) : 0.;
+    }
+
+    /**
+     * Put the Z of a shot location at the machine's balance level, which is where a head with two Z
+     * axes driven by one rocker has to take its pictures.
+     *
+     * <p>The camera wants the part at its own focal height and
+     * {@link #getCameraLocationAtPartHeight(Part, Camera, Nozzle, double, boolean)} says so. On a head
+     * whose Z axes are a cam pair - a
+     * {@link org.openpnp.machine.reference.axis.ReferenceCamCounterClockwiseAxis} and a
+     * {@link org.openpnp.machine.reference.axis.ReferenceCamClockwiseAxis} turning one motor - only one
+     * nozzle can be where its camera wants it, because the other travels the same distance the other
+     * way. The balance point is the one Z where the two agree, and it is the compromise the sequential
+     * path has always made when displacement is on.</p>
+     *
+     * <p>It is also what makes a Z limit mean anything on such a head: standing at the balance, both
+     * nozzles report the same height, so the difference a limit is set against is the difference
+     * between a shot and its own wanted Z rather than the difference between two opposite senses of
+     * up, which is about 0.87mm on {@code pn52} and therefore larger than any limit anyone would set.
+     * The focus is bought the same way for both cameras instead of perfectly for one and 0.87mm adrift
+     * for the other.</p>
+     *
+     * @param shotLocation where the shot wanted to be taken from.
+     * @return the same location with its Z replaced by the balance level, or the location itself when
+     *         displacement is off, because nothing is then displaced and every nozzle is moved to where
+     *         its camera wants it in any case.
+     */
+    public Location withBalanceLevelZ(Location shotLocation) {
+        Machine machine = Configuration.get().getMachine();
+        if (!machine.isDisplacementEnabled()) {
+            return shotLocation;
+        }
+        // Note the Length variant: the plain double value of the balance level would be interpreted
+        // in the units of the shot location.
+        return shotLocation.deriveLengths(null, null, machine.getBalanceLevel(), null);
     }
 
     public int getMaxVisionPasses() {
@@ -1636,27 +1738,19 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      * This method captures the image without processing the pipeline, allowing true parallelism
      * when combined with background thread processing.
      * 
-     * The displacement is calculated as the actual offset from the current nozzle position
-     * to the target shot location. This includes both the camera's configured displacement
-     * AND the nozzle tip runout error.
+     * The displacement of the shot is not this method's to know: it is the residual between the shot
+     * location and the nozzle position read at the exposure, measured once the frame is in hand.
      * 
      * @param part The part being aligned
      * @param camera The camera to use for capture
      * @param nozzle The nozzle performing the capture
      * @param wantedLocation The location where capture should occur
-     * @return PreCapturedPlacement containing the captured image and displacement delta
+     * @return PreCapturedPlacement containing the captured image and where the nozzle was for it
      * @throws Exception If capture fails
      */
     public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation) throws Exception {
-        return captureImageOnly(part, camera, nozzle, wantedLocation, false,
-                FrameProvenance.UNKNOWN);
-    }
-
-    public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
-            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
-        return captureImageOnly(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
-                FrameProvenance.UNKNOWN);
+        return captureImageOnly(part, camera, nozzle, wantedLocation, FrameProvenance.UNKNOWN);
     }
 
     /**
@@ -1674,9 +1768,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      *            recorded it.
      */
     public PreCapturedPlacement captureImageOnly(Part part, Camera camera, 
-            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs)
+            Nozzle nozzle, Location wantedLocation, long arrivalAtMs)
             throws Exception {
-        return capturePreparedFrame(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+        return capturePreparedFrame(part, camera, nozzle, wantedLocation,
                 (earliestFrameHandedTo) -> {
             long tCapture = NanosecondTime.getRuntimeMilliseconds();
             BufferedImage capturedBufferedImage = camera.capture();
@@ -1728,10 +1822,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      *            starts holds the head up for a bounded time instead of stopping the job.
      */
     public PreCapturedPlacement captureImageFromSettlingWindow(Part part, Camera camera,
-            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs,
+            Nozzle nozzle, Location wantedLocation, long arrivalAtMs,
             AbstractSettlingCamera settlingCamera, long settleEpochBefore, long deadlineAtMs)
             throws Exception {
-        return capturePreparedFrame(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+        return capturePreparedFrame(part, camera, nozzle, wantedLocation,
                 (earliestFrameHandedTo) -> grabUntilTheStillWindow(camera, settlingCamera,
                         settleEpochBefore, arrivalAtMs, deadlineAtMs, earliestFrameHandedTo));
     }
@@ -1780,7 +1874,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      * judge, the alignment corrects that anyway.
      */
     private PreCapturedPlacement capturePreparedFrame(Part part, Camera camera, Nozzle nozzle,
-            Location wantedLocation, boolean isFirstNozzleTip, FrameGrab frameGrab) throws Exception {
+            Location wantedLocation, FrameGrab frameGrab) throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
 
         if (!isEnabled() || !bottomVisionSettings.isEnabled()) {
@@ -1808,8 +1902,10 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // The light was already turned on in moveNozzlesToAlignmentPosition() before its
             // waitForCompletion(), so that the M810 was queued before the M400 and the light is on by
             // the time anything is captured here.
-            Location displacementDelta = displacementDelta(camera, nozzle, wantedLocation,
-                    isFirstNozzleTip);
+            //
+            // What this shot is displaced by is not decided here: it is the residual between this shot
+            // location and the nozzle position read after the frame, which does not exist until the frame
+            // has been taken. See requireDisplacement() below.
 
             final PreCheckResult preCheckResult
                     = bottomVisionSettings.getPreCheckAction() != PreCheckAction.Disabled
@@ -1840,6 +1936,11 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             };
 
             GrabbedFrame grabbed = frameGrab.grab(earliestFrameHandedTo);
+            // Read where the nozzle is the instant the frame is in hand. For a frame taken after a stop
+            // this is where the tip was; for a grab-ahead frame the head was still on its way past, which
+            // is precisely why the provenance and not this reading decides whether the frame is usable.
+            final Location actualAtCapture = nozzle.getLocation();
+            requireDisplacement(part, camera, nozzle, wantedLocation, actualAtCapture);
             Mat capturedImage = OpenCvUtils.toMat(grabbed.image);
             FrameProvenance provenance = grabbed.provenance;
             if (preCheckResult != null) {
@@ -1877,8 +1978,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             }
 
             PreCapturedPlacement capturedShot = new PreCapturedPlacement(
-                    camera, nozzle, capturedImage, wantedLocation, displacementDelta, provenance);
+                    camera, nozzle, capturedImage, wantedLocation, provenance);
             capturedShot.setPreCheckResult(preCheckResult);
+            capturedShot.setActualAtCapture(actualAtCapture);
             return capturedShot;
         }
         finally {
@@ -1888,39 +1990,34 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
     }
 
     /**
-     * How far the part has moved on the camera between the place the head was taken to and the place
-     * this nozzle's tip is really at: the calibrated camera offset of this nozzle tip, plus the runout
-     * of that tip at the wanted rotation. The first nozzle tip is the one the head was positioned for,
-     * so for it the displacement is nothing at all.
+     * Make sure the shot about to be handed to the analysis has a displacement to be analysed with, and
+     * write down what it is.
+     *
+     * There is exactly one answer, measured: where this shot wanted to be minus where the machine said
+     * the nozzle was the instant the frame was exposed, which is what the picture shows. The other answer
+     * used to live here, predicted out of the nozzle tip calibration and chosen by a machine setting. It
+     * looked the runout up at the rotation of 0 that every pre-captured shot used to carry (E7) and knew
+     * nothing of the mismatch between the nozzle spacing and the camera spacing (E4), so on the machine
+     * that decided this it was a constant while the measurement was a circle. Both it and the setting are
+     * gone; a shot whose position was never read therefore has no displacement at all, and the honest
+     * thing left to do is refuse the shot rather than let the analysis compensate nothing and call the
+     * part aligned. The batch goes sequential, which is what a refused shot always means.
      */
-    private Location displacementDelta(Camera camera, Nozzle nozzle, Location wantedLocation,
-            boolean isFirstNozzleTip) {
-        ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
-        ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
-
-        // The offset between the nozzle tip and the camera, from the nozzle tip runout calibration.
-        Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-        if (calibrationNozzleTip != null
-                && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-            cameraOffset = calibrationNozzleTip.getCalibration()
-                    .getCalibratedCameraOffset(refNozzle, camera);
+    private void requireDisplacement(Part part, Camera camera, Nozzle nozzle,
+            Location wantedLocation, Location actualAtCapture) throws Exception {
+        Location displacement = PreCapturedPlacement.shotDisplacement(wantedLocation,
+                actualAtCapture);
+        if (displacement == null) {
+            throw new Exception("Nozzle "+nozzle.getId()+" position unknown at capture on camera "
+                    +camera.getName()+": the shot of part "
+                    +(part == null ? "?" : part.getId())
+                    +" has no measurable displacement and cannot be aligned from.");
         }
-
-        // The runout of the nozzle tip at the wanted rotation, from the same calibration.
-        Location runoutCompensation = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-        if (calibrationNozzleTip != null
-                && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-            runoutCompensation = calibrationNozzleTip.getCalibration()
-                    .getCalibratedOffset(refNozzle, wantedLocation.getRotation());
-        }
-
-        Location displacementDelta = isFirstNozzleTip
-                ? new Location(LengthUnit.Millimeters, 0, 0, 0, 0)
-                : cameraOffset.add(runoutCompensation);
-        Logger.debug("displacement: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={},"
-                + " displacementDelta={}", isFirstNozzleTip, cameraOffset, runoutCompensation,
-                displacementDelta);
-        return displacementDelta;
+        Logger.debug("Displacement of part {} on camera {} nozzle {}: measured {} (shot wanted {}, nozzle"
+                        + " actually at {}) - a frame the head was stood still for is the only one those"
+                        + " last two mean anything about",
+                part == null ? "?" : part.getId(), camera.getName(), nozzle.getId(),
+                displacement, wantedLocation, actualAtCapture);
     }
 
     /**
@@ -2282,25 +2379,16 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      * capturing the final image. This is used for the "settle camera" in parallel alignment
      * to stabilize the mechanical system before capturing both cameras.
      * 
-     * The method calculates the displacement delta to account for both camera displacement
-     * AND the nozzle tip runout error.
-     * 
      * @param part The part being aligned
      * @param camera The settling camera to use for capture (must support settling)
      * @param nozzle The nozzle performing the capture
      * @param wantedLocation The location where capture should occur
-     * @return PreCapturedPlacement containing the captured image and displacement delta
+     * @return PreCapturedPlacement containing the captured image and where the nozzle was for it
      * @throws Exception If capture fails
      */
     public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
             Nozzle nozzle, Location wantedLocation) throws Exception {
-        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, false,
-                FrameProvenance.UNKNOWN);
-    }
-
-    public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
-            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip) throws Exception {
-        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+        return captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation,
                 FrameProvenance.UNKNOWN);
     }
 
@@ -2313,7 +2401,7 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
      * @param arrivalAtMs when the head was reported at stillstand after moving to the cameras.
      */
     public PreCapturedPlacement captureImageOnlyWithSettle(Part part, Camera camera, 
-            Nozzle nozzle, Location wantedLocation, boolean isFirstNozzleTip, long arrivalAtMs)
+            Nozzle nozzle, Location wantedLocation, long arrivalAtMs)
             throws Exception {
         BottomVisionSettings bottomVisionSettings = getInheritedVisionSettings(part);
         
@@ -2344,36 +2432,9 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
             // Light was already turned on in moveNozzlesToAlignmentPosition() before waitForCompletion()
             // This ensures M810 is queued before M400, so light is guaranteed on when capture happens
             
-            // Calculate the displacement delta: nozzle tip camera offset + nozzle runout compensation
-            // The camera offset comes from Nozzle Tip Runout Calibration (camera offset per nozzle tip)
-            // The nozzle runout compensation comes from Nozzle Tip Runout Calibration at the wanted rotation
-            ReferenceNozzle refNozzle = (ReferenceNozzle) nozzle;
-            ReferenceNozzleTip calibrationNozzleTip = refNozzle.getCalibrationNozzleTip();
-            
-            // Get the camera offset for this nozzle tip (this is the offset between nozzle tip and camera)
-            Location cameraOffset = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-                cameraOffset = calibrationNozzleTip.getCalibration().getCalibratedCameraOffset(refNozzle, camera);
-            }
-            
-            // Get nozzle runout compensation at the wanted rotation angle
-            Location runoutCompensation = new Location(cameraOffset.getUnits(), 0, 0, 0, 0);
-            if (calibrationNozzleTip != null && calibrationNozzleTip.getCalibration().isCalibrated(refNozzle)) {
-                runoutCompensation = calibrationNozzleTip.getCalibration().getCalibratedOffset(refNozzle, wantedLocation.getRotation());
-            }
-            
-            // Combine: displacement delta = camera offset + runout compensation
-            // This should be small (< 2mm in each direction)
-            // For the first nozzle tip, displacement is zero since we're already at the correct position
-            Location displacementDelta;
-            if (isFirstNozzleTip) {
-                displacementDelta = new Location(LengthUnit.Millimeters, 0, 0, 0, 0);
-            }
-            else {
-                displacementDelta = cameraOffset.add(runoutCompensation);
-            }
-            Logger.debug("captureImageOnlyWithSettle: isFirstNozzleTip={}, cameraOffset={}, runoutCompensation={}, displacementDelta={}", 
-                isFirstNozzleTip, cameraOffset, runoutCompensation, displacementDelta);
+            // What this shot is displaced by is decided after the frame, in requireDisplacement(), below.
+            // The block that used to stand here was the same prediction written out again by hand, which is
+            // how two answers to one question came to exist in one file. Both are gone.
             
             // Perform auto-settle and capture - this captures multiple frames until stable
             // The camera must support settling (extend AbstractSettlingCamera)
@@ -2413,6 +2474,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                 BufferedImage capturedBufferedImage = settlingCamera.settleAndCapture(
                     AbstractSettlingCamera.SettleOption.Settle,
                     firstFrameConsumer);
+                final Location actualAtCapture = nozzle.getLocation();
+                requireDisplacement(part, camera, nozzle, wantedLocation, actualAtCapture);
                 Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
                 // What the settling has just demonstrated about this frame. If it demonstrated nothing
                 // - a settling that ran out of time - then this frame is no better than a snapshot
@@ -2445,16 +2508,19 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
                 }
                 
-                // Create a PreCapturedPlacement with the captured image and displacement delta
+                // Create a PreCapturedPlacement from the frame and where the nozzle was for it.
                 PreCapturedPlacement capturedShot = new PreCapturedPlacement(
-                        camera, nozzle, capturedImage, wantedLocation, displacementDelta, provenance);
+                        camera, nozzle, capturedImage, wantedLocation, provenance);
                 capturedShot.setPreCheckResult(preCheckResult);
+                capturedShot.setActualAtCapture(actualAtCapture);
                 return capturedShot;
             }
             else {
                 // Camera doesn't support settling - fall back to regular capture
                 Logger.warn("Camera {} does not support settling, using regular capture", camera.getName());
                 BufferedImage capturedBufferedImage = camera.capture();
+                final Location actualAtCapture = nozzle.getLocation();
+                requireDisplacement(part, camera, nozzle, wantedLocation, actualAtCapture);
                 Mat capturedImage = OpenCvUtils.toMat(capturedBufferedImage);
                 
                 // Turn off light or register with batch operation (if active)
@@ -2465,10 +2531,12 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     Logger.warn("Failed to turn off camera light after pre-capture: {}", e.getMessage());
                 }
                 
-                return new PreCapturedPlacement(
-                        camera, nozzle, capturedImage, wantedLocation, displacementDelta,
+                PreCapturedPlacement capturedShot = new PreCapturedPlacement(
+                        camera, nozzle, capturedImage, wantedLocation,
                         FrameProvenance.quickCapture(arrivalAtMs,
                                 NanosecondTime.getRuntimeMilliseconds()));
+                capturedShot.setActualAtCapture(actualAtCapture);
+                return capturedShot;
             }
         }
         finally {

@@ -92,7 +92,7 @@ public class PreCheckReportTest {
                 wantedLocation = wantedLocation.add(offset);
             }
             MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation.derive(null, null, null, rotation));
-            captured[0] = bottomVision.captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, true);
+            captured[0] = bottomVision.captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation);
             return true;
         });
         return captured[0];
@@ -104,7 +104,7 @@ public class PreCheckReportTest {
             nozzle.pick(part, null);
             Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
             MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
-            captured[0] = bottomVision.captureImageOnly(part, camera, nozzle, wantedLocation, true);
+            captured[0] = bottomVision.captureImageOnly(part, camera, nozzle, wantedLocation);
             return true;
         });
         return captured[0];

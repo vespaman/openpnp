@@ -1,0 +1,588 @@
+/*
+ * Batch residual probe.
+ *
+ * Answers, on the machine and with numbers, the three questions that the plan
+ * docs/design/parallel-bottom-vision/runtime-displacement-plan.md had to leave open:
+ *
+ *   Q1  What does the motion apply, and what is left to the analysis? A nozzle is commanded to the
+ *       location its own camera claims for it, which contains the runout calibration's circle centre.
+ *       It is then turned through a full cycle. If the tip stays where the camera says it is, the
+ *       motion also took care of the runout at that angle; if the tip walks a circle, it did not, and
+ *       the analysis has to know about it, for every nozzle and not only for the ones that were not
+ *       moved to.
+ *
+ *   Q2  Does a nozzle that was not the one commanded still know where it is? The batch depends on it:
+ *       one move is made and every other nozzle's position is inferred from the head geometry.
+ *
+ *   Q3  Where does a non-primary nozzle actually end up in a batch, and what has the term the code
+ *       applies today to do with that? The head is parked once for each candidate primary, because the
+ *       job planner may pick any nozzle, and then every tip is measured where it really stands. The
+ *       interesting column is the last one: the gap the analysis has to know about, minus what the
+ *       camera says, i.e. what the model cannot explain.
+ *
+ * Nothing is written: no machine.xml, no calibration, no settings. It moves the head at safe Z, takes
+ * pictures of bare tips, prints, and writes the whole run down in a file under
+ * ~/.openpnp2/displacement/, whose name it says before it starts. A run costs a couple of minutes and
+ * can be repeated.
+ *
+ * Run with the machine enabled and homed, the tips clean and in place, and nothing in front of the
+ * up-looking cameras. The tips need their runout calibration only for the model columns; the camera
+ * columns are measured either way.
+ *
+ * One trap worth knowing before reading the output: a tip measurement is refused when the detection
+ * lands further from where it was expected than the nozzle tip calibration's offset threshold, 0.5mm
+ * by default. A non-primary tip in a batch can be that far off, so a "nothing detected" line in the
+ * Q3 part is itself a result: it says the batch put that tip outside what the vision may look for.
+ */
+import org.openpnp.machine.reference.ReferenceNozzle;
+import org.openpnp.machine.reference.ReferenceNozzleTip;
+import org.openpnp.model.LengthUnit;
+import org.openpnp.model.Location;
+import org.openpnp.model.Motion;
+import org.openpnp.spi.MotionPlanner;
+import org.openpnp.util.MovableUtils;
+import org.openpnp.util.VisionUtils;
+import java.text.DecimalFormat;
+import javax.swing.JOptionPane;
+
+/*
+ * Settings, in the text of the script like everything else about how it measures.
+ */
+// The angles the Q1 part turns each nozzle through. A full cycle is what separates a centre from a
+// circle, and 90 degree steps are where a four-lobe runout hides least.
+angles = new double[4];
+angles[0] = 0.0;
+angles[1] = 90.0;
+angles[2] = 180.0;
+angles[3] = 270.0;
+// Detections per position, averaged. One detection is worth about the half pixel of the detector, a
+// hundredth of a millimetre here; the scatter printed with it is the noise floor of the reading.
+framesPerMeasure = 3;
+// The Q3 part measures every nozzle twice in a row. The first run on this machine scattered 0.33mm
+// between the three frames of the first measure of a park and 0.0000mm between the three frames of the
+// second, on the very same nozzle that had scattered nothing at all a minute earlier in Q1. Either the
+// tip is still moving when the head says it has stopped, which is a settle question, or the detector
+// alternates between the tip and something that is not, which is a vision question. Two measures back to
+// back tell those apart; one measure cannot.
+recheck = true;
+// How far the Q2 part drags the head around, in millimetres, twice.
+q2Steps = 2;
+// The two slow parts, separately switchable.
+runRotationTest = true;
+runBatchTest = true;
+
+class Station {
+    Object nozzle;
+    Object tip;
+    Object camera;
+    Object calibration;
+}
+
+df = new DecimalFormat("0.0000");
+
+/*
+ * Every name a function assigns to is written with a leading underscore, and that is not a style. This
+ * interpreter has dynamic scope: a function that assigns to a name the caller already has writes into the
+ * caller's variable, and only formal parameters are local. A helper using a plain "i" for its frame loop
+ * therefore ended every station loop of the caller after the first station - the run reported one nozzle
+ * instead of two and looked perfectly healthy while doing it. Parameters are bound locally, which is why
+ * calZ(s) and goTo(n, at) may keep the caller's names, and why everything else has an underscore.
+ */
+
+f(x) {
+    return df.format(x);
+}
+
+/*
+ * "There is no value" as a location. It cannot be null, because assigning null in BeanShell does not
+ * store null, it *removes* the variable, and the next mention of it then dies with "Undefined argument"
+ * somewhere far away from the reason. A NaN location is a value that says it is not one, and it can be
+ * tested with hasValue().
+ */
+noValue() {
+    return new Location(LengthUnit.Millimeters, Double.NaN, Double.NaN, 0., 0.);
+}
+
+hasValue(l) {
+    if (l == null) {
+        return false;
+    }
+    _m = l.convertToUnits(LengthUnit.Millimeters);
+    return !Double.isNaN(_m.getX());
+}
+
+mm(l) {
+    if (l == null) {
+        return noValue();
+    }
+    return l.convertToUnits(LengthUnit.Millimeters);
+}
+
+xy(l) {
+    if (!hasValue(l)) {
+        return "      -        -";
+    }
+    _m = mm(l);
+    return f(_m.getX()) + " " + f(_m.getY());
+}
+
+// A Length in millimetres, as a plain number. A Length is not a Location and has no getX(): the
+// machine settings are Lengths, the positions are Locations, and the two must not be confused.
+mmv(l) {
+    if (l == null) {
+        return Double.NaN;
+    }
+    return l.convertToUnits(LengthUnit.Millimeters).getValue();
+}
+
+mag(l) {
+    if (!hasValue(l)) {
+        return Double.NaN;
+    }
+    _m = mm(l);
+    return Math.hypot(_m.getX(), _m.getY());
+}
+
+/*
+ * Every moveTo in the SPI has trailing MotionOption varargs, and BeanShell 2.0b5 does not resolve a
+ * varargs call at all - it only matches when the array is handed over explicitly, so moveTo(at) is
+ * simply "method not found". An empty array is exactly what a Java caller writing moveTo(at) passes,
+ * and it lands on the overload that moves at the machine speed, which is what the runtime does.
+ */
+noMotionOptions = new Motion.MotionOption[0];
+
+goTo(n, at) {
+    n.moveTo(at, noMotionOptions);
+}
+
+/*
+ * Everything the run says is also written down as it is said, because the console of the GUI is not a
+ * place where numbers can be compared afterwards, and because a run that dies half way is exactly the
+ * run whose beginning one wants to read again. Nothing is buffered for the end: the line is on disk
+ * before the head moves on. The file name is known before the run starts, so it can be said out loud
+ * first thing.
+ *
+ * Plain FileWriter with append, rather than Files.write(...), because the open options of that method
+ * are a varargs parameter and this interpreter (BeanShell 2.0b5) cannot call a varargs method at all.
+ */
+stamp = new java.text.SimpleDateFormat("yyyy-MM-dd_HH.mm.ss").format(new java.util.Date());
+logFile = new java.io.File(System.getProperty("user.home"),
+        ".openpnp2/displacement/batch-residual-" + stamp + ".txt");
+try {
+    logFile.getParentFile().mkdirs();
+}
+catch (e) {
+    // Said below anyway, where the failure to write will show up on the first line.
+}
+
+say(line) {
+    System.out.println(line);
+    try {
+        _w = new java.io.FileWriter(logFile, true);
+        _w.write(line);
+        _w.write("\n");
+        _w.close();
+    }
+    catch (_e) {
+        System.out.println("batch residual probe: could not write it down: " + _e);
+    }
+}
+
+say("batch residual probe: this run is being written down in " + logFile);
+
+rule(title) {
+    say("");
+    say("=== " + title);
+    say("    ------------------------------------------------------------------------");
+}
+
+// The Z at which this tip is in focus for its own camera, an absolute machine Z. The Z of the camera
+// is not it and must not be used: that is the gantry Z plus a couple of hundredths of head offset.
+calZ(s) {
+    return s.calibration.getCalibrationZOffset().convertToUnits(LengthUnit.Millimeters).getValue();
+}
+
+/*
+ * The tip as its own camera sees it: the offset of the detected tip from the camera's optical axis, in
+ * machine millimetres, averaged over frames detections. Expected is where the tip is predicted to
+ * stand, which is what the detector searches around and what the offset threshold is measured from.
+ *
+ * It sums instead of collecting into an array, and that is not for lack of arrays: under the JSR-223
+ * engine that the Scripting panel evaluates through, BeanShell 2.0b5 cannot size an array from a
+ * variable inside a method, not from a global, not from a parameter, not from a local copy of one,
+ * whatever the value it holds - "new double[frames]" dies with "Array index: 0 does not evaluate to an
+ * integer". A literal size, a static field, an array element and a method call as size all work. The
+ * mean and the scatter are reachable in one pass with running sums, so there is nothing to collect.
+ */
+measureTipOffsets(s, expected, label, frames) {
+    _taken = 0;
+    _sumX = 0.;
+    _sumY = 0.;
+    _sumSq = 0.;
+    _lastError = "";
+    _list = "";
+    for (_i = 0; _i < frames; _i = _i + 1) {
+        try {
+            _found = s.calibration.measureTip(s.nozzle, s.camera, expected);
+            if (_found == null) {
+                _lastError = "nothing detected, or more than one";
+            }
+            else {
+                _det = mm(_found);
+                // Every detection on its own in the report. A mean of three is only worth something when
+                // the three agree; the mean of a tip and a non-tip sits between two things that are both
+                // not it, and only the individual values can say which of the two happened.
+                _list = _list + (_list.equals("") ? "  " : ", ") + f(_det.getX()) + " " + f(_det.getY());
+                _sumX = _sumX + _det.getX();
+                _sumY = _sumY + _det.getY();
+                _sumSq = _sumSq + _det.getX()*_det.getX() + _det.getY()*_det.getY();
+                _taken = _taken + 1;
+            }
+        }
+        catch (_e) {
+            _lastError = "" + _e;
+        }
+    }
+    if (_taken == 0) {
+        say("        " + label + ": nothing measured - " + _lastError);
+        return noValue();
+    }
+    _ax = _sumX / _taken;
+    _ay = _sumY / _taken;
+    // The scatter is the root-mean-square distance of the individual detections from their own mean,
+    // straight out of the running sums. It is the noise floor of the reading, and it is what any
+    // difference below a hundredth of a millimetre has to be judged against.
+    _variance = _sumSq / _taken - _ax*_ax - _ay*_ay;
+    _scatter = _variance > 0. ? Math.sqrt(_variance) : 0.;
+    _average = new Location(LengthUnit.Millimeters, _ax, _ay, 0., 0.);
+    say("        " + label + " " + xy(_average)
+            + "   (" + _taken + " detection" + (_taken == 1 ? "" : "s") + _list
+            + ", scatter " + f(_scatter)
+            + (_taken < frames ? ", " + _lastError : "") + ")");
+    return _average;
+}
+
+if (!machine.isEnabled()) {
+    say("batch residual probe: enable the machine first, the cameras need their lights.");
+}
+else if (!machine.isHomed()) {
+    say("batch residual probe: home the machine first.");
+}
+else {
+    stations = new java.util.ArrayList();
+    nozzles = machine.getHeads().get(0).getNozzles();
+    for (i = 0; i < nozzles.size(); i = i + 1) {
+        nozzle = nozzles.get(i);
+        s = new Station();
+        s.nozzle = nozzle;
+        why = "";
+        try {
+            if (! (nozzle instanceof ReferenceNozzle)) {
+                why = "not a reference nozzle";
+            }
+            tip = nozzle.getNozzleTip();
+            s.tip = tip;
+            if (why.equals("") && ! (tip instanceof ReferenceNozzleTip)) {
+                why = "no nozzle tip";
+            }
+            if (why.equals("")) {
+                s.calibration = ((ReferenceNozzleTip)tip).getCalibration();
+                if (!s.calibration.isEnabled()) {
+                    why = "nozzle tip calibration disabled";
+                }
+            }
+            if (why.equals("")) {
+                s.camera = VisionUtils.getBottomVisionCamera(nozzle);
+            }
+        }
+        catch (e) {
+            why = "" + e;
+        }
+        if (why.equals("") && s.camera != null && s.calibration != null) {
+            stations.add(s);
+        }
+        else {
+            say("batch residual probe: " + nozzle.getName() + " skipped - "
+                    + (why.equals("") ? "no bottom vision camera" : why));
+        }
+    }
+
+    rule("The machine as it is set");
+    say("    nozzles measured: " + stations.size() + " of " + nozzles.size()
+            + ", homed " + machine.isHomed());
+    say("    displacement-enabled " + machine.isDisplacementEnabled()
+            + ", max-distance " + mmv(machine.getDisplacementMaxDistance())
+            + ", max-Z-diff " + mmv(machine.getDisplacementMaxZDiff())
+            + ", max-rotation " + machine.getDisplacementMaxRotation()
+            + ", balance-level " + mmv(machine.getBalanceLevel()));
+    calibratedCount = 0;
+    for (i = 0; i < stations.size(); i = i + 1) {
+        s = stations.get(i);
+        calibrated = s.calibration.isCalibrated(s.nozzle);
+        if (calibrated) {
+            calibratedCount = calibratedCount + 1;
+        }
+        centre = calibrated
+                ? mm(s.calibration.getCalibratedCameraOffset(s.nozzle, s.camera))
+                : noValue();
+        // The centre as the camera is told about it, and the same thing as the calibration stored it. If
+        // the two ever differ then the runtime, which takes one from the camera and the other from the
+        // motion, is being told two different stories about the same tip.
+        axisOffset = calibrated
+                ? mm(s.calibration.getCalibratedAxisOffset(s.nozzle))
+                : noValue();
+        say("    " + s.nozzle.getName() + " / " + s.camera.getName()
+                + ", tip " + (s.tip == null ? "none" : s.tip.getName())
+                + ", calibrated " + calibrated
+                + ", centre " + xy(centre)
+                + ", as stored on the axis " + xy(axisOffset)
+                + ", calibration Z " + f(calZ(s))
+                + ", roaming radius " + mmv(s.camera.getRoamingRadius()));
+    }
+    if (calibratedCount == 0) {
+        say("    No tip on this machine is runout-calibrated, so every model column below says zero.");
+        say("    That is a statement about the machine, not about the probe: the measured camera columns");
+        say("    and the gaps are measured either way, and a head with no runout model is a state the");
+        say("    runtime has to survive, so it is worth knowing what it costs.");
+    }
+
+    rule("Q2: a nozzle that was not commanded, does it know where it is?");
+    if (stations.size() < 2) {
+        say("    needs two nozzles, only one measured, skipped.");
+    }
+    else {
+        first = stations.get(0);
+        here = mm(first.nozzle.getLocation());
+        for (probe = 0; probe < q2Steps; probe = probe + 1) {
+            target = here.derive(here.getX() + 4.0 + 7.0*probe, here.getY() - 3.0 + 5.0*probe, null,
+                    null);
+            try {
+                MovableUtils.moveToLocationAtSafeZ(first.nozzle, target);
+                first.nozzle.waitForCompletion(MotionPlanner.CompletionType.WaitForStillstand);
+                say("    moved " + first.nozzle.getName() + " to " + xy(target));
+                for (i = 0; i < stations.size(); i = i + 1) {
+                    s = stations.get(i);
+                    at = mm(s.nozzle.getLocation());
+                    // Where this nozzle must be if the head is rigid: where the moved nozzle is, plus
+                    // the difference of the two head offsets. Anything else is the position reporting
+                    // inventing a location for a nozzle nobody moved.
+                    wantHere = mm(target).add(mm(s.nozzle.getHeadOffsets())
+                            .subtract(mm(first.nozzle.getHeadOffsets())));
+                    // But a calibrated report is not the axis, it is the tool: getLocation() adds the
+                    // runout offset at the rotation the nozzle stands at, which is exactly what makes the
+                    // tip land where it was commanded. Two nozzles bolted to one head therefore report
+                    // each other apart by the difference of their runout offsets, a constant few
+                    // hundredths that has nothing to do with the head. Take it off to see the axes.
+                    primaryAt = mm(first.nozzle.getLocation());
+                    runoutHere = mm(s.calibration.getCalibratedOffset(s.nozzle, at.getRotation()));
+                    runoutPrimary = mm(first.calibration.getCalibratedOffset(first.nozzle,
+                            primaryAt.getRotation()));
+                    axisError = at.subtract(wantHere).add(runoutPrimary).subtract(runoutHere);
+                    say("        " + s.nozzle.getName() + " reports " + xy(at)
+                            + ", head geometry says " + xy(wantHere)
+                            + ", error " + f(mag(at.subtract(wantHere)))
+                            + ", of which the axis alone " + f(mag(axisError)));
+                }
+            }
+            catch (e) {
+                say("    move failed: " + e);
+            }
+        }
+        say("    read: a few thousandths is rounding between the axis coordinates and the"
+                + " head offsets; hundredths mean the other nozzles are not where the batch assumes.");
+    }
+
+    if (runRotationTest) {
+        rule("Q1: what the motion applies when a nozzle turns");
+        for (i = 0; i < stations.size(); i = i + 1) {
+            s = stations.get(i);
+            // The location that puts this tip on its own camera's axis: the camera's claim already
+            // contains the centre of the runout circle, so a tip that follows its model stands still.
+            base = mm(s.camera.getLocation(s.nozzle)).derive(null, null, calZ(s), 0.);
+            say("    " + s.nozzle.getName() + " / " + s.camera.getName() + ", centre "
+                    + xy(mm(s.calibration.getCalibratedCameraOffset(s.nozzle, s.camera)))
+                    + ", commanded to " + xy(base));
+            try {
+                MovableUtils.moveToLocationAtSafeZ(s.nozzle, base);
+                s.nozzle.waitForCompletion(MotionPlanner.CompletionType.WaitForStillstand);
+            }
+            catch (e) {
+                say("        could not get there: " + e);
+                continue;
+            }
+            seen = 0;
+            minX = 0.;
+            maxX = 0.;
+            minY = 0.;
+            maxY = 0.;
+            maxRadius = 0.;
+            sumSeenX = 0.;
+            sumSeenY = 0.;
+            for (a = 0; a < angles.length; a = a + 1) {
+                at = base.derive(null, null, null, angles[a]);
+                try {
+                    goTo(s.nozzle, at);
+                    s.nozzle.waitForCompletion(MotionPlanner.CompletionType.WaitForStillstand);
+                }
+                catch (e) {
+                    say("        " + f(angles[a]) + " deg: could not turn: " + e);
+                    continue;
+                }
+                model = mm(s.calibration.getCalibratedOffset(s.nozzle, angles[a]));
+                maxRadius = Math.max(maxRadius, mag(model));
+                measured = measureTipOffsets(s, at, "at C " + f(angles[a])
+                            + ", model runout " + xy(model), framesPerMeasure);
+                if (hasValue(measured)) {
+                    mx = mm(measured).getX();
+                    my = mm(measured).getY();
+                    if (seen == 0) {
+                        minX = mx;
+                        maxX = mx;
+                        minY = my;
+                        maxY = my;
+                    }
+                    else {
+                        minX = Math.min(minX, mx);
+                        maxX = Math.max(maxX, mx);
+                        minY = Math.min(minY, my);
+                        maxY = Math.max(maxY, my);
+                    }
+                    sumSeenX = sumSeenX + mx;
+                    sumSeenY = sumSeenY + my;
+                    seen = seen + 1;
+                }
+            }
+            if (seen > 1) {
+                walk = Math.hypot(maxX-minX, maxY-minY);
+                meanOff = Math.hypot(sumSeenX/seen, sumSeenY/seen);
+                fit = s.calibration.getCalibratedRunoutFitError(s.nozzle);
+                // The yardstick has to be the thing that is being ruled out, not a round number. If the
+                // motion did nothing about the runout, the tip would go a whole circle round while the
+                // nozzle turned, and a circle of this radius seen at four right angles spans hypot(2r, 2r)
+                // from corner to corner. Against that, and against the two floors that make a standstill
+                // unreadable - the detector has no subpixel, so nothing here is finer than a pixel, and
+                // the calibration itself was only ever fitted to its own peak error - the answer is
+                // decided, not asserted.
+                across = Math.hypot(2. * maxRadius, 2. * maxRadius);
+                pixel = mm(s.camera.getUnitsPerPixel()).getX();
+                say("      the model's circle is " + f(maxRadius) + "mm in radius"
+                        + (fit == null ? ", fit error unknown" : ", fitted to a peak error of "
+                                + f(fit[0]) + " and an rms of " + f(fit[1]))
+                        + ", one pixel of " + s.camera.getName() + " is " + f(pixel) + "mm");
+                say("      commanded to stand still and turned, the tip stood a mean of "
+                        + f(meanOff) + "mm off that point and " + f(walk) + "mm wide over the cycle"
+                        + ", where nobody correcting the runout would have spread it " + f(across)
+                        + "mm wide, so the motion "
+                        + (walk < 0.5 * across
+                                ? "DOES apply the runout at the angle it is commanded to. What is left is"
+                                  + " the accuracy of the calibration and the pixel, not a term the"
+                                  + " analysis has to add - and it applies it to every nozzle alike."
+                                : "does NOT apply the runout at the angle, so the analysis owes it to"
+                                  + " every nozzle including the one it moved to."));
+            }
+            try {
+                goTo(s.nozzle, mm(s.nozzle.getLocation()).derive(null, null, null, 0.));
+            }
+            catch (e) {
+                say("        could not turn back: " + e);
+            }
+        }
+    }
+
+    if (runBatchTest) {
+        rule("Q3: the batch, where a non-primary nozzle really ends up");
+        if (stations.size() < 2) {
+            say("    needs two nozzles, only one measured, skipped.");
+        }
+        for (p = 0; p < stations.size(); p = p + 1) {
+            primary = stations.get(p);
+            wanted = mm(primary.camera.getLocation(primary.nozzle)).derive(null, null, calZ(primary),
+                    0.);
+            say("");
+            say("    head parked for " + primary.nozzle.getName() + " at " + xy(wanted)
+                    + " at C " + f(wanted.getRotation())
+                    + " (the job does exactly this for whichever nozzle the planner put first)");
+            try {
+                MovableUtils.moveToLocationAtSafeZ(primary.nozzle, wanted);
+                primary.nozzle.waitForCompletion(MotionPlanner.CompletionType.WaitForStillstand);
+            }
+            catch (e) {
+                say("        could not get there: " + e);
+                continue;
+            }
+            for (i = 0; i < stations.size(); i = i + 1) {
+                s = stations.get(i);
+                isPrimary = (i == p);
+                actual = mm(s.nozzle.getLocation());
+                // Where this nozzle's own shot would have wanted it, had it been shot alone: its own
+                // camera, its own Z, its own centre. This is the gap the analysis has to close.
+                wantedMine = mm(s.camera.getLocation(s.nozzle)).derive(null, null, calZ(s), null);
+                geometric = wantedMine.subtract(actual);
+                centre = mm(s.calibration.getCalibratedCameraOffset(s.nozzle, s.camera));
+                runoutHere = mm(s.calibration.getCalibratedOffset(s.nozzle, actual.getRotation()));
+                // The term ReferenceBottomVision applies to this nozzle in the parallel path: nothing
+                // for the primary, the centre plus the runout at the rotation for the others.
+                legacy = isPrimary ? new Location(LengthUnit.Millimeters) : centre.add(runoutHere);
+                say("        " + s.nozzle.getName()
+                        + (isPrimary ? " (moved for)" : "") + " is at " + xy(actual) + " at C "
+                        + f(actual.getRotation()));
+                say("          its own shot wants " + xy(wantedMine)
+                        + ", so the gap is " + xy(geometric) + "  (" + f(mag(geometric))
+                        + "mm), the head turned it " + f(Math.abs(Math.IEEEremainder(wanted.getRotation()
+                                - actual.getRotation(), 360.))) + " deg from the primary");
+                say("          the code applies " + xy(legacy) + "  (" + f(mag(legacy))
+                        + "mm" + (isPrimary ? ", zero, it is the primary" : "")
+                        + "), runout at C here is " + xy(runoutHere));
+                // The tip stands where the nozzle is said to be plus the centre the camera and the tip
+                // calibration agreed on, which is where the detector has to look for it.
+                seenA = measureTipOffsets(s, actual.add(centre),
+                        "the camera sees the tip, first look:", framesPerMeasure);
+                seenB = seenA;
+                if (recheck) {
+                    seenB = measureTipOffsets(s, actual.add(centre),
+                            "the camera sees the tip, second look:", framesPerMeasure);
+                    if (hasValue(seenA) && hasValue(seenB)) {
+                        // Two looks at a nozzle that has not been touched. Whatever they differ by is not
+                        // the geometry and not the calibration: it is the tip still moving, or the
+                        // detector finding something else, which is exactly what a capture must not do.
+                        say("          the two looks differ by " + f(mag(seenB.subtract(seenA)))
+                                + "mm on a nozzle that was not touched between them.");
+                    }
+                }
+                if (hasValue(seenB)) {
+                    say("          the gap should be the seen offset negated, so what the"
+                            + " model cannot explain is " + xy(geometric.add(seenB)) + "  ("
+                            + f(mag(geometric.add(seenB))) + "mm)");
+                }
+            }
+        }
+    }
+
+    // The tips have been down at their focal planes, which is not where a machine should be left.
+    for (i = 0; i < stations.size(); i = i + 1) {
+        try {
+            stations.get(i).nozzle.moveToSafeZ();
+        }
+        catch (e) {
+            say("batch residual probe: could not lift " 
+                    + stations.get(i).nozzle.getName() + ": " + e);
+        }
+    }
+
+    rule("Done");
+    say("    Nothing was written to machine.xml and no calibration was changed.");
+    say("    Q2 is the error column of the first part, Q1 the walked lines, Q3 the gap,");
+    say("    the applied term, the seen offset and the unexplained residual.");
+    say("    All of it is also written down in " + logFile);
+    try {
+        JOptionPane.showMessageDialog(null,
+                "Batch residual probe finished. Nothing was written.\n\nThe error column of the Q2 part,"
+                + " the 'the tip walked' lines of Q1, and in Q3 the gap between where each nozzle is and"
+                + " where its own shot wants it, next to the term the code applies, what the camera saw,"
+                + " and what is left over.\n\nAll of it in\n" + logFile,
+                "Batch residual probe", JOptionPane.INFORMATION_MESSAGE);
+    }
+    catch (e) {
+        say("batch residual probe: no window to tell you about it: " + e);
+    }
+}

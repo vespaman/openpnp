@@ -149,6 +149,11 @@ public class EarlyDepartureAbortTest {
         // kept, so that anything that knows it by name still knows it.
         OnceRefusingBottomVision vision = new OnceRefusingBottomVision();
         vision.setEnabled(true); // a bare ReferenceBottomVision is not enabled until a machine says so
+        // The test machine ships post-rotate, and a post-rotate part cannot be given a pre-captured
+        // shot at all: the head stands at one shot location, so the other nozzle is displaced from
+        // its own, and only the pre-rotate path has a nozzle location to apply that to. The batch
+        // says so and goes sequential, which would leave this test with nothing to abort.
+        vision.setPreRotate(true);
         Field partAlignments = AbstractMachine.class.getDeclaredField("partAlignments");
         partAlignments.setAccessible(true);
         @SuppressWarnings("unchecked")
@@ -195,6 +200,9 @@ public class EarlyDepartureAbortTest {
         assertFalse(vision.refused.isEmpty(),
                 "the deferred alignment never ran over a pre-captured picture, so the head never "
                         +"had anything to abort");
+        assertTrue(ReferencePnpJobProcessor.getParallelAttempts() > 0,
+                "the job never attempted the parallel alignment, so whatever was aborted it was not "
+                        +"a deferred alignment over the cameras");
         assertEquals(1, vision.refused.size(), "exactly one picture was to be refused");
         String abandoned = vision.refused.get(0);
         assertTrue(vision.overCamera.contains(abandoned),

@@ -327,7 +327,7 @@ public class SettleWindowCaptureTest {
         final AtomicReference<PreCapturedPlacement> captured = new AtomicReference<>();
         machine.execute(() -> {
             captured.set(bottomVision.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                    wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                    wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                     deadlineAtMs));
             return true;
         });
@@ -506,7 +506,7 @@ public class SettleWindowCaptureTest {
             settlingThread.start();
             try {
                 captured.set(watching.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                        wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                        wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                         NanosecondTime.getRuntimeMilliseconds()+5000));
             }
             finally {
@@ -579,7 +579,7 @@ public class SettleWindowCaptureTest {
             settlingThread.start();
             try {
                 captured.set(bottomVision.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                        wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                        wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                         NanosecondTime.getRuntimeMilliseconds()+5000));
             }
             finally {
@@ -642,7 +642,7 @@ public class SettleWindowCaptureTest {
             settlingThread.start();
             try {
                 captured.set(bottomVision.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                        wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                        wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                         NanosecondTime.getRuntimeMilliseconds()+5000));
             }
             finally {
@@ -717,7 +717,7 @@ public class SettleWindowCaptureTest {
             settlingThread.start();
             try {
                 captured.set(bottomVision.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                        wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                        wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                         NanosecondTime.getRuntimeMilliseconds()+5000));
             }
             finally {
@@ -737,8 +737,12 @@ public class SettleWindowCaptureTest {
                 + captured.get().getProvenance();
         long withHuntMs = settlingCamera.getRecordedSettleMilliseconds();
         int grabs = otherCamera.getCaptures();
-        // The frames the hunt had to take, plus one for the awkwardness of two threads meeting a lock.
-        long allowed = (grabs+1)*BUS_COST_MS;
+        // The frames the hunt had to take, and then the two threads meeting a lock. The second part is a
+        // wall-clock difference on a machine running the rest of the suite, so it is given a few frames of
+        // bus that the bus itself knows nothing about; what is being asserted is that the hunt costs the
+        // settling the frames it takes and not, say, a wait for the hunt to finish, which would be tens of
+        // frames rather than a handful.
+        long allowed = (grabs+3)*BUS_COST_MS;
         assert withHuntMs-aloneMs <= allowed
                 : "the settling took "+withHuntMs+" ms with the hunt and "+aloneMs+" ms without it, so "
                         +grabs+" grabs cost it "+(withHuntMs-aloneMs)+" ms on a bus of "

@@ -56,6 +56,7 @@ import org.openpnp.machine.reference.wizards.ReferencePnpJobProcessorConfigurati
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.CapturedShot;
+import org.openpnp.model.DisplacementExceededException;
 import org.openpnp.model.FrameNotStillException;
 import org.openpnp.model.FrameProvenance;
 import org.openpnp.model.Configuration;
@@ -2214,6 +2215,43 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 return;
             }
             
+            // A post-rotate part and a parallel batch cannot both be had. The head stands at one shot
+            // location, so every nozzle but the one it moved for is displaced by whatever the rigid
+            // head leaves it at, and only the pre-rotate path has a nozzle location to apply that to:
+            // post-rotate measures the part against the camera and rotates the nozzle afterwards, so
+            // there is nothing for the displacement to be applied to until the part is already placed
+            // wrong. The analysis can discover this (see ReferenceBottomVision#displacementCheck) but
+            // by then the only thing it can do is say so. Refuse here instead, where going sequential
+            // is still free and no picture has been wasted (D10 of the runtime displacement plan).
+            for (PlannedPlacement p : plannedPlacements) {
+                Part part = p.jobPlacement.getPlacement().getPart();
+                PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                if (!(partAlignment instanceof ReferenceBottomVision)) {
+                    continue;
+                }
+                ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                BottomVisionSettings visionSettings = bottomVision.getInheritedVisionSettings(part);
+                if (visionSettings != null && !visionSettings.isEnabled()) {
+                    // No picture is taken of such a part anyway; the missing shot below is what
+                    // sends that one sequential.
+                    continue;
+                }
+                if (!bottomVision.usesPreRotate(part)) {
+                    Logger.info("[PARALLEL-VISION] not attempted: part {} of placement {} is aligned "
+                            +"post-rotate, which cannot compensate being displaced from the shot the "
+                            +"head moved for. Align everything sequentially; set Pre-Rotate on the "
+                            +"bottom vision (or Pre-Rotate Usage = AlwaysOn for the part) to let this "
+                            +"job go parallel.",
+                            part == null ? "?" : part.getId(),
+                            p.jobPlacement.getPlacement().getId());
+                    for (PlannedPlacement seq : plannedPlacements) {
+                        super.align(seq, AbstractPartAlignment.getPartAlignment(
+                                    seq.jobPlacement.getPlacement().getPart()));
+                    }
+                    return;
+                }
+            }
+
             // From here on this is a genuine attempt at parallel alignment, so it is counted: the
             // two ways out above were not attempts, they were parts that cannot be pre-captured.
             parallelAttempts.incrementAndGet();
@@ -2228,7 +2266,21 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             Core.setNumThreads(1);
             try {
                 // STEP 1: Pre-capture ALL images in main thread
-                imageBuffer = preCaptureAllImages(placementsByCamera);
+                try {
+                    imageBuffer = preCaptureAllImages(placementsByCamera);
+                }
+                catch (DisplacementExceededException e) {
+                    // The head went to the cameras and one nozzle was too far from its own shot for the
+                    // difference to be measured out of a picture (D5). No frame was exposed, so the only
+                    // cost is the move, and the parts are owed the ordinary treatment. Counted as a
+                    // fallback rather than as nothing: unlike the routes that are refused before the head
+                    // moves, this one attempted the parallel alignment and did not manage it.
+                    parallelVisionFellBack(e);
+                    for (PlannedPlacement p : plannedPlacements) {
+                        super.align(p, AbstractPartAlignment.getPartAlignment(p.jobPlacement.getPlacement().getPart()));
+                    }
+                    return;
+                }
                 
                 // STEP 2: Check if ALL placements have pre-captured shots
                 // If ANY placement has no shot (e.g., compositing), fall back to sequential for ALL
@@ -2407,8 +2459,11 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 }
                 
                 Camera camera = VisionUtils.getBottomVisionCamera(nozzle);
-                Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(
-                    part, camera, nozzle, placement.getLocation().getRotation(), false);
+                Location wantedLocation = bottomVision.withBalanceLevelZ(
+                        bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle,
+                                bottomVision.shotRotationOf(part, jobPlacement.getBoardLocation(),
+                                        placement),
+                                false));
                 
                 Logger.debug("Moving head to alignment position for parallel vision: {}", wantedLocation);
                 
@@ -2476,8 +2531,8 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             }
       }
         
-        private ImageBuffer preCaptureAllImages(Map<Camera, List<PlannedPlacement>> placementsByCamera)
-                throws JobProcessorException {
+         private ImageBuffer preCaptureAllImages(Map<Camera, List<PlannedPlacement>> placementsByCamera)
+                 throws JobProcessorException, DisplacementExceededException {
             // Flatten all placements into a single list
             List<PlannedPlacement> allPlacements = new ArrayList<>();
             for (List<PlannedPlacement> placements : placementsByCamera.values()) {
@@ -2503,11 +2558,10 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                     initialNozzle, e);
             }
             List<PlannedPlacement> settleCameraPlacements = placementsByCamera.get(settleCamera);
-            
-            // The first nozzle tip (initialNozzle) should have zero displacement since the head
-            // moves to position this nozzle under the settle camera. All other nozzle tips
-            // need displacement compensation for camera-to-nozzle offset and runout.
-            Nozzle firstNozzleTip = initialNozzle;
+
+            // Which nozzle the head was positioned for no longer matters to a shot: every shot measures
+            // its own displacement from where its nozzle was read at the exposure, so none of them is
+            // privileged as the first one.
             
             // Sort cameras for deterministic processing
             List<Camera> cameras = new ArrayList<>(placementsByCamera.keySet());
@@ -2583,6 +2637,10 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                 new ArrayList<>();
             
             try {
+                // Before anything is exposed: is the head standing where this batch's shots can be
+                // taken from at all? See #checkDisplacementLimits(List).
+                checkDisplacementLimits(allPlacements);
+
                 // ===================================================================
                 // PASS 1 (PARALLEL): Trigger async captures for single-shot parts
                 // This starts BEFORE the settle loop, allowing parallel capture
@@ -2643,20 +2701,21 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                         
                         Location wantedLocation;
                         try {
-                            wantedLocation = bottomVision.getCameraLocationAtPartHeight(
-                                part, captureCamera, nozzle, 0., false);
+                            wantedLocation = bottomVision.withBalanceLevelZ(
+                                    bottomVision.getCameraLocationAtPartHeight(part, captureCamera,
+                                            nozzle, bottomVision.shotRotationOf(part,
+                                                    placement.jobPlacement.getBoardLocation(),
+                                                    placement.jobPlacement.getPlacement()),
+                                            false));
                         }
                         catch (Exception e) {
                             throw new JobProcessorException(placement.nozzle, e);
                         }
                         
-                        boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
-                        
                         // Capture references for closure
                         final Camera cam = captureCamera;
                         final Nozzle noz = nozzle;
                         final Part prt = part;
-                        final boolean firstTip = isFirstNozzleTip;
                         final Location loc = wantedLocation;
                         final ReferenceBottomVision bv = bottomVision;
                         
@@ -2673,10 +2732,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                     // against there is no window, and then the old quick capture is all
                                     // there is - which the alignment refuses, and rightly.
                                     PreCapturedPlacement shot = settlingCamera == null
-                                            ? bv.captureImageOnly(prt, cam, noz, loc, firstTip,
-                                                    arrivedAtMs)
+                                            ? bv.captureImageOnly(prt, cam, noz, loc, arrivedAtMs)
                                             : bv.captureImageFromSettlingWindow(prt, cam, noz, loc,
-                                                    firstTip, arrivedAtMs, settlingCamera,
+                                                    arrivedAtMs, settlingCamera,
                                                     settleEpochBefore, windowDeadlineAtMs);
                                     Logger.trace("Async capture completed for camera {}, part {}", 
                                         cam.getName(), prt.getId());
@@ -2706,16 +2764,21 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                         BottomVisionSettings bottomVisionSettings = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
                             .getInheritedVisionSettings(part);
                         if (bottomVisionSettings.isEnabled()) {
-                            Location wantedLocation = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                .getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
+                            ReferenceBottomVision bottomVision
+                                    = (ReferenceBottomVision) AbstractPartAlignment.getPartAlignment(part);
+                            Location wantedLocation = bottomVision.withBalanceLevelZ(
+                                    bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle,
+                                            bottomVision.shotRotationOf(part,
+                                                    firstPlacement.jobPlacement.getBoardLocation(),
+                                                    firstPlacement.jobPlacement.getPlacement()),
+                                            false));
                             
                             // Handle single-shot vs multi-shot for settle camera
                             if (!needsMultipleShots(part)) {
                                 // Single-shot: use settle and capture
-                                boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
                                 PreCapturedPlacement shot = 
                                     ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                    .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip,
+                                    .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation,
                                             arrivedAtMs);
                                 imageBuffer.addShot(nozzle, shot);
                                 
@@ -2728,13 +2791,19 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                                     bottomVisionSettings = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
                                         .getInheritedVisionSettings(part);
                                     if (bottomVisionSettings.isEnabled() && !needsMultipleShots(part)) {
-                                        wantedLocation = ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                            .getCameraLocationAtPartHeight(part, camera, nozzle, 0., false);
+                                        ReferenceBottomVision bottomVision2
+                                                = (ReferenceBottomVision) AbstractPartAlignment.getPartAlignment(part);
+                                        wantedLocation = bottomVision2.withBalanceLevelZ(
+                                                bottomVision2.getCameraLocationAtPartHeight(part,
+                                                        camera, nozzle,
+                                                        bottomVision2.shotRotationOf(part,
+                                                                placement.jobPlacement.getBoardLocation(),
+                                                                placement.jobPlacement.getPlacement()),
+                                                        false));
                                         
-                                        boolean isFirstNozzleTip2 = nozzle.equals(firstNozzleTip);
                                         PreCapturedPlacement shot2 = 
                                             ((ReferenceBottomVision)AbstractPartAlignment.getPartAlignment(part))
-                                            .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation, isFirstNozzleTip2,
+                                            .captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation,
                                             arrivedAtMs);
                                         imageBuffer.addShot(nozzle, shot2);
                                     }
@@ -2818,16 +2887,19 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
                             part.getId(), captureCamera.getName());
                         
                         try {
-                            Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(
-                                part, captureCamera, nozzle, 0., false);
-                            boolean isFirstNozzleTip = nozzle.equals(firstNozzleTip);
+                            Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part,
+                                    captureCamera, nozzle,
+                                    bottomVision.shotRotationOf(part,
+                                            placement.jobPlacement.getBoardLocation(),
+                                            placement.jobPlacement.getPlacement()),
+                                    false);
                             
                             // For multi-shot, we need to use the settle capture method
                             // which handles the movement between shots
                             // This falls back to the original sequential behavior for these parts
                             PreCapturedPlacement shot = 
                                 bottomVision.captureImageOnlyWithSettle(part, captureCamera, nozzle, 
-                                    wantedLocation, isFirstNozzleTip);
+                                    wantedLocation);
                             imageBuffer.addShot(nozzle, shot);
                         }
                         catch (Exception e) {
@@ -2865,7 +2937,103 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             
             return imageBuffer;
         }
-        
+
+        /**
+         * Ask every nozzle of the batch, before its camera is asked to expose anything, whether it is
+         * near enough to where its own shot would be taken from for the difference to be measured out
+         * of the picture rather than driven out of the way.
+         *
+         * <p>The limits exist because a shot far from where it wanted to be is not a slightly wrong
+         * picture of the part: the part sits further out in the field of view, at another
+         * magnification, and the calibration that turns pixels into millimetres is talking about a
+         * different place. The sequential path has always made this decision for itself and moved when
+         * it had to - see the pipeline shot in {@link ReferenceBottomVision}, where the same three
+         * numbers decide between skipping the move and making it. The parallel path never moves a
+         * nozzle onto its own shot at all, so it had no decision to make and the numbers were only ever
+         * printed, as a warning, after the exposure, when nothing can be done with them any more (E5,
+         * D5). This is that decision, in the one place where it can still be acted upon: the head is
+         * standing still under the cameras and nothing has been exposed yet, so the answer can still be
+         * "not this way" and the parts can be aligned in the ordinary manner without a frame wasted.</p>
+         *
+         * <p>Z is compared as an absolute difference against a shot whose Z is the balance level, so
+         * that the two nozzles of a rocker head are each compared against the height they are really at
+         * instead of one against its camera's focal height and the other against the negation of it -
+         * see {@link ReferenceBottomVision#withBalanceLevelZ(Location)}.</p>
+         *
+         * <p>Rotation is deliberately not compared. Every nozzle of the batch is indeed standing at the
+         * angle it is to be placed at, because the step before this one, {@code
+         * PrerotateAllNozzlesForAlign}, turned it there on the way to the cameras - and what a difference
+         * between that angle and the one the axes now report would say is that a rotation did not happen,
+         * which is a motion-accuracy question with its own machinery and is not what
+         * displacement-max-rotation is for. On the sequential path that limit compares the angle the
+         * <em>part</em> was measured at with the angle it was commanded to, and no encoder reading can
+         * stand in for the measurement; a batch has not measured the part yet, which is the whole reason it
+         * is standing under the camera. See D12, and E7 for the rotation the shot location does carry.</p>
+         *
+         * @param placements every placement of this batch. Those shot later, with the nozzle moved for
+         *             them one pass at a time, are left to their own decision about the limits.
+         * @throws DisplacementExceededException when a nozzle stands further from its own shot than the
+         *             machine will see through. The caller aligns everything sequentially.
+         */
+        private void checkDisplacementLimits(List<PlannedPlacement> placements)
+                throws DisplacementExceededException {
+            Machine machine = Configuration.get().getMachine();
+            if (!machine.isDisplacementEnabled()) {
+                // Nothing is displaced then: every nozzle is moved onto its own shot by the sequential
+                // path, and the limits belong to that decision instead of to this one.
+                return;
+            }
+            Length maxDistance = machine.getDisplacementMaxDistance();
+            Length maxZDiff = machine.getDisplacementMaxZDiff();
+            for (PlannedPlacement p : placements) {
+                Part part = p.jobPlacement.getPlacement().getPart();
+                PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
+                if (!(partAlignment instanceof ReferenceBottomVision)) {
+                    continue;
+                }
+                if (needsMultipleShots(part)) {
+                    // Shot later, one pass at a time, with the nozzle moved for the part on each of
+                    // them. The limits belong to that move as they do on the sequential path; this
+                    // decision is only ever about a shot taken from where the head happens to stand.
+                    continue;
+                }
+                ReferenceBottomVision bottomVision = (ReferenceBottomVision) partAlignment;
+                Camera camera;
+                Location shotLocation;
+                try {
+                    camera = VisionUtils.getBottomVisionCamera(p.nozzle);
+                    BottomVisionSettings visionSettings =
+                            bottomVision.getInheritedVisionSettings(part);
+                    if (visionSettings != null && !visionSettings.isEnabled()) {
+                        // This part is not going to be photographed at all.
+                        continue;
+                    }
+                    shotLocation = bottomVision.withBalanceLevelZ(
+                            bottomVision.getCameraLocationAtPartHeight(part, camera, p.nozzle,
+                                    bottomVision.shotRotationOf(part,
+                                            p.jobPlacement.getBoardLocation(),
+                                            p.jobPlacement.getPlacement()),
+                                    false));
+                }
+                catch (Exception e) {
+                    // Nothing can be said about a part whose shot cannot be computed. The capture will
+                    // have to fail, and it will say so with the part's name on it.
+                    continue;
+                }
+                Location actual = p.nozzle.getLocation();
+                Length distance = actual.getLinearLengthTo(shotLocation);
+                Length zDifference = actual.getLengthZ()
+                        .subtract(shotLocation.getLengthZ()).abs();
+                if (distance.compareTo(maxDistance) > 0 || zDifference.compareTo(maxZDiff) > 0) {
+                    throw new DisplacementExceededException(
+                            "nozzle "+p.nozzle.getId()+" stands "+distance+" from its own shot location"
+                                    +" on "+camera.getName()+" (Z "+zDifference+"), while the tolerated"
+                                    +" displacement is "+maxDistance+" (Z "+maxZDiff+")",
+                            p.nozzle, shotLocation, actual);
+                }
+            }
+        }
+
         private boolean needsMultipleShots(Part part) {
             if (part.getPackage() == null) {
                 return false;

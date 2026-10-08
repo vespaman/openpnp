@@ -381,7 +381,7 @@ public class GrabAheadCaptureTest {
         final AtomicReference<PreCapturedPlacement> captured = new AtomicReference<>();
         machine.execute(() -> {
             captured.set(bottomVision.captureImageFromSettlingWindow(part, otherCamera, nozzle,
-                    wantedLocation, false, arrivalAtMs, settlingCamera, settleEpochBefore,
+                    wantedLocation, arrivalAtMs, settlingCamera, settleEpochBefore,
                     deadlineAtMs));
             return true;
         });

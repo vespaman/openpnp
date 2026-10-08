@@ -103,7 +103,7 @@ public class FrameProvenanceTest {
                     0., false);
             MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
             captured[0] = bottomVision.captureImageOnlyWithSettle(part, camera, nozzle, wantedLocation,
-                    true, arrivalAtMs);
+                    arrivalAtMs);
             return true;
         });
         return captured[0];
@@ -116,7 +116,7 @@ public class FrameProvenanceTest {
             Location wantedLocation = bottomVision.getCameraLocationAtPartHeight(part, camera, nozzle,
                     0., false);
             MovableUtils.moveToLocationAtSafeZ(nozzle, wantedLocation);
-            captured[0] = bottomVision.captureImageOnly(part, camera, nozzle, wantedLocation, true,
+            captured[0] = bottomVision.captureImageOnly(part, camera, nozzle, wantedLocation,
                     arrivalAtMs);
             return true;
         });
