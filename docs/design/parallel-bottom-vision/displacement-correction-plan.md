@@ -2,6 +2,22 @@
 
 > Historical design note from the development checkout, imported 2026-09-27. It describes what was
 > intended at the time, not what this branch does. Current state: `SALVAGE-PLAN.md`.
+>
+> **Superseded on 2026-10-05.** Its diagnosis (use the nozzle tip calibration data instead of the
+> camera position) is what produced `displacementDelta()` as it stands today, and that diagnosis was
+> incomplete: the runout centre is a *per nozzle+tip* residual and cannot carry a per-camera property,
+> and the camera spacing vs nozzle spacing mismatch never enters the expression at all. See
+> `DISPLACEMENT-VERIFICATION.md` §5 for the audit and the numbers, and `camera-displacement-plan.md`
+> for what replaces it.
+>
+> **The replacement is finished as of 2026-10-08 and this file describes nothing that still exists.**
+> The term it set out to correct, `displacementDelta()`, has been deleted: a pre-captured shot is now
+> analysed with the residual between where it wanted to be and where the machine said its nozzle was at
+> the exposure, which is measured rather than predicted and so needs no correction. Neither
+> `isFirstNozzleTip` nor any calibration-derived displacement term survives. What came out of this work
+> - the decisions D1-D13, the pre-exposure limits, the post-rotate refusal, the shot's own rotation and
+> the machine runs that settled each - is in `runtime-displacement-plan.md`, with the numbers in
+> `MACHINE-TEST.md`.
 
 ## Problem
 

@@ -1,0 +1,110 @@
+/*
+ * Grab-ahead smoke test. No motion, no pick, no placement: it asks one camera to start filling its ring
+ * of frames, lets it fill, and then looks at what a capture says about when its own frame was taken.
+ *
+ * Run it from the Scripts menu with the machine enabled (the camera switches its light on before it
+ * captures, and that is a machine actuator). Change cameraName below to try another camera.
+ *
+ * Everything here is deliberately flat: no procedures, no casts of an object to an interface it
+ * implements. BeanShell's scope is not Java's, and both a procedure taking the camera as an argument
+ * ("Undefined argument: camera") and "camera instanceof BufferedFrames" answering false about a camera
+ * that was demonstrably filling its ring have already cost a run. The capability is therefore looked for
+ * by interface name, and the methods are called on the object without a cast, which BeanShell dispatches
+ * dynamically.
+ *
+ * What a good run looks like: the grabs inside the session come back in a frame interval or two - not an
+ * exposure plus a driver round-trip - and say the frame's content is from about a frame interval before
+ * the return. That is not staleness but honesty: a frame returned at +2 ms shows the scene from up to an
+ * interval before that, so it cannot be used as proof of what the camera saw at +2 ms.
+ *
+ * The brightness column is the reason to run this after any change to the timestamps. The ring grabs
+ * without switching the light on, so with the camera looking at an empty stage the ring's frames are the
+ * dark ones and the capture after the session - which does actuate the light - is the bright one. That is
+ * the whole of the trap this feature can fall into: hand such a frame to something asking what the camera
+ * sees now and it will report a missing part with a straight face, which is what it did on the machine.
+ */
+import org.openpnp.model.FrameProvenance;
+import org.openpnp.util.NanosecondTime;
+
+cameraName = "Upp1";
+
+camera = null;
+cameras = machine.getDefaultHead().getCameras();
+for (i = 0; i < cameras.size(); i++) {
+    if (cameras.get(i).getName().equals(cameraName)) {
+        camera = cameras.get(i);
+    }
+}
+
+if (camera == null) {
+    System.out.println("grab-ahead smoke: there is no camera " + cameraName);
+}
+else {
+    // Can this camera buffer frames? By name, because instanceof lies here.
+    canBuffer = false;
+    klass = camera.getClass();
+    while (klass != null && !canBuffer) {
+        interfaces = klass.getInterfaces();
+        for (i = 0; i < interfaces.length; i++) {
+            if (interfaces[i].getName().equals("org.openpnp.spi.BufferedFrames")) {
+                canBuffer = true;
+            }
+        }
+        klass = klass.getSuperclass();
+    }
+
+    if (!canBuffer) {
+        System.out.println("grab-ahead smoke: " + cameraName + " is a " + camera.getClass().getName()
+                + ", which cannot buffer frames at all");
+    }
+    else {
+        System.out.println("grab-ahead smoke: " + cameraName + " buffering before: "
+                + camera.isFrameBuffering());
+
+        camera.beginFrameBufferSession("script smoke", 8000);
+        Thread.sleep(400);
+
+        System.out.println("grab-ahead smoke: session open, the device is producing a frame every "
+                + camera.getBufferedFrameIntervalMs() + " ms");
+
+        // Six of the same question: five while the ring is being filled and one after it has stopped, so
+        // that the last is the capture on demand the machine used to do every time.
+        for (i = 0; i < 6; i++) {
+            if (i == 5) {
+                camera.endFrameBufferSession("script smoke done");
+            }
+
+            tAsk = NanosecondTime.getRuntimeMilliseconds();
+            image = camera.capture();
+            tReturn = NanosecondTime.getRuntimeMilliseconds();
+
+            sum = 0;
+            n = 0;
+            for (y = 0; y < image.getHeight(); y = y + 37) {
+                for (x = 0; x < image.getWidth(); x = x + 37) {
+                    rgb = image.getRGB(x, y);
+                    sum = sum + ((rgb >> 16) & 0xff) + ((rgb >> 8) & 0xff) + (rgb & 0xff);
+                    n = n + 1;
+                }
+            }
+            brightness = sum / (3.0 * n);
+
+            capturedAtMs = camera.getRawFrameCapturedAtMs();
+            if (capturedAtMs == FrameProvenance.UNKNOWN) {
+                when = "nobody knows when it was taken";
+            }
+            else {
+                when = "its content is from " + (tReturn - capturedAtMs) + " ms before the return";
+            }
+
+            System.out.println("grab-ahead smoke: grab " + i + (i < 5 ? " in session" : " no session")
+                    + " in " + (tReturn - tAsk) + " ms, " + image.getWidth() + "x"
+                    + image.getHeight() + ", brightness " + brightness + ", " + when);
+
+            Thread.sleep(100);
+        }
+
+        System.out.println("grab-ahead smoke: buffering after: " + camera.isFrameBuffering()
+                + ". Look for the 'Frame buffer " + cameraName + " session script smoke' line in the log.");
+    }
+}

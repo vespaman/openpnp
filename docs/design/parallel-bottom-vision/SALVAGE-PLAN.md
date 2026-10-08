@@ -180,7 +180,17 @@ Still open, in the order they should be taken:
    Placement accuracy is deliberately not measured - on this machine it is dominated by mechanics and
    by the last calibration, so a change of this kind cannot be seen in it; behaviour, rejections,
    cycle time and memory can.
-2. R7 post-rotate compensation, once (1) says where the remaining error is.
+ 2. ~~R7 post-rotate compensation~~ - **closed differently, 2026-10-08**, and the register should be
+    read with this in mind: the question was what to do with a displacement on the post-rotate path,
+    and the answer turned out to be that a part rotated after pickup has no displacement to compensate
+    at all, because the nozzle is moved to the exact shot location for its own camera and the residual
+    of that move is measured rather than predicted. The parallel path refuses such a part before it
+    captures (D10 of `runtime-displacement-plan.md`) and the sequential path measures its own residual
+    the same way it always did; the `displacementDelta()` term that R7 and R14 are written about, and
+    the per-shot `intendedDisplacementDelta` with it, are deleted. That also settles the "correctness
+    of the per-shot delta needs a real machine" caveat: the delta is no longer a second quantity that
+    could be wrong on its own, and what remains of (1) is Q5, which is about the machine and not about
+    this code.
 3. R4 ownership audit.
 4. R8 class untangling, with the machine available.
 
