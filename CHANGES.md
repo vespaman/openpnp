@@ -9,6 +9,7 @@ a complete change list, only those that may directly interest or affect users.
 
 ## Bug Fixes
 
+* Frame dumps are now named with a dot decimal separator on every machine. On a system whose locale writes decimals with a comma, the coordinates in a dumped frame's file name could not be read back, so the frame was a picture rather than evidence about the alignment that produced it.
 * Fix macOS camera permissions [PR 1955](https://github.com/openpnp/openpnp/pull/1955)
 
 

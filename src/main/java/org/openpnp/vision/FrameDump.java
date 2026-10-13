@@ -3,6 +3,7 @@ package org.openpnp.vision;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -674,7 +675,9 @@ public class FrameDump {
         if (Double.isNaN(value)) {
             return UNKNOWN;
         }
-        return (value < 0 ? "~" : "+")+String.format("%.1f", Math.abs(value));
+        // The name of a dumped frame is evidence, so it has to read the same on every machine: the
+        // decimal separator is pinned to a dot, never the one the JVM's format locale happens to use.
+        return (value < 0 ? "~" : "+")+String.format(Locale.US, "%.1f", Math.abs(value));
     }
 
     private static int index(String field) {
