@@ -9,9 +9,17 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+
+import org.openpnp.model.Configuration;
+import org.openpnp.spi.Head;
+import org.openpnp.spi.Nozzle;
+import org.openpnp.spi.NozzleTip;
 
 import org.pmw.tinylog.Logger;
 
@@ -53,11 +61,19 @@ import org.pmw.tinylog.Logger;
  *
  * <p>
  * The header attests the {@code [environment_stamp]} fields it can reach and omits the rest: the schema has no
- * "unknown" sentinel on purpose, because two traces both stamped unknown would <em>match</em>. A run recorded this
- * way can attest {@code config_hash} (the bytes of the machine.xml it loaded) and, if told, {@code oracle_sha}; the
- * five fields that only a machine run knows — locale, v4l2 parameters, the tips loaded, the job file, the lighting
- * note — are written by nothing here and are therefore absent from both sides of every comparison rather than
- * invented.
+ * "unknown" sentinel on purpose, because two traces both stamped unknown would <em>match</em>. Four of the seven are
+ * facts the running application knows — {@code config_hash} (the bytes of the machine.xml it loaded),
+ * {@code effective_locale_format} (the locale numbers will be formatted with, which is <em>not</em> the one
+ * {@code Locale.getDefault()} prints on every host: see ADR-0008), {@code nozzle_tips_loaded} (what the nozzles hold
+ * as the trace opens), and {@code oracle_sha} when told — and three are things only the person in front of the machine
+ * can say, so they arrive as properties and stay absent when nobody says them: {@code -Dvpnp.trace.v4l2_parameters},
+ * {@code -Dvpnp.trace.lighting_note}, and {@code -Dvpnp.trace.job_file}, the last of which is attested by the digest of
+ * the file rather than its path, so that the same job on two hosts is the same stamp.
+ *
+ * <p>
+ * A field is written only when it was actually known. That is why an operator's property that names a job file which
+ * cannot be read leaves the field out and says so in the log, rather than writing the words "unreadable file": two
+ * traces both stamped "unreadable" would match, which is the failure the schema's missing sentinel exists to avoid.
  */
 public final class TraceRecorder {
     /** Setting this to a file path turns recording on; unset, the recorder does nothing at all. */
@@ -65,6 +81,22 @@ public final class TraceRecorder {
 
     /** The revision being run, for the {@code oracle_sha} stamp field. Absent means the field is absent. */
     public static final String ORACLE_SHA_PROPERTY = "vpnp.trace.oracle_sha";
+    /**
+     * The v4l2 parameters the cameras in this run were set with, for the {@code v4l2_parameters} stamp field. The
+     * application does not own these: they live in the capture device and are read from it, so the recorder writes
+     * what it is told and says nothing when it is not. The value should be the device's own words, e.g. the output of
+     * {@code v4l2-ctl --list-ctrls} for the device node, digested or verbatim.
+     */
+    public static final String V4L2_PROPERTY = "vpnp.trace.v4l2_parameters";
+    /** The lighting in front of the camera, for the {@code lighting_note} stamp field. A human's sentence. */
+    public static final String LIGHTING_NOTE_PROPERTY = "vpnp.trace.lighting_note";
+    /**
+     * The job the run is going to process, for the {@code job_file} stamp field. Named by a path, attested as the
+     * SHA-256 of that file's bytes: the frozen rule is that a differing stamp makes two traces incomparable, and a
+     * path would make the same job incomparable between {@code pn52} and this host, which is a difference the rule
+     * does not mean to catch.
+     */
+    public static final String JOB_FILE_PROPERTY = "vpnp.trace.job_file";
 
     /** What the recorded session is about, for a run started from the properties. */
     public static final String SUBJECT_PROPERTY = "vpnp.trace.subject";
@@ -103,12 +135,17 @@ public final class TraceRecorder {
     /**
      * Starts recording to {@code file}, replacing any trace already being written. Call it once the configuration
      * has been loaded and saved, so that {@code config_hash} names the bytes the run actually ran on.
+     *
+     * <p>
+     * The stamp a caller passes is added to the one the application can derive, and wins over it field by field: a
+     * harness that has just saved a configuration knows the bytes better than a file read would, and it should not
+     * have to re-derive the locale and the loaded tips to say so.
      */
-    public static void open(File file, String producer, String subject, Map<String, String> stamp)
+    public static void open(File file, String producer, String subject, Map<String, String> suppliedStamp)
             throws IOException {
         close();
         TraceRecorder candidate = new TraceRecorder(file,
-                headerLine(producer, subject, stamp),
+                headerLine(producer, subject, stamp(suppliedStamp)),
                 Boolean.parseBoolean(System.getProperty(REPLIES_PROPERTY, "false")));
         recorder = candidate;
         addHook();
@@ -116,9 +153,11 @@ public final class TraceRecorder {
     }
 
     /**
-     * The recorder a machine session gets when nobody scripts it: the file, the revision and the subject come from
-     * the properties, and {@code config_hash} is not attested because this path cannot know which bytes the
-     * application ended up running on. Absent rather than guessed — a stamp field is a claim.
+     * The recorder a machine session gets when nobody scripts it: the file, the revision and the subject come from the
+     * properties, and the stamp is what {@link #stamp(Map)} can ask of the running application at that moment. That
+     * includes {@code config_hash}, taken from the configuration directory as the trace opens: it names the bytes the
+     * run started on, which is the claim a stamp makes. A run that saves a different configuration mid-session does not
+     * change the stamp, and a scripted caller that opens the trace after its save passes its own value, which wins.
      */
     private static TraceRecorder fromProperties() throws IOException {
         File file = new File(System.getProperty(PROPERTY));
@@ -166,17 +205,128 @@ public final class TraceRecorder {
                 : "openpnp@" + sha;
     }
 
-    /** A stamp from the properties, with room for a caller's own fields. Nulls are omitted, never written. */
+    /**
+     * The {@code [environment_stamp]} the run can attest: what the application knows, what the operator was asked, and
+     * nothing else. Nulls are omitted rather than written, because a field the two sides both spell "unknown" would
+     * <em>match</em>, and a matching pair of traces is read as "same environment" by whoever compares them.
+     *
+     * <p>
+     * A caller's own fields go in last and win, so a harness that opened the trace after saving a configuration can
+     * attest the bytes it saved rather than the ones on disk when the session started.
+     */
     private static Map<String, String> stamp(Map<String, String> extra) {
         Map<String, String> fields = new TreeMap<>();
-        String sha = System.getProperty(ORACLE_SHA_PROPERTY);
-        if (sha != null && !sha.isEmpty()) {
-            fields.put("oracle_sha", sha);
-        }
+        putIfPresent(fields, "oracle_sha", System.getProperty(ORACLE_SHA_PROPERTY));
+        putIfPresent(fields, "effective_locale_format", effectiveLocaleFormat());
+        putIfPresent(fields, "nozzle_tips_loaded", nozzleTipsLoaded());
+        putIfPresent(fields, "config_hash", machineConfigHash());
+        putIfPresent(fields, "v4l2_parameters", System.getProperty(V4L2_PROPERTY));
+        putIfPresent(fields, "lighting_note", System.getProperty(LIGHTING_NOTE_PROPERTY));
+        putIfPresent(fields, "job_file", jobFileHash());
         if (extra != null) {
             fields.putAll(extra);
         }
         return fields;
+    }
+
+    /** Writes a field only when there is something to say: an empty string would attest an environment of nothing. */
+    private static void putIfPresent(Map<String, String> fields, String name, String value) {
+        if (value != null && !value.isEmpty()) {
+            fields.put(name, value);
+        }
+    }
+
+    /**
+     * The locale numbers will be formatted with, which on a host like the one this fork is developed on is not the one
+     * {@code Locale.getDefault()} prints: {@code LANG=en_US.UTF-8} with {@code LC_CTYPE=sv_SE.UTF-8} gives a FORMAT
+     * locale of {@code sv_SE} while the plain default says {@code en_US}, and it is the FORMAT locale that decides
+     * whether a saved {@code 1000.0} comes out as {@code 1000,0}. Spelled as a language tag so two hosts that would
+     * format alike stamp alike, and so the value cannot contain the space a bare display name brings.
+     */
+    private static String effectiveLocaleFormat() {
+        return Locale.getDefault(Locale.Category.FORMAT).toLanguageTag();
+    }
+
+    /**
+     * What the nozzles hold as the trace opens, sorted and spelled {@code NOZZLE1=BL898;NOZZLE2=none}: which tips are
+     * loaded changes what a job sends (a tip change is a command, and a nozzle that holds nothing refuses to place),
+     * so it belongs to the environment a golden is recorded against.
+     *
+     * <p>
+     * The moment matters and is stated rather than hidden: a job that changes tips ends with different ones from the
+     * stamp, and the stamp is the starting state because that is the part a comparison needs to be told about. A
+     * machine with no nozzles says {@code no nozzles}: that is a fact about the run, and it is a different fact from
+     * the one a run that could not ask would leave unsaid.
+     */
+    private static String nozzleTipsLoaded() {
+        Configuration configuration = configurationOrNull();
+        if (configuration == null || configuration.getMachine() == null) {
+            return null;
+        }
+        if (configuration.getMachine().getHeads() == null) {
+            return null;
+        }
+        List<String> parts = new ArrayList<>();
+        for (Head head : configuration.getMachine().getHeads()) {
+            List<Nozzle> nozzles = head.getNozzles();
+            if (nozzles == null) {
+                continue;
+            }
+            for (Nozzle nozzle : nozzles) {
+                NozzleTip tip = nozzle.getNozzleTip();
+                parts.add(nozzle.getName() + "=" + (tip == null ? "none" : tip.getId()));
+            }
+        }
+        Collections.sort(parts);
+        return parts.isEmpty() ? "no nozzles" : String.join(";", parts);
+    }
+
+    /**
+     * The bytes of the machine configuration this run loaded. The path is the one {@code Configuration} itself writes,
+     * which is a coupling worth naming: if the configuration directory moves, this field goes absent rather than
+     * pointing at something else, because it is derived from the same getter the loader uses.
+     */
+    private static String machineConfigHash() {
+        Configuration configuration = configurationOrNull();
+        if (configuration == null || configuration.getConfigurationDirectory() == null) {
+            return null;
+        }
+        File machine = new File(configuration.getConfigurationDirectory(), "machine.xml");
+        return machine.isFile() ? sha256(machine) : null;
+    }
+
+    /**
+     * The job the operator said this run is for, digested. Unreadable names the file in the log and attest nothing:
+     * "the job was unreadable" and "there was no job" are different claims, and neither is a value two traces should be
+     * allowed to agree on.
+     */
+    private static String jobFileHash() {
+        String named = System.getProperty(JOB_FILE_PROPERTY);
+        if (named == null || named.isEmpty()) {
+            return null;
+        }
+        File job = new File(named);
+        if (!job.isFile()) {
+            Logger.error("Trace stamp field job_file was asked for, but {} is not a readable file: the field stays "
+                    + "absent rather than attesting a job nobody ran", job.getAbsolutePath());
+            return null;
+        }
+        return sha256(job);
+    }
+
+    /**
+     * The configuration, or null when there is not one yet — the state of a unit test, and of the first seconds of an
+     * application before its load. {@code Configuration.get()} answers that with an {@code Error}, and a field that
+     * cannot be asked is a field left out rather than one invented, so the {@code Error} is caught here and nowhere
+     * else in this file.
+     */
+    private static Configuration configurationOrNull() {
+        try {
+            return Configuration.get();
+        }
+        catch (Error | RuntimeException e) {
+            return null;
+        }
     }
 
     /** Stops recording. A run that produced no events leaves no file, because a trace with no events is not a record. */

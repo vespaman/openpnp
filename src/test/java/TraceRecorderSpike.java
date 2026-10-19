@@ -1,6 +1,9 @@
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -175,9 +178,50 @@ public class TraceRecorderSpike {
         machine.setEnabled(false);
         TraceRecorder.close();
 
+        // The stamp is the part a comparison acts on, so the spike grades it instead of trusting the writer: a field
+        // silently absent makes two traces incomparable, and a field silently wrong makes two runs comparable that
+        // should not be. Both are worth failing a run for.
+        String header = firstLine(new File(evidence, "trace.jsonl"));
+        require(header.contains("\"effective_locale_format\":\""
+                        + Locale.getDefault(Locale.Category.FORMAT).toLanguageTag() + "\""),
+                "the header attests the FORMAT locale this run formats numbers with");
+        require(header.contains("\"nozzle_tips_loaded\":\""),
+                "the header attests which tips the nozzles held as the trace opened");
+        require(header.contains(n1.getName() + "="
+                        + (n1.getNozzleTip() == null ? "none" : n1.getNozzleTip().getId())),
+                "and it says so in the machine's own names: the nozzle the session moved and the tip the fixture "
+                        + "loaded for it (this session changes no tip, so the stamp's start state and this end state "
+                        + "are the same fact here)");
+        require(header.contains("\"config_hash\":\"" + stamp.get("config_hash") + "\""),
+                "the header carries the caller's config_hash (here the derived one would answer the same bytes: the "
+                        + "spike passes the hash of the very file the configuration directory holds)");
+        require(System.getProperty(TraceRecorder.LIGHTING_NOTE_PROPERTY) != null
+                        ? header.contains("\"lighting_note\"") : !header.contains("\"lighting_note\""),
+                "a field only a person in front of the machine can attest is written when they said it, and absent "
+                        + "when they did not");
+
         System.out.println("SPIKE evidence in " + evidence.getAbsolutePath());
         System.out.println("SPIKE   log     " + logFile.length() + " bytes");
         System.out.println("SPIKE   trace   " + new File(evidence, "trace.jsonl").length() + " bytes");
         System.out.println("SPIKE   actuator read " + read + ", tabbed actuator read " + withTabs);
+    }
+
+    /** The header record, which is the first line and the only one that is not an event. */
+    private static String firstLine(File file) throws IOException {
+        try (java.io.BufferedReader in = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(file), StandardCharsets.UTF_8))) {
+            String line = in.readLine();
+            if (line == null) {
+                throw new IllegalStateException("The trace " + file + " has no header at all");
+            }
+            return line;
+        }
+    }
+
+    /** The spike's own assertion: it is not a JUnit test on purpose, so a broken claim has to be thrown, not printed. */
+    private static void require(boolean claim, String what) {
+        if (!claim) {
+            throw new IllegalStateException("The trace header fails its claim: " + what);
+        }
     }
 }

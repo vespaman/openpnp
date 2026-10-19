@@ -5,6 +5,7 @@ a complete change list, only those that may directly interest or affect users.
 
 ## New Features
 
+* The recorded trace now stamps the environment a comparison needs, as far as the application can honestly attest it: the locale that numbers were formatted with, which nozzle tips were loaded when recording started, and the SHA-256 of the machine configuration the run loaded. The three things only a person in front of the machine can say are supplied rather than guessed: `-Dvpnp.trace.v4l2_parameters=…`, `-Dvpnp.trace.lighting_note=…`, and `-Dvpnp.trace.job_file=/path/job.xml`, the last stamped by the digest of the job's bytes rather than its path so that the same job on two hosts stamps the same. A field that is not known is left out of the header instead of written as "unknown", because two traces stamped "unknown" would look like a match.
 * The application can now record a run as a machine-readable trace: start it with `-Dvpnp.trace=/path/trace.jsonl` and every command handed to the controller is written as one JSON line, flushed as it is sent, beside a header carrying the SHA-256 of the configuration the run actually used. It is inert unless that property is given, and `-Dvpnp.trace.replies=true` also records the controller's answers. The files are for the [C++ reimplementation](https://github.com/vespaman/vpnp), which grades its own outbound command stream against them; no machine behaviour changes either way.
 * Reduce horizontal padding in some table columns, for more compact displays [PR 1950](https://github.com/openpnp/openpnp/pull/1950)
 
