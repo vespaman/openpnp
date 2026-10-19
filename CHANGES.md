@@ -5,6 +5,7 @@ a complete change list, only those that may directly interest or affect users.
 
 ## New Features
 
+* The application can now record a run as a machine-readable trace: start it with `-Dvpnp.trace=/path/trace.jsonl` and every command handed to the controller is written as one JSON line, flushed as it is sent, beside a header carrying the SHA-256 of the configuration the run actually used. It is inert unless that property is given, and `-Dvpnp.trace.replies=true` also records the controller's answers. The files are for the [C++ reimplementation](https://github.com/vespaman/vpnp), which grades its own outbound command stream against them; no machine behaviour changes either way.
 * Reduce horizontal padding in some table columns, for more compact displays [PR 1950](https://github.com/openpnp/openpnp/pull/1950)
 
 ## Bug Fixes

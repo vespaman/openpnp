@@ -77,6 +77,7 @@ import org.openpnp.spi.base.AbstractSingleTransformedAxis;
 import org.openpnp.spi.base.AbstractTransformedAxis;
 import org.openpnp.util.NanosecondTime;
 import org.openpnp.util.TextUtils;
+import org.openpnp.logging.TraceRecorder;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
@@ -1559,6 +1560,10 @@ public class GcodeDriver extends AbstractReferenceDriver implements Named {
                 }
                 Line line = new Line(receivedLine);
                 Logger.trace("[{}] << {}", connectionName, line);
+                // Recorded only when -Dvpnp.trace.replies=true, so that the default trace is the outbound wire:
+                // a reply is graded on its shape rather than its bytes, and it doubles the file. See
+                // org.openpnp.logging.TraceRecorder.
+                TraceRecorder.recordReceive(line.toString());
                 // Process the response.
                 processResponse(line);
                 // Add to the responseQueue for further processing by the caller.

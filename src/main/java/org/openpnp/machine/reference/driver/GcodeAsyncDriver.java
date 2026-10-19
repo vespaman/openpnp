@@ -35,6 +35,7 @@ import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.Translations;
 import org.openpnp.util.Collect;
 import org.openpnp.util.CycleProfiler;
+import org.openpnp.logging.TraceRecorder;
 import org.pmw.tinylog.Logger;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
@@ -281,6 +282,9 @@ public class GcodeAsyncDriver extends GcodeDriver {
                         receivedConfirmationsQueue.clear();
                         comms.writeLine(command.line);
                         Logger.trace("[{}] >> {}", connectionName, command);
+                        // The same bytes the log line above names, as a trace record. Inert unless
+                        // -Dvpnp.trace=<file> was given; see org.openpnp.logging.TraceRecorder.
+                        TraceRecorder.recordSend(command.toString());
                     }
                     else {
                         confirmationComplete = true;
