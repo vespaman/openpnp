@@ -118,6 +118,7 @@ public class GeometricPath2D extends Path2D.Double {
                     case PathIterator.SEG_MOVETO:
                         moveTo(segmentPoints.get(idx), segmentPoints.get(idx+1));
                         idx += 2;
+                        break;
                     case PathIterator.SEG_LINETO:
                         lineTo(segmentPoints.get(idx), segmentPoints.get(idx+1));
                         idx += 2;

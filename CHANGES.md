@@ -11,6 +11,7 @@ a complete change list, only those that may directly interest or affect users.
 
 ## Bug Fixes
 
+* A board with a drawn outline can be saved and opened again. Reading the outline back walked its own segment list one case too far, because the case for the first point of a path continued into the case for a line, so every board file that carried a `<profile>` failed to load with an IndexOutOfBoundsException.
 * Frame dumps are now named with a dot decimal separator on every machine. On a system whose locale writes decimals with a comma, the coordinates in a dumped frame's file name could not be read back, so the frame was a picture rather than evidence about the alignment that produced it.
 * Fix macOS camera permissions [PR 1955](https://github.com/openpnp/openpnp/pull/1955)
 
